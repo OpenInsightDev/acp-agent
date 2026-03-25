@@ -4,11 +4,12 @@ use std::process::ExitStatus;
 
 use crate::registry::fetch_registry;
 use crate::runtime::prepare::prepare_agent_command;
-use crate::runtime::transports::{h2, ws};
+use crate::runtime::transports::{h2, tcp, ws};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ServeTransport {
     Http,
+    Tcp,
     Ws,
 }
 
@@ -34,6 +35,9 @@ pub async fn serve_agent(
     match options.transport {
         ServeTransport::Http => {
             h2::serve_h2(prepared, &agent.id, &options.host, options.port).await
+        }
+        ServeTransport::Tcp => {
+            tcp::serve_tcp(prepared, &agent.id, &options.host, options.port).await
         }
         ServeTransport::Ws => ws::serve_ws(prepared, &agent.id, &options.host, options.port).await,
     }

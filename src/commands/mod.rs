@@ -51,7 +51,7 @@ enum Commands {
         #[arg(
             long,
             default_value = "http",
-            help = "Network transport to expose (http or ws)."
+            help = "Network transport to expose (http, tcp, or ws)."
         )]
         transport: ServeTransport,
         #[arg(long, default_value = "127.0.0.1")]
@@ -264,6 +264,17 @@ mod tests {
                 assert_eq!(port, 8010);
                 assert_eq!(args, vec!["--model", "gpt-6"]);
             }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_serve_subcommand_with_tcp_transport() {
+        let cli = Cli::try_parse_from(["acp-agent", "serve", "demo-agent", "--transport", "tcp"])
+            .unwrap();
+
+        match cli.command {
+            Commands::Serve { transport, .. } => assert_eq!(transport, ServeTransport::Tcp),
             command => panic!("unexpected command: {command:?}"),
         }
     }
