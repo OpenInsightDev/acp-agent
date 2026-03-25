@@ -9,19 +9,42 @@ use crate::commands::install::{
 use crate::registry::{BinaryTarget, Environment, Platform, RegistryAgent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A concrete instruction set for invoking an agent binary or package runner.
+///
+/// `program` is the executable path (binary or package manager), `args` are the
+/// command line arguments already resolved by the runtime, `env` holds any
+/// injected environment overrides, and `current_dir` is the working directory
+/// (only set when a binary distribution was unpacked locally).
 pub struct CommandSpec {
+    /// The executable (or package manager) that will be launched.
     pub program: OsString,
+    /// Arguments prepopulated by the runtime before user args are appended.
     pub args: Vec<OsString>,
+    /// Environment overrides that should be injected into the child process.
     pub env: Vec<(OsString, OsString)>,
+    /// Optional working directory used by the child process (set for binaries).
     pub current_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
+/// The prepared payload returned to transports and runners.
+///
+/// Consumers should drop this struct only after the agent process exits; the
+/// optional `temp_dir` keeps the temporary extraction directory alive for the
+/// duration of the child process.
 pub struct PreparedCommand {
+    /// The command specification suitable for `tokio::process::Command`.
     pub spec: CommandSpec,
+    /// Temp directory that must survive while the agent process runs (if present).
     pub temp_dir: Option<tempfile::TempDir>,
 }
 
+/// Builds a `PreparedCommand` from a registry entry and extra user arguments.
+///
+/// The runtime first attempts to download and extract a binary distribution for
+/// the current platform, then falls back to `npx` or `uvx` package runners if no
+/// binary target exists. Any resolved temporary directory is returned so callers
+/// can keep it alive while the spawned process runs.
 pub async fn prepare_agent_command(
     agent: &RegistryAgent,
     user_args: &[String],

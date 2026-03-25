@@ -1,3 +1,5 @@
+//! HTTP/2 transport that upgrades the agent's stdio into a bidirectional data stream.
+//! The connection accepts a single HTTP/2 stream with a fixed `Content-Type`.
 use std::convert::Infallible;
 use std::process::ExitStatus;
 use std::sync::Arc;
@@ -25,6 +27,11 @@ const COPY_BUFFER_SIZE: usize = 8192;
 type ResponseBody = BoxBody<Bytes, Infallible>;
 type ResponseFrame = Result<Frame<Bytes>, Infallible>;
 
+/// Handles a single HTTP/2 POST request whose body is streamed to stdin.
+///
+/// Enforces `Content-Type: application/octet-stream` and requires HTTP/2. One
+/// response stream mirrors stdout frames, and the transport shuts down when the
+/// client or agent closes the stream.
 pub async fn serve_h2(
     prepared: PreparedCommand,
     subject: &str,

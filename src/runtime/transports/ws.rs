@@ -1,3 +1,5 @@
+//! Transport that exposes an agent over WebSocket + JSON-RPC (stdin/stdout mapped to RPC).
+//! It supports a single connection and multiplexes stdout using jsonrpsee subscriptions.
 use std::process::ExitStatus;
 use std::sync::Arc;
 
@@ -25,6 +27,11 @@ const WS_SUBSCRIBE_STDOUT_METHOD: &str = "subscribe_stdout";
 const WS_STDOUT_NOTIFICATION_METHOD: &str = "stdout";
 const WS_UNSUBSCRIBE_STDOUT_METHOD: &str = "unsubscribe_stdout";
 
+/// Accepts one WebSocket connection and exposes stdin/stdout through RPC methods.
+///
+/// `write_stdin`/`close_stdin` map to the agent's stdin, while clients subscribe
+/// to `stdout` notifications produced from the running process. Only one
+/// connection and a limited number of stdout subscriptions are allowed.
 pub async fn serve_ws(
     prepared: PreparedCommand,
     subject: &str,

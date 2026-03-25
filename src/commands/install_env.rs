@@ -9,6 +9,11 @@ use tokio::process::Command;
 const JS_TOOLS: [&str; 4] = ["npm", "yarn", "pnpm", "bun"];
 const PYTHON_TOOLS: [&str; 2] = ["pip", "uv"];
 
+/// Detects missing runtime dependencies and installs them if confirmed.
+///
+/// The command currently supports Bun (JS toolchain) and UV (Python runtime)
+/// detection. It prints a plan, optionally prompts unless `assume_yes` is `true`,
+/// runs the installers, and reports the verified installations.
 pub async fn install_env<W: Write>(writer: &mut W, assume_yes: bool) -> Result<()> {
     let report = detect_environment()?;
     write_detection_report(&report, writer)?;

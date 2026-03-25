@@ -1,3 +1,6 @@
+//! TCP transport that proxies stdin/stdout bytes without additional framing.
+//! Only a single client is accepted so transports that need multiplexing should
+//! use the WebSocket or HTTP/2 implementations instead.
 use std::convert::Infallible;
 use std::future::pending;
 use std::process::ExitStatus;
@@ -10,6 +13,10 @@ use tokio::process::{ChildStdin, ChildStdout};
 use crate::runtime::prepare::{CommandSpec, PreparedCommand};
 use crate::runtime::process::{spawn_stream_child, terminate_child};
 
+/// Accepts one TCP client and shuffles raw bytes between the socket and the agent.
+///
+/// The transport keeps running until either the socket closes or the child process
+/// exits, and it presents any IO errors via the `Result`.
 pub async fn serve_tcp(
     prepared: PreparedCommand,
     subject: &str,

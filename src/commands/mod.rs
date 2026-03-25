@@ -5,13 +5,31 @@ use crate::runtime::serve::ServeTransport;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
+/// Agent installation entrypoints and install outcome types.
 pub mod install;
+/// Runtime dependency detection and optional bootstrap installers.
 pub mod install_env;
+/// Registry listing output helpers.
 pub mod list;
+/// Stdio execution helpers for launching an agent directly.
 pub mod run;
+/// Registry search output helpers.
 pub mod search;
+/// Network-serving helpers that wrap the runtime transport layer.
 pub mod serve;
 
+/// High-level CLI entrypoint shared by the binaries in this crate.
+///
+/// `acp-agent` exposes discover/install/run/serve operations for agents
+/// hosted in the public registry. The CLI delegates the actual work to
+/// the helpers defined in the sibling modules so that tests can exercise them
+/// programmatically.
+
+/// CLI arguments consumed by the `acp-agent` binary.
+///
+/// The parser is intentionally thin: it only captures which subcommand the user
+/// invoked so that `execute_cli` can route to the appropriate handler and keep
+/// the binary minimal while still exposing helpers for other callers.
 #[derive(Debug, Parser)]
 #[command(
     name = "acp-agent",
@@ -64,12 +82,25 @@ enum Commands {
     },
 }
 
+/// Normalized exit status returned by `execute_cli`.
+///
+/// CLI callers still receive an `anyhow::Result`, but this enum represents the
+/// exit code that should be returned to the OS if `execute_cli` succeeds. A
+/// `Success` value maps to `0`, whereas `Code` preserves a non-zero process
+/// status (including signals on Unix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliExit {
+    /// The command completed successfully and should exit with code `0`.
     Success,
+    /// The command completed and wants the process to exit with the provided code.
     Code(i32),
 }
 
+/// Dispatches the parsed `Cli` to the concrete command handlers.
+///
+/// The function mirrors the binary’s subcommand list so that the CLI can be
+/// exercised from tests or other binaries by composing `Cli` + a writer that,
+/// for example, records output instead of writing to `stdout`.
 pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<CliExit> {
     match cli.command {
         Commands::List => {
@@ -118,6 +149,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
     }
 }
 
+/// Converts process `ExitStatus` into the API-friendly `CliExit` representation.
 fn exit_from_status(status: ExitStatus) -> CliExit {
     if status.success() {
         return CliExit::Success;

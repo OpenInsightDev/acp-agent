@@ -16,6 +16,10 @@ use crate::registry::{
     fetch_registry,
 };
 
+/// Installs an agent by ID using the configured registry distribution.
+///
+/// The function mirrors the CLI `install` subcommand and returns a
+/// descriptive `InstallOutcome` so callers can log where the agent ended up.
 pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome> {
     let registry = fetch_registry().await?;
     let agent = registry.get_agent(agent_id)?;
@@ -23,6 +27,11 @@ pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome> {
     install_from_registry(&registry, agent).await
 }
 
+/// Core installer that inspects each distribution in priority order.
+///
+/// Binary archives are installed to the user-local bin directory when a
+/// platform-matching release exists; otherwise the function falls back to npm or
+/// uv package installers depending on what the registry exposes.
 pub async fn install_from_registry(
     _registry: &Registry,
     agent: &RegistryAgent,
@@ -333,22 +342,34 @@ where
     bail!("failed to run {program} for {subject}: {detail}");
 }
 
+/// Identifier for how an agent was installed when the CLI reports success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallMethod {
+    /// The registry provided a ready-to-run binary archive.
     Binary,
+    /// The registry points to an npm package invoking `npx`.
     Npx,
+    /// The registry points to a uvx package invoking `uv`.
     Uvx,
 }
 
+/// Outcome data that is printed by the `install` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallOutcome {
+    /// A binary archive was downloaded and copied under the user bin directory.
     Binary {
+        /// ID of the agent that was installed.
         agent_id: String,
+        /// Filesystem path of the copied executable.
         path: PathBuf,
     },
+    /// A package manager (npm or uv) installed a wrapper on behalf of the agent.
     PackageManager {
+        /// ID of the agent that was installed.
         agent_id: String,
+        /// Which package-manager strategy was used.
         method: InstallMethod,
+        /// Package identifier handed to the installer.
         package: String,
     },
 }

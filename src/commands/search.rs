@@ -4,6 +4,10 @@ use anyhow::{Context, Result};
 
 use crate::registry::{Registry, fetch_registry};
 
+/// Prints registry agents whose name/id/description fuzzily match `query`.
+///
+/// This mirrors the CLI `search` subcommand that writes the same `name`, `id`,
+/// `description` columns as `list`, but only for the matching subset.
 pub async fn search_agents<W: Write>(query: &str, writer: &mut W) -> Result<()> {
     let registry = fetch_registry().await?;
     write_search_results(&registry, query, writer).context("failed to write search results")

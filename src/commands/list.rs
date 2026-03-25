@@ -4,6 +4,10 @@ use anyhow::{Context, Result};
 
 use crate::registry::{Registry, fetch_registry};
 
+/// Prints the canonical registry agent directory in a tab-separated table.
+///
+/// This is what the CLI `list` subcommand prints, and it sorts agents by name
+/// (case-insensitive) before outputting `name`, `id`, and `description`.
 pub async fn list_agents<W: Write>(writer: &mut W) -> Result<()> {
     let registry = fetch_registry().await?;
     write_agent_list(&registry, writer).context("failed to write agent list")
