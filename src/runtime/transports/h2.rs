@@ -20,7 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::runtime::prepare::PreparedCommand;
 use crate::runtime::process::{spawn_stream_child, terminate_child};
 
-const H2_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
+#[doc(hidden)]
+pub const H2_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
 const STREAM_BUFFER_CAPACITY: usize = 16;
 const COPY_BUFFER_SIZE: usize = 8192;
 
@@ -55,7 +56,8 @@ pub async fn serve_h2(
     serve_h2_connection(prepared, subject, socket).await
 }
 
-async fn serve_h2_connection(
+#[doc(hidden)]
+pub async fn serve_h2_connection(
     prepared: PreparedCommand,
     subject: &str,
     socket: TcpStream,
@@ -250,12 +252,7 @@ struct BoundListener {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use std::net::SocketAddr;
-    use std::time::Duration;
-
     use super::*;
-    use crate::runtime::prepare::{CommandSpec, PreparedCommand};
 
     #[test]
     fn accepts_stream_content_type() {
@@ -269,196 +266,4 @@ mod tests {
         assert!(!content_type_is_stream(Some(&header)));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn http_transport_streams_full_duplex_over_h2() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            run_command_h2_with_listener(
-                prepared_command_with_program(
-                    OsString::from("sh"),
-                    vec![
-                        OsString::from("-c"),
-                        OsString::from("printf 'boot\\n'; cat"),
-                    ],
-                ),
-                "demo-agent",
-                BoundListener {
-                    listener,
-                    display_address: address.to_string(),
-                },
-            )
-            .await
-        });
-
-        let (mut sender, connection) = h2_handshake(address).await;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-
-        let (request_tx, request_body) = request_body_channel();
-        let request: Request<ResponseBody> = Request::builder()
-            .method(Method::POST)
-            .uri(format!("http://{address}/"))
-            .version(Version::HTTP_2)
-            .header(CONTENT_TYPE, H2_STREAM_CONTENT_TYPE)
-            .body(request_body)
-            .unwrap();
-
-        let response = sender.send_request(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.version(), Version::HTTP_2);
-
-        let mut response_body = response.into_body();
-        let first_chunk = tokio::time::timeout(
-            Duration::from_secs(2),
-            read_next_data_frame(&mut response_body),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(first_chunk.as_ref(), b"boot\n");
-
-        request_tx
-            .send(Ok(Frame::data(Bytes::from_static(b"ping\n"))))
-            .await
-            .unwrap();
-        drop(request_tx);
-
-        let rest = response_body.collect().await.unwrap().to_bytes();
-        assert_eq!(rest.as_ref(), b"ping\n");
-
-        let status = tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(status.success());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn http_transport_rejects_second_stream() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            run_command_h2_with_listener(
-                prepared_command_with_program(
-                    OsString::from("sh"),
-                    vec![OsString::from("-c"), OsString::from("cat")],
-                ),
-                "demo-agent",
-                BoundListener {
-                    listener,
-                    display_address: address.to_string(),
-                },
-            )
-            .await
-        });
-
-        let (mut sender, connection) = h2_handshake(address).await;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-
-        let (request_tx, request_body) = request_body_channel();
-        let first: Request<ResponseBody> = Request::builder()
-            .method(Method::POST)
-            .uri(format!("http://{address}/"))
-            .version(Version::HTTP_2)
-            .header(CONTENT_TYPE, H2_STREAM_CONTENT_TYPE)
-            .body(request_body)
-            .unwrap();
-        let first_response = sender.send_request(first).await.unwrap();
-        assert_eq!(first_response.status(), StatusCode::OK);
-
-        let second: Request<ResponseBody> = Request::builder()
-            .method(Method::POST)
-            .uri(format!("http://{address}/"))
-            .version(Version::HTTP_2)
-            .header(CONTENT_TYPE, H2_STREAM_CONTENT_TYPE)
-            .body(Full::new(Bytes::new()).boxed())
-            .unwrap();
-        let second_response = sender.send_request(second).await.unwrap();
-        assert_eq!(second_response.status(), StatusCode::CONFLICT);
-
-        request_tx
-            .send(Ok(Frame::data(Bytes::from_static(b"done"))))
-            .await
-            .unwrap();
-        drop(request_tx);
-
-        let _ = first_response.into_body().collect().await.unwrap();
-
-        let status = tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(status.success());
-    }
-
-    async fn h2_handshake(
-        address: SocketAddr,
-    ) -> (
-        hyper::client::conn::http2::SendRequest<ResponseBody>,
-        hyper::client::conn::http2::Connection<TokioIo<TcpStream>, ResponseBody, TokioExecutor>,
-    ) {
-        let stream = TcpStream::connect(address).await.unwrap();
-        hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-            .handshake(TokioIo::new(stream))
-            .await
-            .unwrap()
-    }
-
-    fn request_body_channel() -> (tokio::sync::mpsc::Sender<ResponseFrame>, ResponseBody) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<ResponseFrame>(STREAM_BUFFER_CAPACITY);
-        (tx, StreamBody::new(ReceiverStream::new(rx)).boxed())
-    }
-
-    async fn read_next_data_frame(body: &mut Incoming) -> Option<Bytes> {
-        while let Some(frame) = body.frame().await {
-            let frame = frame.unwrap();
-            if let Ok(data) = frame.into_data() {
-                return Some(data);
-            }
-        }
-
-        None
-    }
-
-    #[cfg(unix)]
-    async fn run_command_h2_with_listener(
-        prepared: PreparedCommand,
-        subject: &str,
-        bound_listener: BoundListener,
-    ) -> Result<ExitStatus> {
-        eprintln!(
-            "Running {} over http://{} (HTTP/2 stream transport)",
-            subject, bound_listener.display_address
-        );
-
-        let (socket, _) = bound_listener.listener.accept().await.with_context(|| {
-            format!(
-                "failed to accept HTTP connection on {}",
-                bound_listener.display_address
-            )
-        })?;
-
-        serve_h2_connection(prepared, subject, socket).await
-    }
-
-    #[cfg(unix)]
-    fn prepared_command_with_program(program: OsString, args: Vec<OsString>) -> PreparedCommand {
-        PreparedCommand {
-            spec: CommandSpec {
-                program,
-                args,
-                env: Vec::new(),
-                current_dir: None,
-            },
-            temp_dir: None,
-        }
-    }
 }
