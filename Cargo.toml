@@ -2,6 +2,13 @@
 name = "acp-agent"
 version = "0.0.1"
 edition = "2024"
+description = "CLI for discovering, installing, launching, and proxying ACP agents from the public registry"
+rust-version = "1.85"
+repository = "https://github.com/observerw/acp-agent-rs"
+homepage = "https://github.com/observerw/acp-agent-rs"
+documentation = "https://docs.rs/acp-agent"
+keywords = ["acp", "agent", "cli", "proxy", "rpc"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.102"
