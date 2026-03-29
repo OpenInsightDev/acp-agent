@@ -41,7 +41,8 @@ pub async fn serve_tcp(
     serve_tcp_connection(prepared.spec, subject, socket).await
 }
 
-async fn serve_tcp_connection(
+#[doc(hidden)]
+pub async fn serve_tcp_connection(
     spec: CommandSpec,
     subject: &str,
     socket: TcpStream,
@@ -140,98 +141,4 @@ async fn bind_listener(host: &str, port: u16) -> Result<BoundListener> {
 
 fn bind_target_display(host: &str, port: u16) -> String {
     format!("host={host}, port={port}")
-}
-
-#[cfg(test)]
-mod tests {
-    use std::ffi::OsString;
-    use std::time::Duration;
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    use super::*;
-    use crate::runtime::prepare::PreparedCommand;
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn tcp_transport_streams_raw_stdio_over_socket() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            run_command_tcp_with_listener(
-                prepared_command_with_program(
-                    OsString::from("sh"),
-                    vec![
-                        OsString::from("-c"),
-                        OsString::from("printf 'boot\\n'; cat"),
-                    ],
-                ),
-                "demo-agent",
-                BoundListener {
-                    listener,
-                    display_address: address.to_string(),
-                },
-            )
-            .await
-        });
-
-        let mut client = TcpStream::connect(address).await.unwrap();
-        let mut first_chunk = [0_u8; 5];
-        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut first_chunk))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&first_chunk, b"boot\n");
-
-        client.write_all(b"ping\n").await.unwrap();
-        client.shutdown().await.unwrap();
-
-        let mut echoed = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut echoed))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(echoed, b"ping\n");
-
-        let status = tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(status.success());
-    }
-
-    #[cfg(unix)]
-    async fn run_command_tcp_with_listener(
-        prepared: PreparedCommand,
-        subject: &str,
-        bound_listener: BoundListener,
-    ) -> Result<ExitStatus> {
-        eprintln!(
-            "Running {} over tcp://{} (raw stdio stream transport)",
-            subject, bound_listener.display_address
-        );
-
-        let (socket, _) = bound_listener.listener.accept().await.with_context(|| {
-            format!(
-                "failed to accept TCP connection on {}",
-                bound_listener.display_address
-            )
-        })?;
-
-        serve_tcp_connection(prepared.spec, subject, socket).await
-    }
-
-    #[cfg(unix)]
-    fn prepared_command_with_program(program: OsString, args: Vec<OsString>) -> PreparedCommand {
-        PreparedCommand {
-            spec: CommandSpec {
-                program,
-                args,
-                env: Vec::new(),
-                current_dir: None,
-            },
-            temp_dir: None,
-        }
-    }
 }
