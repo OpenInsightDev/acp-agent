@@ -265,5 +265,4 @@ mod tests {
         let header = hyper::header::HeaderValue::from_static("application/json");
         assert!(!content_type_is_stream(Some(&header)));
     }
-
 }

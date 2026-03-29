@@ -16,7 +16,10 @@ async fn tcp_transport_streams_raw_stdio_over_socket() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.context("failed to accept TCP client")?;
+        let (socket, _) = listener
+            .accept()
+            .await
+            .context("failed to accept TCP client")?;
         serve_tcp_connection(
             prepared_command_with_program(
                 OsString::from("sh"),

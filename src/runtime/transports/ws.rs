@@ -197,8 +197,7 @@ fn validate_inbound_ws_message(text: &str) -> Result<()> {
 /// Reads child stdout as UTF-8 NDJSON and sends each complete line as a `Text` frame.
 async fn pump_child_stdout_to_ws(
     mut child_stdout: ChildStdout,
-    mut ws_sink: impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
-        + Unpin,
+    mut ws_sink: impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 ) -> Result<()> {
     let mut raw_buf = vec![0u8; READ_BUFFER_SIZE];
     // Accumulate undecoded bytes for incremental UTF-8 decoding.
@@ -338,9 +337,7 @@ mod tests {
             serve_ws_connection(prepared.spec, "test-agent", socket).await
         });
 
-        let (ws, _) = connect_async(format!("ws://{address}"))
-            .await
-            .unwrap();
+        let (ws, _) = connect_async(format!("ws://{address}")).await.unwrap();
         (ws, server)
     }
 
@@ -351,11 +348,9 @@ mod tests {
     async fn ws_transport_single_frame_becomes_ndjson_line() {
         let (mut ws, server) = setup("sh", &["-c", "cat"]).await;
 
-        ws.send(Message::Text(
-            r#"{"jsonrpc":"2.0","method":"ping"}"#.into(),
-        ))
-        .await
-        .unwrap();
+        ws.send(Message::Text(r#"{"jsonrpc":"2.0","method":"ping"}"#.into()))
+            .await
+            .unwrap();
 
         let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
@@ -379,11 +374,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ws_transport_multiple_ndjson_lines_become_multiple_frames() {
-        let (mut ws, server) = setup(
-            "sh",
-            &["-c", r#"printf '{"id":1}\n{"id":2}\n'"#],
-        )
-        .await;
+        let (mut ws, server) = setup("sh", &["-c", r#"printf '{"id":1}\n{"id":2}\n'"#]).await;
 
         let f1 = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
@@ -408,11 +399,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ws_transport_empty_lines_are_not_sent_as_frames() {
-        let (mut ws, server) = setup(
-            "sh",
-            &["-c", r#"printf '{"id":1}\n\n{"id":2}\n'"#],
-        )
-        .await;
+        let (mut ws, server) = setup("sh", &["-c", r#"printf '{"id":1}\n\n{"id":2}\n'"#]).await;
 
         let f1 = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
@@ -473,9 +460,7 @@ mod tests {
     async fn ws_transport_rejects_frame_with_carriage_return() {
         let (mut ws, server) = setup("sh", &["-c", "cat"]).await;
 
-        ws.send(Message::Text("{\"a\":1}\r".into()))
-            .await
-            .unwrap();
+        ws.send(Message::Text("{\"a\":1}\r".into())).await.unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(2), server)
             .await
@@ -533,8 +518,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn ws_transport_closes_ws_cleanly_when_child_exits_with_newline() {
-        let (mut ws, server) =
-            setup("sh", &["-c", r#"printf '{"ok":true}\n'"#]).await;
+        let (mut ws, server) = setup("sh", &["-c", r#"printf '{"ok":true}\n'"#]).await;
 
         let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
@@ -614,8 +598,7 @@ mod tests {
         // ── In-process test agent ──────────────────────────────────────────────
 
         struct EchoAgent {
-            notification_tx:
-                mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>,
+            notification_tx: mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>,
             next_session_id: Cell<u64>,
         }
 
@@ -636,9 +619,11 @@ mod tests {
                 &self,
                 args: acp::InitializeRequest,
             ) -> acp::Result<acp::InitializeResponse> {
-                Ok(acp::InitializeResponse::new(args.protocol_version).agent_info(
-                    acp::Implementation::new("ws-e2e-agent", "0.1.0").title("WS E2E Agent"),
-                ))
+                Ok(
+                    acp::InitializeResponse::new(args.protocol_version).agent_info(
+                        acp::Implementation::new("ws-e2e-agent", "0.1.0").title("WS E2E Agent"),
+                    ),
+                )
             }
 
             async fn authenticate(
@@ -671,10 +656,7 @@ mod tests {
                 Ok(acp::SetSessionModeResponse::new())
             }
 
-            async fn prompt(
-                &self,
-                args: acp::PromptRequest,
-            ) -> acp::Result<acp::PromptResponse> {
+            async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
                 let (ack_tx, ack_rx) = oneshot::channel();
                 self.notification_tx
                     .send((
@@ -709,17 +691,11 @@ mod tests {
                 Ok(acp::ListSessionsResponse::new(Vec::new()))
             }
 
-            async fn ext_method(
-                &self,
-                _args: acp::ExtRequest,
-            ) -> acp::Result<acp::ExtResponse> {
+            async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
                 Err(acp::Error::method_not_found())
             }
 
-            async fn ext_notification(
-                &self,
-                _args: acp::ExtNotification,
-            ) -> acp::Result<()> {
+            async fn ext_notification(&self, _args: acp::ExtNotification) -> acp::Result<()> {
                 Err(acp::Error::method_not_found())
             }
         }
@@ -728,8 +704,7 @@ mod tests {
 
         #[derive(Clone, Default)]
         struct NullClient {
-            notifications:
-                std::sync::Arc<std::sync::Mutex<Vec<acp::SessionNotification>>>,
+            notifications: std::sync::Arc<std::sync::Mutex<Vec<acp::SessionNotification>>>,
         }
 
         #[async_trait::async_trait(?Send)]
@@ -782,23 +757,14 @@ mod tests {
             ) -> acp::Result<acp::KillTerminalResponse> {
                 Err(acp::Error::method_not_found())
             }
-            async fn session_notification(
-                &self,
-                n: acp::SessionNotification,
-            ) -> acp::Result<()> {
+            async fn session_notification(&self, n: acp::SessionNotification) -> acp::Result<()> {
                 self.notifications.lock().unwrap().push(n);
                 Ok(())
             }
-            async fn ext_method(
-                &self,
-                _a: acp::ExtRequest,
-            ) -> acp::Result<acp::ExtResponse> {
+            async fn ext_method(&self, _a: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
                 Err(acp::Error::method_not_found())
             }
-            async fn ext_notification(
-                &self,
-                _a: acp::ExtNotification,
-            ) -> acp::Result<()> {
+            async fn ext_notification(&self, _a: acp::ExtNotification) -> acp::Result<()> {
                 Err(acp::Error::method_not_found())
             }
         }
@@ -833,11 +799,10 @@ mod tests {
                 self.buf.extend_from_slice(data);
                 while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                     let line_bytes: Vec<u8> = self.buf.drain(..=pos).collect();
-                    let text =
-                        String::from_utf8(line_bytes[..line_bytes.len() - 1].to_vec())
-                            .map_err(|_| {
-                                io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 message")
-                            })?;
+                    let text = String::from_utf8(line_bytes[..line_bytes.len() - 1].to_vec())
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 message")
+                        })?;
                     self.frame_tx.send(text).map_err(|_| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "ws writer closed")
                     })?;
@@ -845,17 +810,11 @@ mod tests {
                 Poll::Ready(Ok(data.len()))
             }
 
-            fn poll_flush(
-                self: Pin<&mut Self>,
-                _cx: &mut Ctx<'_>,
-            ) -> Poll<io::Result<()>> {
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Ctx<'_>) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
 
-            fn poll_close(
-                self: Pin<&mut Self>,
-                _cx: &mut Ctx<'_>,
-            ) -> Poll<io::Result<()>> {
+            fn poll_close(self: Pin<&mut Self>, _cx: &mut Ctx<'_>) -> Poll<io::Result<()>> {
                 Poll::Ready(Ok(()))
             }
         }
@@ -941,8 +900,15 @@ mod tests {
             });
 
             (
-                WsWriter { buf: Vec::new(), frame_tx },
-                WsReader { leftover: Vec::new(), offset: 0, frame_rx },
+                WsWriter {
+                    buf: Vec::new(),
+                    frame_tx,
+                },
+                WsReader {
+                    leftover: Vec::new(),
+                    offset: 0,
+                    frame_rx,
+                },
             )
         }
 
@@ -961,10 +927,9 @@ mod tests {
                 let (notification_tx, mut notification_rx) = mpsc::unbounded_channel();
                 let agent = EchoAgent::new(notification_tx);
 
-                let (conn, io_task) =
-                    acp::AgentSideConnection::new(agent, writer, reader, |fut| {
-                        tokio::task::spawn_local(fut);
-                    });
+                let (conn, io_task) = acp::AgentSideConnection::new(agent, writer, reader, |fut| {
+                    tokio::task::spawn_local(fut);
+                });
                 let conn = Rc::new(conn);
                 let notify_conn = Rc::clone(&conn);
 

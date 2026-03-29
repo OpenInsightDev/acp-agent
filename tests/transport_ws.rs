@@ -258,10 +258,7 @@ async fn ws_transport_fails_when_child_stdout_has_no_trailing_newline() {
         serve_ws_connection(
             prepared_command_with_program(
                 OsString::from("sh"),
-                vec![
-                    OsString::from("-c"),
-                    OsString::from(r#"printf '{"id":1}'"#),
-                ],
+                vec![OsString::from("-c"), OsString::from(r#"printf '{"id":1}'"#)],
             )
             .spec,
             "demo-agent",

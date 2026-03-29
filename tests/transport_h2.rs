@@ -25,7 +25,10 @@ async fn http_transport_streams_full_duplex_over_h2() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.context("failed to accept HTTP client")?;
+        let (socket, _) = listener
+            .accept()
+            .await
+            .context("failed to accept HTTP client")?;
         serve_h2_connection(
             prepared_command_with_program(
                 OsString::from("sh"),
@@ -82,7 +85,10 @@ async fn http_transport_rejects_second_stream() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.context("failed to accept HTTP client")?;
+        let (socket, _) = listener
+            .accept()
+            .await
+            .context("failed to accept HTTP client")?;
         serve_h2_connection(
             prepared_command_with_program(
                 OsString::from("sh"),
