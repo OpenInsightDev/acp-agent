@@ -3,30 +3,33 @@
 mod support;
 
 use std::ffi::OsString;
-use std::net::SocketAddr;
 
-use acp_agent::runtime::transports::h2::{H2_STREAM_CONTENT_TYPE, serve_h2_connection};
-use anyhow::{Context, Result};
+use acp_agent::runtime::transports::h2::serve_h2;
+use anyhow::Result;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::body::{Bytes, Frame, Incoming};
 use hyper::header::CONTENT_TYPE;
 use hyper::{Method, Request, StatusCode, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
-use support::transport::{prepared_command_with_program, timeout};
+use support::transport::{
+    STREAM_BUFFER_CAPACITY, prepared_command_with_program, reserve_local_port, timeout,
+};
+
+const H2_STREAM_CONTENT_TYPE: &str = "application/octet-stream";
 
 type ResponseFrame = Result<Frame<Bytes>, std::convert::Infallible>;
 type ResponseBody = BoxBody<Bytes, std::convert::Infallible>;
 
 #[tokio::test]
 async fn http_transport_streams_full_duplex_over_h2() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let port = reserve_local_port();
+    let address = format!("127.0.0.1:{port}");
     let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.context("failed to accept HTTP client")?;
-        serve_h2_connection(
+        serve_h2(
             prepared_command_with_program(
                 OsString::from("sh"),
                 vec![
@@ -35,15 +38,13 @@ async fn http_transport_streams_full_duplex_over_h2() {
                 ],
             ),
             "demo-agent",
-            socket,
+            "127.0.0.1",
+            port,
         )
         .await
     });
 
-    let (mut sender, connection) = h2_handshake(address).await;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let (mut sender, connection_task) = h2_handshake(port).await;
 
     let (request_tx, request_body) = request_body_channel();
     let request: Request<ResponseBody> = Request::builder()
@@ -73,31 +74,29 @@ async fn http_transport_streams_full_duplex_over_h2() {
     let rest = response_body.collect().await.unwrap().to_bytes();
     assert_eq!(rest.as_ref(), b"ping\n");
 
+    assert_h2_connection_ok(connection_task).await;
     let status: Result<_> = timeout(server).await.unwrap();
     assert!(status.unwrap().success());
 }
 
 #[tokio::test]
 async fn http_transport_rejects_second_stream() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let port = reserve_local_port();
+    let address = format!("127.0.0.1:{port}");
     let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.context("failed to accept HTTP client")?;
-        serve_h2_connection(
+        serve_h2(
             prepared_command_with_program(
                 OsString::from("sh"),
                 vec![OsString::from("-c"), OsString::from("cat")],
             ),
             "demo-agent",
-            socket,
+            "127.0.0.1",
+            port,
         )
         .await
     });
 
-    let (mut sender, connection) = h2_handshake(address).await;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let (mut sender, connection_task) = h2_handshake(port).await;
 
     let (request_tx, request_body) = request_body_channel();
     let first: Request<ResponseBody> = Request::builder()
@@ -128,25 +127,27 @@ async fn http_transport_rejects_second_stream() {
 
     let _ = first_response.into_body().collect().await.unwrap();
 
+    assert_h2_connection_ok(connection_task).await;
     let status: Result<_> = timeout(server).await.unwrap();
     assert!(status.unwrap().success());
 }
 
-async fn h2_handshake(
-    address: SocketAddr,
-) -> (
+async fn h2_handshake(port: u16) -> (
     hyper::client::conn::http2::SendRequest<ResponseBody>,
-    hyper::client::conn::http2::Connection<TokioIo<TcpStream>, ResponseBody, TokioExecutor>,
+    JoinHandle<Result<(), hyper::Error>>,
 ) {
-    let stream = TcpStream::connect(address).await.unwrap();
-    hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+    let stream = connect_tcp(port).await;
+    let (sender, connection) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake(TokioIo::new(stream))
         .await
-        .unwrap()
+        .unwrap();
+    let connection_task = tokio::spawn(connection);
+
+    (sender, connection_task)
 }
 
 fn request_body_channel() -> (tokio::sync::mpsc::Sender<ResponseFrame>, ResponseBody) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<ResponseFrame>(16);
+    let (tx, rx) = tokio::sync::mpsc::channel::<ResponseFrame>(STREAM_BUFFER_CAPACITY);
     (tx, StreamBody::new(ReceiverStream::new(rx)).boxed())
 }
 
@@ -159,4 +160,25 @@ async fn read_next_data_frame(body: &mut Incoming) -> Option<Bytes> {
     }
 
     None
+}
+
+async fn connect_tcp(port: u16) -> TcpStream {
+    let address = format!("127.0.0.1:{port}");
+    timeout(async {
+        loop {
+            match TcpStream::connect(&address).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+}
+
+async fn assert_h2_connection_ok(connection_task: JoinHandle<Result<(), hyper::Error>>) {
+    timeout(async {
+        let result = connection_task.await.expect("failed to join h2 connection task");
+        result.expect("h2 connection task failed");
+    })
+    .await;
 }

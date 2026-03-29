@@ -4,46 +4,40 @@ mod support;
 
 use std::ffi::OsString;
 
-use acp_agent::runtime::transports::ws::{
-    StreamChunk, WS_CLOSE_STDIN_METHOD, WS_SUBSCRIBE_STDOUT_METHOD, WS_UNSUBSCRIBE_STDOUT_METHOD,
-    WS_WRITE_STDIN_METHOD, serve_ws_connection,
-};
-use anyhow::{Context, Result};
+use acp_agent::runtime::transports::ws::serve_ws;
+use anyhow::Result;
 use jsonrpsee::core::client::{ClientT, SubscriptionClientT};
 use jsonrpsee::rpc_params;
-use jsonrpsee::ws_client::WsClientBuilder;
-use tokio::net::TcpListener;
+use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
+use serde::{Deserialize, Serialize};
 
-use support::transport::{prepared_command_with_program, timeout};
+use support::transport::{prepared_command_with_program, reserve_local_port, timeout};
+
+const WS_WRITE_STDIN_METHOD: &str = "write_stdin";
+const WS_CLOSE_STDIN_METHOD: &str = "close_stdin";
+const WS_SUBSCRIBE_STDOUT_METHOD: &str = "subscribe_stdout";
+const WS_UNSUBSCRIBE_STDOUT_METHOD: &str = "unsubscribe_stdout";
 
 #[tokio::test]
 async fn ws_transport_streams_full_duplex_over_jsonrpc() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let port = reserve_local_port();
     let server = tokio::spawn(async move {
-        let (socket, _) = listener
-            .accept()
-            .await
-            .context("failed to accept WebSocket client")?;
-        serve_ws_connection(
+        serve_ws(
             prepared_command_with_program(
                 OsString::from("sh"),
                 vec![
                     OsString::from("-c"),
                     OsString::from("printf 'boot\\n'; cat"),
                 ],
-            )
-            .spec,
+            ),
             "demo-agent",
-            socket,
+            "127.0.0.1",
+            port,
         )
         .await
     });
 
-    let client = WsClientBuilder::default()
-        .build(format!("ws://{address}"))
-        .await
-        .unwrap();
+    let client = connect_ws(port).await;
     let mut stdout = client
         .subscribe::<StreamChunk, _>(
             WS_SUBSCRIBE_STDOUT_METHOD,
@@ -82,29 +76,21 @@ async fn ws_transport_streams_full_duplex_over_jsonrpc() {
 
 #[tokio::test]
 async fn ws_transport_rejects_second_stdout_subscription() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let port = reserve_local_port();
     let server = tokio::spawn(async move {
-        let (socket, _) = listener
-            .accept()
-            .await
-            .context("failed to accept WebSocket client")?;
-        serve_ws_connection(
+        serve_ws(
             prepared_command_with_program(
                 OsString::from("sh"),
                 vec![OsString::from("-c"), OsString::from("cat")],
-            )
-            .spec,
+            ),
             "demo-agent",
-            socket,
+            "127.0.0.1",
+            port,
         )
         .await
     });
 
-    let client = WsClientBuilder::default()
-        .build(format!("ws://{address}"))
-        .await
-        .unwrap();
+    let client = connect_ws(port).await;
     let first_subscription = client
         .subscribe::<StreamChunk, _>(
             WS_SUBSCRIBE_STDOUT_METHOD,
@@ -132,4 +118,22 @@ async fn ws_transport_rejects_second_stdout_subscription() {
 
     let status: Result<_> = timeout(server).await.unwrap();
     assert!(status.unwrap().success());
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StreamChunk {
+    data: Vec<u8>,
+}
+
+async fn connect_ws(port: u16) -> WsClient {
+    let url = format!("ws://127.0.0.1:{port}");
+    timeout(async {
+        loop {
+            match WsClientBuilder::default().build(&url).await {
+                Ok(client) => break client,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
 }

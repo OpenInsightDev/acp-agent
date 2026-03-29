@@ -4,35 +4,33 @@ mod support;
 
 use std::ffi::OsString;
 
-use acp_agent::runtime::transports::tcp::serve_tcp_connection;
-use anyhow::{Context, Result};
+use acp_agent::runtime::transports::tcp::serve_tcp;
+use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
-use support::transport::{prepared_command_with_program, timeout};
+use support::transport::{prepared_command_with_program, reserve_local_port, timeout};
 
 #[tokio::test]
 async fn tcp_transport_streams_raw_stdio_over_socket() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
+    let port = reserve_local_port();
     let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.context("failed to accept TCP client")?;
-        serve_tcp_connection(
+        serve_tcp(
             prepared_command_with_program(
                 OsString::from("sh"),
                 vec![
                     OsString::from("-c"),
                     OsString::from("printf 'boot\\n'; cat"),
                 ],
-            )
-            .spec,
+            ),
             "demo-agent",
-            socket,
+            "127.0.0.1",
+            port,
         )
         .await
     });
 
-    let mut client = TcpStream::connect(address).await.unwrap();
+    let mut client = connect_tcp(port).await;
     let mut first_chunk = [0_u8; 5];
     timeout(client.read_exact(&mut first_chunk)).await.unwrap();
     assert_eq!(&first_chunk, b"boot\n");
@@ -46,4 +44,17 @@ async fn tcp_transport_streams_raw_stdio_over_socket() {
 
     let status: Result<_> = timeout(server).await.unwrap();
     assert!(status.unwrap().success());
+}
+
+async fn connect_tcp(port: u16) -> TcpStream {
+    let address = format!("127.0.0.1:{port}");
+    timeout(async {
+        loop {
+            match TcpStream::connect(&address).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
 }
