@@ -10,14 +10,14 @@ use crate::runtime::transports::{h2, tcp, ws};
 ///
 /// * `Http` stands for the HTTP/2 full-duplex stream transport exposed by `h2`.
 /// * `Tcp` exposes raw bytes over a single TCP connection (no framing or RPC).
-/// * `Ws` publishes a JSON-RPC over WebSocket wrapper used by the existing client.
+/// * `Ws` exposes one ACP JSON-RPC message per WebSocket text frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ServeTransport {
     /// HTTP/2 stream transport implemented by [`crate::runtime::transports::h2`].
     Http,
     /// Raw TCP byte-stream transport implemented by [`crate::runtime::transports::tcp`].
     Tcp,
-    /// WebSocket + JSON-RPC transport implemented by [`crate::runtime::transports::ws`].
+    /// WebSocket transport: one ACP message per WebSocket frame, implemented by [`crate::runtime::transports::ws`].
     Ws,
 }
 

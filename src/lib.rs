@@ -46,7 +46,7 @@ acp-agent serve example-agent --transport ws --port 7000
 
 - `http` exposes one HTTP/2 byte stream over `POST /` with `Content-Type: application/octet-stream`.
 - `tcp` exposes raw stdin/stdout bytes over a single TCP connection.
-- `ws` exposes stdin/stdout through a JSON-RPC API over WebSocket.
+- `ws` exposes ACP messages as WebSocket text frames (one message per frame).
 
 ## Library Surface
 

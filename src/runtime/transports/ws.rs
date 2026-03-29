@@ -1,37 +1,35 @@
-//! Transport that exposes an agent over WebSocket + JSON-RPC (stdin/stdout mapped to RPC).
-//! It supports a single connection and multiplexes stdout using jsonrpsee subscriptions.
-use std::pin::Pin;
+//! WebSocket transport: one text frame = one ACP JSON-RPC message.
+//!
+//! Inbound (ws → child stdin): each `Text` frame must be a well-formed JSON
+//! object without embedded newlines.  The frame text is forwarded to the child
+//! followed by `\n` (NDJSON framing).
+//!
+//! Outbound (child stdout → ws): the child's NDJSON output is split on `\n`
+//! and each complete non-empty line is sent as a single `Text` frame without
+//! the trailing newline.
 use std::process::ExitStatus;
-use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use jsonrpsee::RpcModule;
-use jsonrpsee::core::SubscriptionError;
-use jsonrpsee::server::{
-    PendingSubscriptionSink, Server, ServerConfig, serve_with_graceful_shutdown, stop_channel,
-};
-use jsonrpsee::types::ErrorObjectOwned;
-use serde::{Deserialize, Serialize};
+use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::process::{ChildStdin, ChildStdout};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::runtime::prepare::{CommandSpec, PreparedCommand};
 use crate::runtime::process::{spawn_stream_child, terminate_child};
 
-const STREAM_BUFFER_CAPACITY: usize = 16;
-const COPY_BUFFER_SIZE: usize = 8192;
-const WS_WRITE_STDIN_METHOD: &str = "write_stdin";
-const WS_CLOSE_STDIN_METHOD: &str = "close_stdin";
-const WS_SUBSCRIBE_STDOUT_METHOD: &str = "subscribe_stdout";
-const WS_STDOUT_NOTIFICATION_METHOD: &str = "stdout";
-const WS_UNSUBSCRIBE_STDOUT_METHOD: &str = "unsubscribe_stdout";
+/// Grace window before force-killing child after WebSocket closes.
+const STDIN_CLOSE_GRACE: Duration = Duration::from_secs(5);
+const READ_BUFFER_SIZE: usize = 8192;
 
-/// Accepts one WebSocket connection and exposes stdin/stdout through RPC methods.
+/// Accepts one WebSocket connection and exposes the agent via ACP message framing.
 ///
-/// `write_stdin`/`close_stdin` map to the agent's stdin, while clients subscribe
-/// to `stdout` notifications produced from the running process. Only one
-/// connection and a limited number of stdout subscriptions are allowed.
+/// One WebSocket `Text` frame maps to exactly one ACP JSON-RPC message. The
+/// child process communicates over NDJSON on its stdio; newline translation
+/// occurs only at the transport boundary.
 pub async fn serve_ws(
     prepared: PreparedCommand,
     subject: &str,
@@ -40,7 +38,7 @@ pub async fn serve_ws(
 ) -> Result<ExitStatus> {
     let bound_listener = bind_listener(host, port).await?;
     eprintln!(
-        "Running {} over ws://{} (jsonrpsee WebSocket transport)",
+        "Running {} over ws://{} (ACP message per WebSocket frame)",
         subject, bound_listener.display_address
     );
 
@@ -71,147 +69,199 @@ async fn serve_ws_connection(
         .take()
         .ok_or_else(|| anyhow!("child process missing piped stdout"))?;
 
-    let session = Arc::new(WsStreamSession::new(child_stdin, child_stdout));
-    let module = build_ws_rpc_module(session)?;
-    let config = ServerConfig::builder()
-        .ws_only()
-        .max_connections(1)
-        .max_subscriptions_per_connection(8)
-        .set_message_buffer_capacity(STREAM_BUFFER_CAPACITY as u32)
-        .build();
-    let service_builder = Server::builder().set_config(config).to_service_builder();
-    let (stop_handle, server_handle) = stop_channel();
-    let mut service = service_builder.build(module, stop_handle.clone());
-    let session_closed = service.on_session_closed();
-    let serve = tokio::spawn(async move {
-        serve_with_graceful_shutdown(socket, service, stop_handle.shutdown()).await
-    });
-    tokio::pin!(session_closed);
-    tokio::pin!(serve);
+    let ws = accept_ws_connection(socket).await?;
+    let (ws_sink, ws_stream) = ws.split();
+
+    let ws_to_stdin = pump_ws_to_child_stdin(ws_stream, child_stdin);
+    let stdout_to_ws = pump_child_stdout_to_ws(child_stdout, ws_sink);
+    tokio::pin!(ws_to_stdin);
+    tokio::pin!(stdout_to_ws);
 
     tokio::select! {
-        status = child.wait() => {
-            let status = status.context("failed while waiting on child process")?;
-            let _ = server_handle.stop();
-            let serve_result = serve.as_mut().await.context("failed to join WebSocket transport task")?;
-            if let Err(source) = serve_result {
-                return Err(anyhow!("WebSocket transport failed: {source}"));
-            }
-            Ok(status)
-        }
-        _ = &mut session_closed => {
-            let _ = server_handle.stop();
-            let status = terminate_child(&mut child).await?;
-            let serve_result = serve.as_mut().await.context("failed to join WebSocket transport task")?;
-            if let Err(source) = serve_result {
-                return Err(anyhow!("WebSocket transport failed: {source}"));
-            }
-            Ok(status)
-        }
-    }
-}
-
-fn build_ws_rpc_module(session: Arc<WsStreamSession>) -> Result<RpcModule<WsStreamSession>> {
-    let mut module = RpcModule::from_arc(session);
-    module.register_async_method(WS_WRITE_STDIN_METHOD, |params, session, _| async move {
-        let chunk: StreamChunk = params.one().map_err(ErrorObjectOwned::from)?;
-        session.write_stdin(&chunk.data).await
-    })?;
-    module.register_async_method(WS_CLOSE_STDIN_METHOD, |_, session, _| async move {
-        session.close_stdin().await
-    })?;
-    module.register_subscription::<std::result::Result<(), SubscriptionError>, _, _>(
-        WS_SUBSCRIBE_STDOUT_METHOD,
-        WS_STDOUT_NOTIFICATION_METHOD,
-        WS_UNSUBSCRIBE_STDOUT_METHOD,
-        |_, pending, session, _| async move { stream_stdout_subscription(pending, session).await },
-    )?;
-    Ok(module)
-}
-
-async fn stream_stdout_subscription(
-    pending: PendingSubscriptionSink,
-    session: Arc<WsStreamSession>,
-) -> std::result::Result<(), SubscriptionError> {
-    let Some(mut child_stdout) = session.take_stdout().await else {
-        pending
-            .reject(ws_internal_error("stdout is already subscribed"))
-            .await;
-        return Ok(());
-    };
-
-    let sink = pending.accept().await?;
-    let mut buffer = [0_u8; COPY_BUFFER_SIZE];
-
-    loop {
-        tokio::select! {
-            _ = sink.closed() => break Ok(()),
-            read = child_stdout.read(&mut buffer) => match read {
-                Ok(0) => break Ok(()),
-                Ok(read) => {
-                    let message = serde_json::value::to_raw_value(&StreamChunk {
-                        data: buffer[..read].to_vec(),
-                    }).map_err(|error| SubscriptionError::from(error.to_string()))?;
-
-                    if sink.send(message).await.is_err() {
-                        break Ok(());
+        // WS side closed or errored.
+        result = &mut ws_to_stdin => {
+            match result {
+                Ok(mut child_stdin) => {
+                    // WebSocket closed normally: close stdin then wait for child to finish.
+                    let _ = child_stdin.shutdown().await;
+                    drop(child_stdin);
+                    // Wait for the stdout pump to finish processing remaining output.
+                    let stdout_result = tokio::time::timeout(STDIN_CLOSE_GRACE, &mut stdout_to_ws).await;
+                    match stdout_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(source)) => {
+                            let _ = terminate_child(&mut child).await;
+                            return Err(anyhow!("WebSocket transport failed: {source}"));
+                        }
+                        Err(_timeout) => {
+                            // stdout pump timed out — force-kill.
+                            let _ = terminate_child(&mut child).await;
+                        }
+                    }
+                    let status = tokio::time::timeout(STDIN_CLOSE_GRACE, child.wait()).await;
+                    match status {
+                        Ok(Ok(s)) => Ok(s),
+                        _ => terminate_child(&mut child).await,
                     }
                 }
-                Err(_) => break Ok(()),
+                Err(source) => {
+                    let _ = terminate_child(&mut child).await;
+                    Err(anyhow!("WebSocket transport failed: {source}"))
+                }
+            }
+        }
+        // Child stdout ended or errored — stdout pump drives completion.
+        result = &mut stdout_to_ws => {
+            match result {
+                Ok(()) => {
+                    // Stdout closed cleanly (all lines were newline-terminated).
+                    terminate_child(&mut child).await
+                }
+                Err(source) => {
+                    let _ = terminate_child(&mut child).await;
+                    Err(anyhow!("WebSocket transport failed: {source}"))
+                }
             }
         }
     }
 }
 
-fn ws_internal_error(message: impl Into<String>) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(-32000, message.into(), None::<()>)
+async fn accept_ws_connection(socket: TcpStream) -> Result<WebSocketStream<TcpStream>> {
+    tokio_tungstenite::accept_async(socket)
+        .await
+        .context("WebSocket handshake failed")
 }
 
-struct WsStreamSession {
-    child_stdin: Mutex<Option<Pin<Box<dyn tokio::io::AsyncWrite + Send>>>>,
-    child_stdout: Mutex<Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>>>,
-}
-
-impl WsStreamSession {
-    fn new<Stdin, Stdout>(child_stdin: Stdin, child_stdout: Stdout) -> Self
-    where
-        Stdin: tokio::io::AsyncWrite + Send + 'static,
-        Stdout: tokio::io::AsyncRead + Send + 'static,
-    {
-        Self {
-            child_stdin: Mutex::new(Some(Box::pin(child_stdin))),
-            child_stdout: Mutex::new(Some(Box::pin(child_stdout))),
+/// Reads WebSocket `Text` frames, validates them, and writes to child stdin as NDJSON.
+///
+/// Returns the `ChildStdin` on normal WebSocket close so the caller can gracefully
+/// shut stdin before waiting on the child.  Returns an error on protocol violations.
+async fn pump_ws_to_child_stdin(
+    mut ws_stream: impl futures_util::Stream<
+        Item = Result<Message, tokio_tungstenite::tungstenite::Error>,
+    > + Unpin,
+    mut child_stdin: ChildStdin,
+) -> Result<ChildStdin> {
+    while let Some(msg) = ws_stream.next().await {
+        let msg = msg.context("WebSocket read error")?;
+        match msg {
+            Message::Text(text) => {
+                validate_inbound_ws_message(&text)?;
+                child_stdin
+                    .write_all(text.as_bytes())
+                    .await
+                    .context("failed to write to child stdin")?;
+                child_stdin
+                    .write_all(b"\n")
+                    .await
+                    .context("failed to write newline to child stdin")?;
+            }
+            Message::Binary(_) => {
+                return Err(anyhow!(
+                    "WebSocket transport only accepts Text frames; Binary frame rejected"
+                ));
+            }
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
         }
     }
+    Ok(child_stdin)
+}
 
-    async fn write_stdin(&self, data: &[u8]) -> std::result::Result<usize, ErrorObjectOwned> {
-        let mut child_stdin = self.child_stdin.lock().await;
-        let child_stdin = child_stdin
-            .as_mut()
-            .ok_or_else(|| ws_internal_error("stdin is closed"))?;
-
-        child_stdin
-            .write_all(data)
-            .await
-            .map_err(|error| ws_internal_error(format!("failed to write stdin: {error}")))?;
-        Ok(data.len())
+/// Validates that a single WebSocket text frame is a legal ACP message.
+fn validate_inbound_ws_message(text: &str) -> Result<()> {
+    if text.contains('\n') || text.contains('\r') {
+        return Err(anyhow!(
+            "WebSocket frame must not contain newlines (would corrupt NDJSON framing)"
+        ));
     }
+    let value: serde_json::Value =
+        serde_json::from_str(text).context("WebSocket frame is not valid JSON")?;
+    if !value.is_object() {
+        return Err(anyhow!(
+            "WebSocket frame JSON must be an object (got {})",
+            match &value {
+                serde_json::Value::Array(_) => "array",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Null => "null",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Object(_) => "object",
+            }
+        ));
+    }
+    Ok(())
+}
 
-    async fn close_stdin(&self) -> std::result::Result<bool, ErrorObjectOwned> {
-        let child_stdin = self.child_stdin.lock().await.take();
-        let Some(mut child_stdin) = child_stdin else {
-            return Ok(false);
+/// Reads child stdout as UTF-8 NDJSON and sends each complete line as a `Text` frame.
+async fn pump_child_stdout_to_ws(
+    mut child_stdout: ChildStdout,
+    mut ws_sink: impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + Unpin,
+) -> Result<()> {
+    let mut raw_buf = vec![0u8; READ_BUFFER_SIZE];
+    // Accumulate undecoded bytes for incremental UTF-8 decoding.
+    let mut byte_buf: Vec<u8> = Vec::new();
+    // Characters decoded and awaiting `\n`.
+    let mut line_buf = String::new();
+
+    loop {
+        let n = child_stdout
+            .read(&mut raw_buf)
+            .await
+            .context("failed to read from child stdout")?;
+
+        if n == 0 {
+            // EOF: any remaining data in line_buf is an unterminated line.
+            if !line_buf.is_empty() {
+                return Err(anyhow!(
+                    "child stdout closed with unterminated line (missing trailing newline)"
+                ));
+            }
+            // Close the WebSocket gracefully.
+            let _ = ws_sink.close().await;
+            return Ok(());
+        }
+
+        byte_buf.extend_from_slice(&raw_buf[..n]);
+
+        // Incrementally decode UTF-8, leaving incomplete multibyte sequences in byte_buf.
+        let text = match std::str::from_utf8(&byte_buf) {
+            Ok(s) => {
+                let owned = s.to_owned();
+                byte_buf.clear();
+                owned
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                if e.error_len().is_some() {
+                    // Invalid UTF-8 sequence (not just incomplete).
+                    return Err(anyhow!("child stdout contains invalid UTF-8 data"));
+                }
+                // Incomplete multibyte sequence at end — keep those bytes for next read.
+                let owned = std::str::from_utf8(&byte_buf[..valid_up_to])
+                    .unwrap()
+                    .to_owned();
+                byte_buf.drain(..valid_up_to);
+                owned
+            }
         };
 
-        child_stdin
-            .shutdown()
-            .await
-            .map_err(|error| ws_internal_error(format!("failed to close stdin: {error}")))?;
-        Ok(true)
-    }
+        line_buf.push_str(&text);
 
-    async fn take_stdout(&self) -> Option<Pin<Box<dyn tokio::io::AsyncRead + Send>>> {
-        self.child_stdout.lock().await.take()
+        // Split completed lines and send each as a Text frame.
+        while let Some(newline_pos) = line_buf.find('\n') {
+            let line: String = line_buf.drain(..newline_pos).collect();
+            // Remove the `\n` itself.
+            line_buf.remove(0);
+
+            if !line.is_empty() {
+                ws_sink
+                    .send(Message::Text(line.into()))
+                    .await
+                    .context("failed to send WebSocket frame")?;
+            }
+        }
     }
 }
 
@@ -242,115 +292,27 @@ fn bind_target_display(host: &str, port: u16) -> String {
     format!("host={host}, port={port}")
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StreamChunk {
-    data: Vec<u8>,
-}
-
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::io;
-    use std::rc::Rc;
-    use std::task::{Context as TaskContext, Poll};
     use std::time::Duration;
 
-    use super::*;
-    use agent_client_protocol::{self as acp, Agent as _, Client as _};
-    use anyhow::Context as _;
     use futures_util::{SinkExt, StreamExt};
-    use jsonrpsee::core::client::{ClientT, SubscriptionClientT};
-    use jsonrpsee::rpc_params;
-    use jsonrpsee::ws_client::WsClientBuilder;
-    use serde_json::{Value, json};
-    use tokio::sync::{Mutex as TokioMutex, mpsc, oneshot};
-    use tokio::task::LocalSet;
+    use tokio::net::TcpListener;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
-    use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
+
+    use super::*;
+    use crate::runtime::prepare::{CommandSpec, PreparedCommand};
+
+    // ── helpers ────────────────────────────────────────────────────────────────
 
     #[cfg(unix)]
-    async fn run_command_ws_with_listener(
-        prepared: PreparedCommand,
-        subject: &str,
-        listener: BoundListener,
-    ) -> Result<ExitStatus> {
-        eprintln!(
-            "Running {} over ws://{} (jsonrpsee WebSocket transport)",
-            subject, listener.display_address
-        );
-
-        let (socket, _) = listener.listener.accept().await.with_context(|| {
-            format!(
-                "failed to accept WebSocket connection on {}",
-                listener.display_address
-            )
-        })?;
-
-        serve_ws_connection(prepared.spec, subject, socket).await
-    }
-
-    async fn run_stream_ws_with_listener<Stdin, Stdout>(
-        stdin: Stdin,
-        stdout: Stdout,
-        subject: &str,
-        listener: BoundListener,
-    ) -> Result<()>
-    where
-        Stdin: tokio::io::AsyncWrite + Send + 'static,
-        Stdout: tokio::io::AsyncRead + Send + 'static,
-    {
-        eprintln!(
-            "Running {} over ws://{} (jsonrpsee WebSocket transport)",
-            subject, listener.display_address
-        );
-
-        let (socket, _) = listener.listener.accept().await.with_context(|| {
-            format!(
-                "failed to accept WebSocket connection on {}",
-                listener.display_address
-            )
-        })?;
-
-        let session = Arc::new(WsStreamSession::new(stdin, stdout));
-        let module = build_ws_rpc_module(session)?;
-        let config = ServerConfig::builder()
-            .ws_only()
-            .max_connections(1)
-            .max_subscriptions_per_connection(8)
-            .set_message_buffer_capacity(STREAM_BUFFER_CAPACITY as u32)
-            .build();
-        let service_builder = Server::builder().set_config(config).to_service_builder();
-        let (stop_handle, server_handle) = stop_channel();
-        let mut service = service_builder.build(module, stop_handle.clone());
-        let session_closed = service.on_session_closed();
-        let serve = tokio::spawn(async move {
-            serve_with_graceful_shutdown(socket, service, stop_handle.shutdown()).await
-        });
-        tokio::pin!(session_closed);
-        tokio::pin!(serve);
-
-        let _ = (&mut session_closed).await;
-        let _ = server_handle.stop();
-        let serve_result = serve
-            .as_mut()
-            .await
-            .context("failed to join WebSocket transport task")?;
-        if let Err(source) = serve_result {
-            return Err(anyhow!("WebSocket transport failed: {source}"));
-        }
-
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn prepared_command_with_program(program: OsString, args: Vec<OsString>) -> PreparedCommand {
+    fn prepared_command(program: &str, args: &[&str]) -> PreparedCommand {
         PreparedCommand {
             spec: CommandSpec {
-                program,
-                args,
+                program: OsString::from(program),
+                args: args.iter().map(|s| OsString::from(*s)).collect(),
                 env: Vec::new(),
                 current_dir: None,
             },
@@ -359,72 +321,52 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn ws_transport_streams_full_duplex_over_jsonrpc() {
+    async fn setup(
+        program: &str,
+        args: &[&str],
+    ) -> (
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+        tokio::task::JoinHandle<Result<ExitStatus>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let prepared = prepared_command(program, args);
+
         let server = tokio::spawn(async move {
-            run_command_ws_with_listener(
-                prepared_command_with_program(
-                    OsString::from("sh"),
-                    vec![
-                        OsString::from("-c"),
-                        OsString::from("printf 'boot\\n'; cat"),
-                    ],
-                ),
-                "demo-agent",
-                BoundListener {
-                    listener,
-                    display_address: address.to_string(),
-                },
-            )
-            .await
+            let (socket, _) = listener.accept().await.unwrap();
+            serve_ws_connection(prepared.spec, "test-agent", socket).await
         });
 
-        let client = WsClientBuilder::default()
-            .build(format!("ws://{address}"))
+        let (ws, _) = connect_async(format!("ws://{address}"))
             .await
             .unwrap();
-        let mut stdout = client
-            .subscribe::<StreamChunk, _>(
-                WS_SUBSCRIBE_STDOUT_METHOD,
-                rpc_params![],
-                WS_UNSUBSCRIBE_STDOUT_METHOD,
-            )
-            .await
-            .unwrap();
+        (ws, server)
+    }
 
-        let first_chunk = tokio::time::timeout(Duration::from_secs(2), stdout.next())
+    // ── framing happy path ─────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_transport_single_frame_becomes_ndjson_line() {
+        let (mut ws, server) = setup("sh", &["-c", "cat"]).await;
+
+        ws.send(Message::Text(
+            r#"{"jsonrpc":"2.0","method":"ping"}"#.into(),
+        ))
+        .await
+        .unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), ws.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(first_chunk.data, b"boot\n");
+        assert_eq!(
+            reply,
+            Message::Text(r#"{"jsonrpc":"2.0","method":"ping"}"#.into())
+        );
 
-        let written: usize = client
-            .request(
-                WS_WRITE_STDIN_METHOD,
-                rpc_params![StreamChunk {
-                    data: b"ping\n".to_vec(),
-                }],
-            )
-            .await
-            .unwrap();
-        assert_eq!(written, 5);
-
-        let closed: bool = client
-            .request(WS_CLOSE_STDIN_METHOD, rpc_params![])
-            .await
-            .unwrap();
-        assert!(closed);
-
-        let echoed = tokio::time::timeout(Duration::from_secs(2), stdout.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(echoed.data, b"ping\n");
-
+        ws.close(None).await.unwrap();
         let status = tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .unwrap()
@@ -435,52 +377,177 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ws_transport_rejects_second_stdout_subscription() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            run_command_ws_with_listener(
-                prepared_command_with_program(
-                    OsString::from("sh"),
-                    vec![OsString::from("-c"), OsString::from("cat")],
-                ),
-                "demo-agent",
-                BoundListener {
-                    listener,
-                    display_address: address.to_string(),
-                },
-            )
-            .await
-        });
+    async fn ws_transport_multiple_ndjson_lines_become_multiple_frames() {
+        let (mut ws, server) = setup(
+            "sh",
+            &["-c", r#"printf '{"id":1}\n{"id":2}\n'"#],
+        )
+        .await;
 
-        let client = WsClientBuilder::default()
-            .build(format!("ws://{address}"))
+        let f1 = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let f2 = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(f1, Message::Text(r#"{"id":1}"#.into()));
+        assert_eq!(f2, Message::Text(r#"{"id":2}"#.into()));
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_transport_empty_lines_are_not_sent_as_frames() {
+        let (mut ws, server) = setup(
+            "sh",
+            &["-c", r#"printf '{"id":1}\n\n{"id":2}\n'"#],
+        )
+        .await;
+
+        let f1 = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let f2 = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(f1, Message::Text(r#"{"id":1}"#.into()));
+        assert_eq!(f2, Message::Text(r#"{"id":2}"#.into()));
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    // ── inbound validation ─────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_transport_rejects_binary_frame() {
+        let (mut ws, server) = setup("sh", &["-c", "cat"]).await;
+
+        ws.send(Message::Binary(b"data".to_vec().into()))
             .await
             .unwrap();
-        let first_subscription = client
-            .subscribe::<StreamChunk, _>(
-                WS_SUBSCRIBE_STDOUT_METHOD,
-                rpc_params![],
-                WS_UNSUBSCRIBE_STDOUT_METHOD,
-            )
-            .await;
-        assert!(first_subscription.is_ok());
 
-        let second_subscription = client
-            .subscribe::<StreamChunk, _>(
-                WS_SUBSCRIBE_STDOUT_METHOD,
-                rpc_params![],
-                WS_UNSUBSCRIBE_STDOUT_METHOD,
-            )
-            .await;
-        assert!(second_subscription.is_err());
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+    }
 
-        let closed: bool = client
-            .request(WS_CLOSE_STDIN_METHOD, rpc_params![])
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_transport_rejects_frame_with_newline() {
+        let (mut ws, server) = setup("sh", &["-c", "cat"]).await;
+
+        ws.send(Message::Text("{\"a\":1}\n{\"b\":2}".into()))
             .await
             .unwrap();
-        assert!(closed);
-        drop(first_subscription);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_transport_rejects_frame_with_carriage_return() {
+        let (mut ws, server) = setup("sh", &["-c", "cat"]).await;
+
+        ws.send(Message::Text("{\"a\":1}\r".into()))
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_transport_rejects_non_json_frame() {
+        let (mut ws, server) = setup("sh", &["-c", "cat"]).await;
+
+        ws.send(Message::Text("not json".into())).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_transport_rejects_non_object_json() {
+        let (mut ws, server) = setup("sh", &["-c", "cat"]).await;
+
+        ws.send(Message::Text("[1,2,3]".into())).await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    // ── outbound failure paths ─────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_transport_fails_on_unterminated_stdout_line() {
+        // Script writes data without a trailing newline then exits.
+        let (_ws, server) = setup("sh", &["-c", r#"printf '{"id":1}'"#]).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "expected error for unterminated stdout line"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ws_transport_closes_ws_cleanly_when_child_exits_with_newline() {
+        let (mut ws, server) =
+            setup("sh", &["-c", r#"printf '{"ok":true}\n'"#]).await;
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, Message::Text(r#"{"ok":true}"#.into()));
+
+        let next = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap();
+        if let Some(Ok(msg)) = next {
+            assert!(matches!(msg, Message::Close(_)));
+        }
 
         let status = tokio::time::timeout(Duration::from_secs(2), server)
             .await
@@ -490,580 +557,523 @@ mod tests {
         assert!(status.success());
     }
 
-    #[derive(Clone, Debug, Default)]
-    struct RecordingClient {
-        notifications: Arc<TokioMutex<Vec<acp::SessionNotification>>>,
+    // ── validate_inbound_ws_message unit tests ─────────────────────────────────
+
+    #[test]
+    fn validate_accepts_valid_object() {
+        assert!(validate_inbound_ws_message(r#"{"method":"ping"}"#).is_ok());
     }
 
-    impl RecordingClient {
-        async fn first_notification(&self) -> Option<acp::SessionNotification> {
-            self.notifications.lock().await.first().cloned()
-        }
+    #[test]
+    fn validate_rejects_newline() {
+        assert!(validate_inbound_ws_message("{\"a\":1}\n").is_err());
     }
 
-    #[async_trait::async_trait(?Send)]
-    impl acp::Client for RecordingClient {
-        async fn request_permission(
-            &self,
-            _args: acp::RequestPermissionRequest,
-        ) -> acp::Result<acp::RequestPermissionResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn write_text_file(
-            &self,
-            _args: acp::WriteTextFileRequest,
-        ) -> acp::Result<acp::WriteTextFileResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn read_text_file(
-            &self,
-            _args: acp::ReadTextFileRequest,
-        ) -> acp::Result<acp::ReadTextFileResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn create_terminal(
-            &self,
-            _args: acp::CreateTerminalRequest,
-        ) -> acp::Result<acp::CreateTerminalResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn terminal_output(
-            &self,
-            _args: acp::TerminalOutputRequest,
-        ) -> acp::Result<acp::TerminalOutputResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn release_terminal(
-            &self,
-            _args: acp::ReleaseTerminalRequest,
-        ) -> acp::Result<acp::ReleaseTerminalResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn wait_for_terminal_exit(
-            &self,
-            _args: acp::WaitForTerminalExitRequest,
-        ) -> acp::Result<acp::WaitForTerminalExitResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn kill_terminal(
-            &self,
-            _args: acp::KillTerminalRequest,
-        ) -> acp::Result<acp::KillTerminalResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
-            self.notifications.lock().await.push(args);
-            Ok(())
-        }
-
-        async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn ext_notification(&self, _args: acp::ExtNotification) -> acp::Result<()> {
-            Err(acp::Error::method_not_found())
-        }
+    #[test]
+    fn validate_rejects_carriage_return() {
+        assert!(validate_inbound_ws_message("{\"a\":1}\r").is_err());
     }
 
-    struct TestAcpAgent {
-        notifications: mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>,
-        next_session_id: Cell<u64>,
+    #[test]
+    fn validate_rejects_non_json() {
+        assert!(validate_inbound_ws_message("hello").is_err());
     }
 
-    impl TestAcpAgent {
-        fn new(
-            notifications: mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>,
-        ) -> Self {
-            Self {
-                notifications,
-                next_session_id: Cell::new(0),
+    #[test]
+    fn validate_rejects_json_array() {
+        assert!(validate_inbound_ws_message("[1,2]").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_json_null() {
+        assert!(validate_inbound_ws_message("null").is_err());
+    }
+
+    // ── ACP SDK end-to-end tests ───────────────────────────────────────────────
+    //
+    // These tests run a real `AgentSideConnection` in-process over the WS
+    // transport to verify the full ACP protocol flow with the new framing.
+
+    #[cfg(unix)]
+    mod acp_e2e {
+        use std::cell::Cell;
+        use std::io;
+        use std::pin::Pin;
+        use std::rc::Rc;
+        use std::task::{Context as Ctx, Poll};
+
+        use agent_client_protocol::{self as acp, Agent as _, Client as _};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio::sync::{mpsc, oneshot};
+        use tokio::task::LocalSet;
+        use tokio_tungstenite::connect_async;
+        use tokio_tungstenite::tungstenite::Message;
+
+        // ── In-process test agent ──────────────────────────────────────────────
+
+        struct EchoAgent {
+            notification_tx:
+                mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>,
+            next_session_id: Cell<u64>,
+        }
+
+        impl EchoAgent {
+            fn new(
+                tx: mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>,
+            ) -> Self {
+                Self {
+                    notification_tx: tx,
+                    next_session_id: Cell::new(0),
+                }
             }
         }
-    }
 
-    #[async_trait::async_trait(?Send)]
-    impl acp::Agent for TestAcpAgent {
-        async fn initialize(
-            &self,
-            arguments: acp::InitializeRequest,
-        ) -> acp::Result<acp::InitializeResponse> {
-            Ok(
-                acp::InitializeResponse::new(arguments.protocol_version).agent_info(
-                    acp::Implementation::new("ws-test-agent", "0.1.0").title("WS Test Agent"),
-                ),
-            )
-        }
-
-        async fn authenticate(
-            &self,
-            _arguments: acp::AuthenticateRequest,
-        ) -> acp::Result<acp::AuthenticateResponse> {
-            Ok(acp::AuthenticateResponse::default())
-        }
-
-        async fn new_session(
-            &self,
-            _arguments: acp::NewSessionRequest,
-        ) -> acp::Result<acp::NewSessionResponse> {
-            let session_id = self.next_session_id.get();
-            self.next_session_id.set(session_id + 1);
-            Ok(acp::NewSessionResponse::new(session_id.to_string()))
-        }
-
-        async fn load_session(
-            &self,
-            _arguments: acp::LoadSessionRequest,
-        ) -> acp::Result<acp::LoadSessionResponse> {
-            Ok(acp::LoadSessionResponse::new())
-        }
-
-        async fn set_session_mode(
-            &self,
-            _arguments: acp::SetSessionModeRequest,
-        ) -> acp::Result<acp::SetSessionModeResponse> {
-            Ok(acp::SetSessionModeResponse::new())
-        }
-
-        async fn prompt(&self, arguments: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
-            let (ack_tx, ack_rx) = oneshot::channel();
-            self.notifications
-                .send((
-                    acp::SessionNotification::new(
-                        arguments.session_id,
-                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                            "hello over ws bridge".into(),
-                        )),
-                    ),
-                    ack_tx,
+        #[async_trait::async_trait(?Send)]
+        impl acp::Agent for EchoAgent {
+            async fn initialize(
+                &self,
+                args: acp::InitializeRequest,
+            ) -> acp::Result<acp::InitializeResponse> {
+                Ok(acp::InitializeResponse::new(args.protocol_version).agent_info(
+                    acp::Implementation::new("ws-e2e-agent", "0.1.0").title("WS E2E Agent"),
                 ))
-                .map_err(|_| acp::Error::internal_error())?;
-            let _ = ack_rx.await;
-            Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
-        }
-
-        async fn cancel(&self, _args: acp::CancelNotification) -> acp::Result<()> {
-            Ok(())
-        }
-
-        async fn set_session_config_option(
-            &self,
-            _args: acp::SetSessionConfigOptionRequest,
-        ) -> acp::Result<acp::SetSessionConfigOptionResponse> {
-            Ok(acp::SetSessionConfigOptionResponse::new(Vec::new()))
-        }
-
-        async fn list_sessions(
-            &self,
-            _args: acp::ListSessionsRequest,
-        ) -> acp::Result<acp::ListSessionsResponse> {
-            Ok(acp::ListSessionsResponse::new(Vec::new()))
-        }
-
-        async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
-            Err(acp::Error::method_not_found())
-        }
-
-        async fn ext_notification(&self, _args: acp::ExtNotification) -> acp::Result<()> {
-            Err(acp::Error::method_not_found())
-        }
-    }
-
-    fn spawn_test_agent_streams() -> (
-        impl tokio::io::AsyncWrite + Send,
-        impl tokio::io::AsyncRead + Send,
-    ) {
-        let (client_to_agent_rx, client_to_agent_tx) = piper::pipe(1024);
-        let (agent_to_client_rx, agent_to_client_tx) = piper::pipe(1024);
-        let (notification_tx, mut notification_rx) = mpsc::unbounded_channel();
-
-        let (conn, io_task) = acp::AgentSideConnection::new(
-            TestAcpAgent::new(notification_tx),
-            agent_to_client_tx,
-            client_to_agent_rx,
-            |fut| {
-                tokio::task::spawn_local(fut);
-            },
-        );
-        let conn = Rc::new(conn);
-        let notification_conn = Rc::clone(&conn);
-
-        tokio::task::spawn_local(io_task);
-        tokio::task::spawn_local(async move {
-            while let Some((notification, ack)) = notification_rx.recv().await {
-                if notification_conn
-                    .session_notification(notification)
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                let _ = ack.send(());
-            }
-        });
-
-        (
-            client_to_agent_tx.compat_write(),
-            agent_to_client_rx.compat(),
-        )
-    }
-
-    enum BridgeCommand {
-        Request {
-            method: String,
-            params: Value,
-            response: Option<oneshot::Sender<Result<Value>>>,
-        },
-        Shutdown,
-    }
-
-    struct WsRpcBridgeHandle {
-        command_tx: mpsc::UnboundedSender<BridgeCommand>,
-        manager: tokio::task::JoinHandle<Result<()>>,
-    }
-
-    impl WsRpcBridgeHandle {
-        async fn shutdown(self) -> Result<()> {
-            let _ = self.command_tx.send(BridgeCommand::Shutdown);
-            self.manager
-                .await
-                .context("failed to join websocket bridge task")?
-        }
-    }
-
-    struct WsRpcReader {
-        incoming_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-        buffer: Vec<u8>,
-        offset: usize,
-    }
-
-    impl WsRpcReader {
-        fn new(incoming_rx: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
-            Self {
-                incoming_rx,
-                buffer: Vec::new(),
-                offset: 0,
-            }
-        }
-    }
-
-    impl futures_util::io::AsyncRead for WsRpcReader {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut TaskContext<'_>,
-            buf: &mut [u8],
-        ) -> Poll<io::Result<usize>> {
-            if self.offset < self.buffer.len() {
-                let remaining = &self.buffer[self.offset..];
-                let read = remaining.len().min(buf.len());
-                buf[..read].copy_from_slice(&remaining[..read]);
-                self.offset += read;
-                if self.offset == self.buffer.len() {
-                    self.buffer.clear();
-                    self.offset = 0;
-                }
-                return Poll::Ready(Ok(read));
             }
 
-            match self.incoming_rx.poll_recv(cx) {
-                Poll::Ready(Some(chunk)) => {
-                    self.buffer = chunk;
-                    self.offset = 0;
-                    self.poll_read(cx, buf)
-                }
-                Poll::Ready(None) => Poll::Ready(Ok(0)),
-                Poll::Pending => Poll::Pending,
+            async fn authenticate(
+                &self,
+                _args: acp::AuthenticateRequest,
+            ) -> acp::Result<acp::AuthenticateResponse> {
+                Ok(acp::AuthenticateResponse::default())
             }
-        }
-    }
 
-    struct WsRpcWriter {
-        command_tx: mpsc::UnboundedSender<BridgeCommand>,
-        buffer: Vec<u8>,
-    }
+            async fn new_session(
+                &self,
+                _args: acp::NewSessionRequest,
+            ) -> acp::Result<acp::NewSessionResponse> {
+                let id = self.next_session_id.get();
+                self.next_session_id.set(id + 1);
+                Ok(acp::NewSessionResponse::new(id.to_string()))
+            }
 
-    impl WsRpcWriter {
-        fn new(command_tx: mpsc::UnboundedSender<BridgeCommand>) -> Self {
-            Self {
-                command_tx,
-                buffer: Vec::new(),
+            async fn load_session(
+                &self,
+                _args: acp::LoadSessionRequest,
+            ) -> acp::Result<acp::LoadSessionResponse> {
+                Ok(acp::LoadSessionResponse::new())
+            }
+
+            async fn set_session_mode(
+                &self,
+                _args: acp::SetSessionModeRequest,
+            ) -> acp::Result<acp::SetSessionModeResponse> {
+                Ok(acp::SetSessionModeResponse::new())
+            }
+
+            async fn prompt(
+                &self,
+                args: acp::PromptRequest,
+            ) -> acp::Result<acp::PromptResponse> {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                self.notification_tx
+                    .send((
+                        acp::SessionNotification::new(
+                            args.session_id,
+                            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                                "pong".into(),
+                            )),
+                        ),
+                        ack_tx,
+                    ))
+                    .map_err(|_| acp::Error::internal_error())?;
+                let _ = ack_rx.await;
+                Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+            }
+
+            async fn cancel(&self, _args: acp::CancelNotification) -> acp::Result<()> {
+                Ok(())
+            }
+
+            async fn set_session_config_option(
+                &self,
+                _args: acp::SetSessionConfigOptionRequest,
+            ) -> acp::Result<acp::SetSessionConfigOptionResponse> {
+                Ok(acp::SetSessionConfigOptionResponse::new(Vec::new()))
+            }
+
+            async fn list_sessions(
+                &self,
+                _args: acp::ListSessionsRequest,
+            ) -> acp::Result<acp::ListSessionsResponse> {
+                Ok(acp::ListSessionsResponse::new(Vec::new()))
+            }
+
+            async fn ext_method(
+                &self,
+                _args: acp::ExtRequest,
+            ) -> acp::Result<acp::ExtResponse> {
+                Err(acp::Error::method_not_found())
+            }
+
+            async fn ext_notification(
+                &self,
+                _args: acp::ExtNotification,
+            ) -> acp::Result<()> {
+                Err(acp::Error::method_not_found())
             }
         }
 
-        fn queue_complete_lines(&mut self) -> io::Result<()> {
-            while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
-                let chunk = self.buffer.drain(..=position).collect::<Vec<_>>();
-                self.command_tx
-                    .send(BridgeCommand::Request {
-                        method: WS_WRITE_STDIN_METHOD.to_string(),
-                        params: json!([{ "data": chunk }]),
-                        response: None,
-                    })
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "websocket bridge closed")
+        // ── Minimal no-op client ───────────────────────────────────────────────
+
+        #[derive(Clone, Default)]
+        struct NullClient {
+            notifications:
+                std::sync::Arc<std::sync::Mutex<Vec<acp::SessionNotification>>>,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl acp::Client for NullClient {
+            async fn request_permission(
+                &self,
+                _a: acp::RequestPermissionRequest,
+            ) -> acp::Result<acp::RequestPermissionResponse> {
+                Err(acp::Error::method_not_found())
+            }
+            async fn write_text_file(
+                &self,
+                _a: acp::WriteTextFileRequest,
+            ) -> acp::Result<acp::WriteTextFileResponse> {
+                Err(acp::Error::method_not_found())
+            }
+            async fn read_text_file(
+                &self,
+                _a: acp::ReadTextFileRequest,
+            ) -> acp::Result<acp::ReadTextFileResponse> {
+                Err(acp::Error::method_not_found())
+            }
+            async fn create_terminal(
+                &self,
+                _a: acp::CreateTerminalRequest,
+            ) -> acp::Result<acp::CreateTerminalResponse> {
+                Err(acp::Error::method_not_found())
+            }
+            async fn terminal_output(
+                &self,
+                _a: acp::TerminalOutputRequest,
+            ) -> acp::Result<acp::TerminalOutputResponse> {
+                Err(acp::Error::method_not_found())
+            }
+            async fn release_terminal(
+                &self,
+                _a: acp::ReleaseTerminalRequest,
+            ) -> acp::Result<acp::ReleaseTerminalResponse> {
+                Err(acp::Error::method_not_found())
+            }
+            async fn wait_for_terminal_exit(
+                &self,
+                _a: acp::WaitForTerminalExitRequest,
+            ) -> acp::Result<acp::WaitForTerminalExitResponse> {
+                Err(acp::Error::method_not_found())
+            }
+            async fn kill_terminal(
+                &self,
+                _a: acp::KillTerminalRequest,
+            ) -> acp::Result<acp::KillTerminalResponse> {
+                Err(acp::Error::method_not_found())
+            }
+            async fn session_notification(
+                &self,
+                n: acp::SessionNotification,
+            ) -> acp::Result<()> {
+                self.notifications.lock().unwrap().push(n);
+                Ok(())
+            }
+            async fn ext_method(
+                &self,
+                _a: acp::ExtRequest,
+            ) -> acp::Result<acp::ExtResponse> {
+                Err(acp::Error::method_not_found())
+            }
+            async fn ext_notification(
+                &self,
+                _a: acp::ExtNotification,
+            ) -> acp::Result<()> {
+                Err(acp::Error::method_not_found())
+            }
+        }
+
+        // ── WS ↔ futures::AsyncRead/Write adapter ─────────────────────────────
+        //
+        // The ACP SDK expects `futures::AsyncRead + AsyncWrite` (from the
+        // `futures` crate), but tokio-tungstenite uses its own `SplitSink` /
+        // `SplitStream`.  We bridge them with a pair of `piper::pipe` channels:
+        //
+        //   WsWriter  – receives bytes from the ACP encoder, accumulates them
+        //               into complete NDJSON lines, and forwards each line as a
+        //               single WS Text frame (stripped of the trailing `\n`).
+        //
+        //   WsReader  – receives WS Text frames, appends `\n`, and exposes them
+        //               as a byte stream to the ACP decoder.
+
+        /// An `AsyncWrite` that converts NDJSON byte writes into WS Text frames.
+        struct WsWriter {
+            /// Byte buffer – accumulates data until a `\n` is seen.
+            buf: Vec<u8>,
+            /// Channel to the background pump task.
+            frame_tx: mpsc::UnboundedSender<String>,
+        }
+
+        impl futures_util::io::AsyncWrite for WsWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Ctx<'_>,
+                data: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.buf.extend_from_slice(data);
+                while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = self.buf.drain(..=pos).collect();
+                    let text =
+                        String::from_utf8(line_bytes[..line_bytes.len() - 1].to_vec())
+                            .map_err(|_| {
+                                io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 message")
+                            })?;
+                    self.frame_tx.send(text).map_err(|_| {
+                        io::Error::new(io::ErrorKind::BrokenPipe, "ws writer closed")
                     })?;
+                }
+                Poll::Ready(Ok(data.len()))
             }
 
-            Ok(())
-        }
-    }
-
-    impl futures_util::io::AsyncWrite for WsRpcWriter {
-        fn poll_write(
-            mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            self.buffer.extend_from_slice(buf);
-            if let Err(error) = self.queue_complete_lines() {
-                return Poll::Ready(Err(error));
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Ctx<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
             }
-            Poll::Ready(Ok(buf.len()))
-        }
 
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-        ) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            mut self: std::pin::Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-        ) -> Poll<io::Result<()>> {
-            if !self.buffer.is_empty() {
-                let chunk = std::mem::take(&mut self.buffer);
-                self.command_tx
-                    .send(BridgeCommand::Request {
-                        method: WS_WRITE_STDIN_METHOD.to_string(),
-                        params: json!([{ "data": chunk }]),
-                        response: None,
-                    })
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::BrokenPipe, "websocket bridge closed")
-                    })?;
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _cx: &mut Ctx<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
             }
-            let _ = self.command_tx.send(BridgeCommand::Request {
-                method: WS_CLOSE_STDIN_METHOD.to_string(),
-                params: json!([]),
-                response: None,
-            });
-            Poll::Ready(Ok(()))
         }
-    }
 
-    async fn bridge_request(
-        command_tx: &mpsc::UnboundedSender<BridgeCommand>,
-        method: &str,
-        params: Value,
-    ) -> Result<Value> {
-        let (response_tx, response_rx) = oneshot::channel();
-        command_tx
-            .send(BridgeCommand::Request {
-                method: method.to_string(),
-                params,
-                response: Some(response_tx),
-            })
-            .map_err(|_| anyhow!("websocket bridge command channel closed"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow!("websocket bridge response channel closed"))?
-    }
+        /// An `AsyncRead` that turns WS Text frames into a byte stream.
+        struct WsReader {
+            /// Incoming frame bytes (with appended `\n`) not yet consumed.
+            leftover: Vec<u8>,
+            offset: usize,
+            /// Channel from the background pump task.
+            frame_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        }
 
-    async fn connect_sdk_bridge(
-        url: &str,
-    ) -> Result<(WsRpcWriter, WsRpcReader, WsRpcBridgeHandle)> {
-        let (websocket, _) = connect_async(url)
-            .await
-            .with_context(|| format!("failed to connect websocket bridge to {url}"))?;
-        let (mut sink, mut stream) = websocket.split();
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        impl futures_util::io::AsyncRead for WsReader {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Ctx<'_>,
+                buf: &mut [u8],
+            ) -> Poll<io::Result<usize>> {
+                if self.offset < self.leftover.len() {
+                    let remaining = &self.leftover[self.offset..];
+                    let n = remaining.len().min(buf.len());
+                    buf[..n].copy_from_slice(&remaining[..n]);
+                    self.offset += n;
+                    if self.offset == self.leftover.len() {
+                        self.leftover.clear();
+                        self.offset = 0;
+                    }
+                    return Poll::Ready(Ok(n));
+                }
 
-        let manager = tokio::spawn(async move {
-            let mut next_id = 0_u64;
-            let mut pending: HashMap<u64, Option<oneshot::Sender<Result<Value>>>> = HashMap::new();
-
-            loop {
-                tokio::select! {
-                    command = command_rx.recv() => match command {
-                        Some(BridgeCommand::Request { method, params, response }) => {
-                            let id = next_id;
-                            next_id += 1;
-                            pending.insert(id, response);
-                            let request = json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "method": method,
-                                "params": params,
-                            });
-                            sink.send(Message::Text(request.to_string().into()))
-                                .await
-                                .map_err(|error| anyhow!("failed to send websocket request: {error}"))?;
+                match self.frame_rx.poll_recv(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => Poll::Ready(Ok(0)),
+                    Poll::Ready(Some(bytes)) => {
+                        let n = bytes.len().min(buf.len());
+                        buf[..n].copy_from_slice(&bytes[..n]);
+                        if n < bytes.len() {
+                            self.leftover = bytes[n..].to_vec();
+                            self.offset = 0;
                         }
-                        Some(BridgeCommand::Shutdown) => {
-                            let _ = sink.close().await;
-                            break;
-                        }
-                        None => break,
-                    },
-                    message = stream.next() => match message {
-                        Some(Ok(Message::Text(text))) => {
-                            let payload: Value = serde_json::from_str(&text)
-                                .with_context(|| format!("failed to decode websocket payload: {text}"))?;
-                            if let Some(id) = payload.get("id").and_then(Value::as_u64) {
-                                if let Some(response) = pending.remove(&id).flatten() {
-                                    if let Some(result) = payload.get("result") {
-                                        let _ = response.send(Ok(result.clone()));
-                                    } else if let Some(error) = payload.get("error") {
-                                        let _ = response.send(Err(anyhow!("websocket rpc error: {error}")));
-                                    } else {
-                                        let _ = response.send(Ok(Value::Null));
-                                    }
-                                }
-                            } else if payload.get("method").and_then(Value::as_str)
-                                == Some(WS_STDOUT_NOTIFICATION_METHOD)
-                            {
-                                let bytes = payload
-                                    .get("params")
-                                    .and_then(|params| params.get("result"))
-                                    .and_then(|result| result.get("data"))
-                                    .and_then(Value::as_array)
-                                    .map(|items| {
-                                        items
-                                            .iter()
-                                            .filter_map(Value::as_u64)
-                                            .map(|value| value as u8)
-                                            .collect::<Vec<_>>()
-                                    })
-                                    .ok_or_else(|| anyhow!("missing stdout payload in websocket notification"))?;
-                                let _ = incoming_tx.send(bytes);
-                            }
-                        }
-                        Some(Ok(Message::Binary(_))) => {}
-                        Some(Ok(Message::Close(_))) | None => break,
-                        Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
-                        Some(Ok(Message::Frame(_))) => {}
-                        Some(Err(error)) => return Err(anyhow!("websocket bridge read failed: {error}")),
+                        Poll::Ready(Ok(n))
                     }
                 }
             }
-
-            Ok(())
-        });
-
-        bridge_request(&command_tx, WS_SUBSCRIBE_STDOUT_METHOD, json!([])).await?;
-
-        Ok((
-            WsRpcWriter::new(command_tx.clone()),
-            WsRpcReader::new(incoming_rx),
-            WsRpcBridgeHandle {
-                command_tx,
-                manager,
-            },
-        ))
-    }
-
-    async fn wait_for_session_notification(
-        client: &RecordingClient,
-        timeout: Duration,
-    ) -> acp::SessionNotification {
-        let start = tokio::time::Instant::now();
-        loop {
-            if let Some(notification) = client.first_notification().await {
-                return notification;
-            }
-
-            assert!(
-                start.elapsed() < timeout,
-                "timed out waiting for ACP session notification"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn ws_transport_supports_acp_sdk_over_websocket_bridge() {
-        let local_set = LocalSet::new();
-        local_set
-            .run_until(async {
-                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let address = listener.local_addr().unwrap();
-                let (stdin, stdout) = spawn_test_agent_streams();
-                let server = tokio::spawn(async move {
-                    run_stream_ws_with_listener(
-                        stdin,
-                        stdout,
-                        "ws-test-agent",
-                        BoundListener {
-                            listener,
-                            display_address: address.to_string(),
-                        },
-                    )
-                    .await
-                });
+        // ── Helper: build a WsWriter+WsReader pair from a WS connection ───────
 
-                let (outgoing, incoming, bridge) = connect_sdk_bridge(&format!("ws://{address}"))
-                    .await
-                    .unwrap();
-                let client = RecordingClient::default();
+        fn ws_to_acp_io<S>(ws: tokio_tungstenite::WebSocketStream<S>) -> (WsWriter, WsReader)
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + 'static,
+        {
+            let (mut ws_sink, mut ws_stream) = ws.split();
+            let (frame_tx, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
+            let (incoming_tx, frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+            // Pump outgoing frames.
+            tokio::task::spawn_local(async move {
+                while let Some(text) = outgoing_rx.recv().await {
+                    if ws_sink.send(Message::Text(text.into())).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = ws_sink.close().await;
+            });
+
+            // Pump incoming frames.
+            tokio::task::spawn_local(async move {
+                while let Some(msg) = ws_stream.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            let mut bytes = text.as_bytes().to_vec();
+                            bytes.push(b'\n');
+                            if incoming_tx.send(bytes).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Message::Close(_)) | Err(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+
+            (
+                WsWriter { buf: Vec::new(), frame_tx },
+                WsReader { leftover: Vec::new(), offset: 0, frame_rx },
+            )
+        }
+
+        // ── Test setup helper ─────────────────────────────────────────────────
+
+        async fn setup_acp_ws() -> (acp::ClientSideConnection, NullClient) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+
+            // Server side: accept one WS connection, wire to AgentSideConnection.
+            tokio::task::spawn_local(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let (writer, reader) = ws_to_acp_io(ws);
+
+                let (notification_tx, mut notification_rx) = mpsc::unbounded_channel();
+                let agent = EchoAgent::new(notification_tx);
+
                 let (conn, io_task) =
-                    acp::ClientSideConnection::new(client.clone(), outgoing, incoming, |fut| {
+                    acp::AgentSideConnection::new(agent, writer, reader, |fut| {
                         tokio::task::spawn_local(fut);
                     });
+                let conn = Rc::new(conn);
+                let notify_conn = Rc::clone(&conn);
+
                 tokio::task::spawn_local(io_task);
+                tokio::task::spawn_local(async move {
+                    while let Some((notif, ack)) = notification_rx.recv().await {
+                        if notify_conn.session_notification(notif).await.is_err() {
+                            break;
+                        }
+                        let _ = ack.send(());
+                    }
+                });
+            });
 
-                let initialize = conn
-                    .initialize(
-                        acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
-                            acp::Implementation::new("ws-test-client", "0.1.0")
-                                .title("WS Test Client"),
-                        ),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(initialize.protocol_version, acp::ProtocolVersion::V1);
+            // Client side.
+            let (ws, _) = connect_async(format!("ws://{address}")).await.unwrap();
+            let (writer, reader) = ws_to_acp_io(ws);
 
-                let session = conn
-                    .new_session(acp::NewSessionRequest::new(
-                        std::env::current_dir().unwrap(),
-                    ))
-                    .await
-                    .unwrap();
-                let prompt_result = conn
-                    .prompt(acp::PromptRequest::new(
-                        session.session_id.clone(),
-                        vec!["ping".into()],
-                    ))
-                    .await
-                    .unwrap();
-                assert_eq!(prompt_result.stop_reason, acp::StopReason::EndTurn);
+            let null_client = NullClient::default();
+            let (conn, io_task) =
+                acp::ClientSideConnection::new(null_client.clone(), writer, reader, |fut| {
+                    tokio::task::spawn_local(fut);
+                });
+            tokio::task::spawn_local(io_task);
 
-                let notification =
-                    wait_for_session_notification(&client, Duration::from_secs(2)).await;
-                match notification.update {
-                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk {
-                        content: acp::ContentBlock::Text(text),
-                        ..
-                    }) => assert_eq!(text.text, "hello over ws bridge"),
-                    update => panic!("unexpected session update: {update:?}"),
-                }
+            (conn, null_client)
+        }
 
-                bridge.shutdown().await.unwrap();
-                tokio::time::timeout(Duration::from_secs(2), server)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-            })
-            .await;
+        // ── Tests ─────────────────────────────────────────────────────────────
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn acp_initialize_over_ws_transport() {
+            LocalSet::new()
+                .run_until(async {
+                    let (conn, _client) = setup_acp_ws().await;
+
+                    let resp = conn
+                        .initialize(
+                            acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_info(
+                                acp::Implementation::new("test-client", "0.1.0")
+                                    .title("Test Client"),
+                            ),
+                        )
+                        .await
+                        .expect("initialize failed");
+
+                    assert_eq!(resp.protocol_version, acp::ProtocolVersion::V1);
+                    let info = resp.agent_info.unwrap();
+                    assert_eq!(info.name, "ws-e2e-agent");
+                })
+                .await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn acp_new_session_over_ws_transport() {
+            LocalSet::new()
+                .run_until(async {
+                    let (conn, _client) = setup_acp_ws().await;
+
+                    let resp = conn
+                        .new_session(acp::NewSessionRequest::new(
+                            std::env::current_dir().unwrap(),
+                        ))
+                        .await
+                        .expect("new_session failed");
+
+                    assert_eq!(resp.session_id.0.as_ref(), "0");
+                })
+                .await;
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn acp_prompt_and_session_notification_over_ws_transport() {
+            LocalSet::new()
+                .run_until(async {
+                    let (conn, client) = setup_acp_ws().await;
+
+                    let session = conn
+                        .new_session(acp::NewSessionRequest::new(
+                            std::env::current_dir().unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+
+                    let prompt_resp = conn
+                        .prompt(acp::PromptRequest::new(
+                            session.session_id,
+                            vec!["ping".into()],
+                        ))
+                        .await
+                        .expect("prompt failed");
+
+                    assert_eq!(prompt_resp.stop_reason, acp::StopReason::EndTurn);
+
+                    // Yield so notification delivery completes.
+                    for _ in 0..20 {
+                        tokio::task::yield_now().await;
+                    }
+
+                    let notifs = client.notifications.lock().unwrap();
+                    assert_eq!(notifs.len(), 1);
+                    match &notifs[0].update {
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk {
+                            content: acp::ContentBlock::Text(t),
+                            ..
+                        }) => assert_eq!(t.text, "pong"),
+                        other => panic!("unexpected update: {other:?}"),
+                    }
+                })
+                .await;
+        }
     }
 }

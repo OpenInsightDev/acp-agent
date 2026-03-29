@@ -6,5 +6,5 @@
 pub mod h2;
 /// Raw TCP byte-stream transport.
 pub mod tcp;
-/// WebSocket + JSON-RPC transport built on `jsonrpsee`.
+/// WebSocket transport: one ACP message per WebSocket text frame.
 pub mod ws;
