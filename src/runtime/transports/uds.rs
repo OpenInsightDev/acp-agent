@@ -4,9 +4,10 @@
 #![cfg(unix)]
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::runtime::prepare::{CommandSpec, PreparedCommand};
@@ -18,8 +19,17 @@ pub async fn serve_uds(
     subject: &str,
     path: &Path,
 ) -> Result<ExitStatus> {
+    if path.exists() {
+        bail!(
+            "refusing to bind Unix socket at {}: path already exists",
+            path.display()
+        );
+    }
+
+    let mut socket_path_guard = SocketPathGuard::new(path.to_path_buf());
     let listener = UnixListener::bind(path)
         .with_context(|| format!("failed to bind Unix socket listener at {}", path.display()))?;
+    socket_path_guard.mark_created();
     eprintln!(
         "Running {} over unix://{} (raw stdio stream transport)",
         subject,
@@ -45,4 +55,32 @@ pub async fn serve_uds_connection(
     socket: UnixStream,
 ) -> Result<ExitStatus> {
     serve_raw_stream_connection(spec, subject, socket).await
+}
+
+struct SocketPathGuard {
+    path: PathBuf,
+    created: bool,
+}
+
+impl SocketPathGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            created: false,
+        }
+    }
+
+    fn mark_created(&mut self) {
+        self.created = true;
+    }
+}
+
+impl Drop for SocketPathGuard {
+    fn drop(&mut self) {
+        if !self.created {
+            return;
+        }
+
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
