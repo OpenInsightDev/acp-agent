@@ -78,18 +78,33 @@ struct ServeCliOptions {
 impl ServeCliOptions {
     fn into_mode(self) -> anyhow::Result<ServeMode> {
         match self.transport {
-            ServeTransportArg::Http => Ok(ServeMode::Http {
-                host: self.host.unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string()),
-                port: self.port.unwrap_or(DEFAULT_SERVE_PORT),
-            }),
-            ServeTransportArg::Tcp => Ok(ServeMode::Tcp {
-                host: self.host.unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string()),
-                port: self.port.unwrap_or(DEFAULT_SERVE_PORT),
-            }),
-            ServeTransportArg::Ws => Ok(ServeMode::Ws {
-                host: self.host.unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string()),
-                port: self.port.unwrap_or(DEFAULT_SERVE_PORT),
-            }),
+            ServeTransportArg::Http => {
+                #[cfg(unix)]
+                reject_unix_socket_for_non_uds(&self.unix_socket)?;
+
+                Ok(ServeMode::Http {
+                    host: self.host.unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string()),
+                    port: self.port.unwrap_or(DEFAULT_SERVE_PORT),
+                })
+            }
+            ServeTransportArg::Tcp => {
+                #[cfg(unix)]
+                reject_unix_socket_for_non_uds(&self.unix_socket)?;
+
+                Ok(ServeMode::Tcp {
+                    host: self.host.unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string()),
+                    port: self.port.unwrap_or(DEFAULT_SERVE_PORT),
+                })
+            }
+            ServeTransportArg::Ws => {
+                #[cfg(unix)]
+                reject_unix_socket_for_non_uds(&self.unix_socket)?;
+
+                Ok(ServeMode::Ws {
+                    host: self.host.unwrap_or_else(|| DEFAULT_SERVE_HOST.to_string()),
+                    port: self.port.unwrap_or(DEFAULT_SERVE_PORT),
+                })
+            }
             #[cfg(unix)]
             ServeTransportArg::Uds => {
                 if self.host.is_some() || self.port.is_some() {
@@ -103,6 +118,15 @@ impl ServeCliOptions {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn reject_unix_socket_for_non_uds(unix_socket: &Option<PathBuf>) -> anyhow::Result<()> {
+    if unix_socket.is_some() {
+        bail!("--unix-socket can only be used with --transport uds");
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Subcommand)]
@@ -427,6 +451,32 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_unix_socket_for_non_uds_transport() {
+        let cli = Cli::try_parse_from([
+            "acp-agent",
+            "serve",
+            "demo-agent",
+            "--transport",
+            "tcp",
+            "--unix-socket",
+            "/tmp/acp-agent.sock",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Serve { options, .. } => {
+                let error = options.into_mode().unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "--unix-socket can only be used with --transport uds"
+                );
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
     }
 
     #[test]

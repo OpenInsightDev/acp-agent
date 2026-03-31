@@ -40,6 +40,7 @@ Expose an agent over a network transport:
 acp-agent serve example-agent --transport http --host 127.0.0.1 --port 8010
 acp-agent serve example-agent --transport tcp --port 9000
 acp-agent serve example-agent --transport ws --port 7000
+acp-agent serve example-agent --transport uds --unix-socket /tmp/acp-agent.sock
 ```
 
 ## Transport Modes
@@ -47,6 +48,7 @@ acp-agent serve example-agent --transport ws --port 7000
 - `http` exposes one HTTP/2 byte stream over `POST /` with `Content-Type: application/octet-stream`.
 - `tcp` exposes raw stdin/stdout bytes over a single TCP connection.
 - `ws` exposes ACP messages as WebSocket text frames (one message per frame).
+- `uds` exposes raw stdin/stdout bytes over a single Unix domain socket connection on Unix.
 
 ## Library Surface
 

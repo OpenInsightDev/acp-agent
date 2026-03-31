@@ -14,5 +14,5 @@ pub mod process;
 pub mod serve;
 /// Direct stdio execution without a network transport.
 pub mod stdio;
-/// Concrete TCP, HTTP/2, and WebSocket transport implementations.
+/// Concrete TCP, Unix domain socket, HTTP/2, and WebSocket transport implementations.
 pub mod transports;
