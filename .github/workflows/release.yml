@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: acp-agent
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --locked
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset_suffix: linux-x86_64
+            archive_ext: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset_suffix: linux-aarch64
+            archive_ext: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset_suffix: darwin-x86_64
+            archive_ext: tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset_suffix: darwin-aarch64
+            archive_ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package archive
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME#v}"
+          DIST_DIR="dist"
+          ARCHIVE_BASENAME="${BIN_NAME}-${VERSION}-${ASSET_SUFFIX}"
+          mkdir -p "$DIST_DIR"
+          cp "target/${TARGET}/release/${BIN_NAME}" "${DIST_DIR}/${BIN_NAME}"
+          chmod +x "${DIST_DIR}/${BIN_NAME}"
+          tar -czf "${DIST_DIR}/${ARCHIVE_BASENAME}.${ARCHIVE_EXT}" -C "$DIST_DIR" "${BIN_NAME}"
+          rm "${DIST_DIR}/${BIN_NAME}"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_suffix }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Flatten artifact directory
+        run: |
+          set -eu
+          find dist -mindepth 2 -type f -exec mv {} dist/ \;
+          find dist -mindepth 1 -type d -empty -delete
+
+      - name: Add install script asset
+        run: cp scripts/install.sh dist/install.sh
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/install.sh
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          overwrite_files: true
