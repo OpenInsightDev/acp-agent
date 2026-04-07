@@ -216,16 +216,14 @@ pub struct Registry {
 impl Registry {
     /// Decodes the registry payload from a byte slice and validates it.
     pub fn from_slice(input: &[u8]) -> Result<Self> {
-        let registry: Self =
-            serde_json::from_slice(input).map_err(|error| registry_decode_error(error))?;
+        let registry: Self = serde_json::from_slice(input).map_err(registry_decode_error)?;
         registry.validate()?;
         Ok(registry)
     }
 
     /// Decodes the registry from a `serde_json::Value` and validates it.
     pub fn from_value(input: Value) -> Result<Self> {
-        let registry: Self =
-            serde_json::from_value(input).map_err(|error| registry_decode_error(error))?;
+        let registry: Self = serde_json::from_value(input).map_err(registry_decode_error)?;
         registry.validate()?;
         Ok(registry)
     }
@@ -284,8 +282,7 @@ impl FromStr for Registry {
     type Err = anyhow::Error;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let registry: Self =
-            serde_json::from_str(input).map_err(|error| registry_decode_error(error))?;
+        let registry: Self = serde_json::from_str(input).map_err(registry_decode_error)?;
         registry.validate()?;
         Ok(registry)
     }

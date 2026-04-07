@@ -30,7 +30,6 @@ pub mod serve;
 /// hosted in the public registry. The CLI delegates the actual work to
 /// the helpers defined in the sibling modules so that tests can exercise them
 /// programmatically.
-
 /// CLI arguments consumed by the `acp-agent` binary.
 ///
 /// The parser is intentionally thin: it only captures which subcommand the user

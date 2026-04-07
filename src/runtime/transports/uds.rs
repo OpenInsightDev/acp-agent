@@ -1,8 +1,6 @@
 //! Unix domain socket transport that proxies stdin/stdout bytes without framing.
 //! Only a single client is accepted so transports that need multiplexing should
 //! use the WebSocket or HTTP/2 implementations instead.
-#![cfg(unix)]
-
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
