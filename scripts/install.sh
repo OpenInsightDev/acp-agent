@@ -2,7 +2,7 @@
 
 set -eu
 
-REPO="${ACP_AGENT_REPO:-observerw/acp-agent-rs}"
+REPO="${ACP_AGENT_REPO:-OpenInsightDev/acp-agent}"
 BIN_NAME="${ACP_AGENT_BIN_NAME:-acp-agent}"
 INSTALL_DIR="${ACP_AGENT_INSTALL_DIR:-$HOME/.local/bin}"
 API_URL="https://api.github.com/repos/$REPO/releases/latest"
