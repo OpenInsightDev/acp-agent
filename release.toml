@@ -1,0 +1,9 @@
+# cargo-release configuration (https://github.com/cargo-release/cargo-release)
+#
+# Local publishing is disabled on purpose: the tag-triggered GitHub Actions
+# release workflow (release.yml) builds the platform binaries, publishes the
+# crate to crates.io via OIDC trusted publishing, creates the GitHub release,
+# and pushes the Docker image to GHCR. cargo-release only bumps the version,
+# commits, tags (v<version>), and pushes to origin.
+
+publish = false
