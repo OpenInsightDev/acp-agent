@@ -97,7 +97,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
       - name: Check out repository
@@ -116,7 +116,26 @@ jobs:
       - name: Publish crate to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
-        run: cargo publish --locked
+        run: |
+          set +e
+          cargo publish --locked 2> /tmp/publish.err
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ] && grep -qiE "already (exists|uploaded)|is already uploaded" /tmp/publish.err; then
+            echo "crate version already published; continuing"
+          else
+            cat /tmp/publish.err
+            exit "$status"
+          fi
+
+  release:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
 
       - name: Download packaged artifacts
         uses: actions/download-artifact@v8
