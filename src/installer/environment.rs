@@ -6,7 +6,7 @@ use std::process::ExitStatus;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
 
-const JS_TOOLS: [&str; 1] = ["npm"];
+const JS_TOOLS: [&str; 2] = ["npm", "deno"];
 const PYTHON_TOOLS: [&str; 1] = ["uv"];
 
 /// Detects missing agent toolchains and installs them if confirmed.
@@ -462,6 +462,13 @@ mod tests {
     #[test]
     fn skips_deno_installation_when_npm_is_available() {
         let plan = InstallationPlan::from_report(&report(&["npm"], &["uv"]));
+
+        assert!(plan.targets.is_empty());
+    }
+
+    #[test]
+    fn skips_deno_installation_when_deno_is_available() {
+        let plan = InstallationPlan::from_report(&report(&["deno"], &["uv"]));
 
         assert!(plan.targets.is_empty());
     }

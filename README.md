@@ -87,19 +87,42 @@ documentation.
 
 ## Docker
 
-Build the current project, install `codex-acp` inside the container, and expose
-it to clients on the host:
+The image contains the `acp-agent` CLI and its supported JavaScript/Python
+toolchains (`deno`, `uv`, and `uvx`). It does not install a specific agent during
+the image build. The final image is a small non-root runtime image, and the CLI
+is its entrypoint, so arguments can be passed directly after the image name.
 
 ```sh
 docker build -t acp-agent:local .
 
 docker run --rm \
   -p 127.0.0.1:8010:8010 \
-  --entrypoint sh \
-  acp-agent:local -lc \
-  'acp-agent install-env --yes &&
-   acp-agent install codex-acp &&
-   exec acp-agent serve codex-acp --host 0.0.0.0 --port 8010'
+  -v acp-agent-cache:/cache \
+  acp-agent:local serve codex-acp --host 0.0.0.0 --port 8010
+```
+
+The same form works for every CLI command. `install-env` is optional in this
+image because Deno and uv are installed at image build time:
+
+```sh
+docker run --rm acp-agent:local list
+docker run --rm acp-agent:local search codex
+docker run --rm acp-agent:local install-env --yes
+docker run --rm -v acp-agent-cache:/cache acp-agent:local install codex-acp
+docker run --rm -v acp-agent-cache:/cache acp-agent:local run codex-acp
+```
+
+`/cache` stores the registry and downloaded agent cache. Mount a named volume
+when containers are recreated. No agent is preloaded into the image; the first
+`install`, `run`, or `serve` command downloads or prepares the selected agent as
+needed.
+
+Arguments after the image name are passed to `acp-agent`, including agent
+arguments after the relevant `--` separator:
+
+```sh
+docker run --rm -v acp-agent-cache:/cache acp-agent:local \
+  serve codex-acp --host 0.0.0.0 --port 8010 -- --model gpt-5
 ```
 
 From the host, use `http://127.0.0.1:8010/acp` for HTTP/SSE or
@@ -110,6 +133,9 @@ The image does not include agent credentials. Pass only the environment or
 credential storage required by the selected agent. Without Codex credentials,
 `codex-acp` initializes and reports its authentication methods, but session
 creation returns an authentication error.
+
+The image runs as UID `65532` and does not provide a shell. Use the CLI
+entrypoint directly; do not rely on `--entrypoint sh` for container setup.
 
 ## Development
 
