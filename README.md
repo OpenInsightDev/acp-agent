@@ -44,7 +44,8 @@ acp-agent run gemini --yolo
 acp-agent run claude-acp --yolo -- --model opus
 ```
 
-`--yolo` injects the agent's mapped startup flag (from `data/yolo-modes.json`),
+`--yolo` injects the agent's mapped startup flag (fetched from the published
+yolo-mode catalog at `https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json`),
 e.g. `--yolo` for Gemini, `--dangerously-skip-permissions` for Claude,
 `--dangerously-skip-sandbox-and-permissions` for Codex. Agents that only expose
 yolo over the ACP wire protocol (e.g. `session/set_mode`) fail loudly with

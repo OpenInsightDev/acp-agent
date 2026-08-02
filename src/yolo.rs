@@ -2,12 +2,12 @@
 //!
 //! ACP does not standardize a "yolo" mode: every agent names its
 //! auto-approve-everything mode differently (Claude uses `bypassPermissions`,
-//! Codex uses `agent-full-access`, Gemini uses `yolo`). This module embeds the
-//! curated catalog from `data/yolo-modes.json` and resolves the correct
-//! command-line flag (or a helpful protocol-level hint) for a given registry
-//! agent id.
+//! Codex uses `agent-full-access`, Gemini uses `yolo`). This module fetches the
+//! curated catalog from the published CDN (mirroring how the registry itself is
+//! fetched) and resolves the correct command-line flag — or a helpful
+//! protocol-level hint — for a given registry agent id.
 //!
-//! The catalog stores only yolo-specific information — everything else (name,
+//! The catalog stores only yolo-specific information; everything else (name,
 //! description, distribution) already lives in the public ACP registry. Each
 //! entry may carry any of:
 //!
@@ -22,6 +22,14 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
+
+/// CDN URL for the published yolo-mode catalog.
+///
+/// The catalog is maintained in the repository at `data/yolo-modes.json` and
+/// served through jsDelivr's GitHub CDN, so it can be updated independently of
+/// new CLI releases.
+pub const YOLO_MODES_URL: &str =
+    "https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json";
 
 /// ACP config-option selector for agents whose yolo mode lives in
 /// `session/set_config_option` rather than `session/set_mode`.
@@ -56,7 +64,7 @@ impl YoloModeInfo {
     }
 }
 
-/// The embedded yolo-mode catalog keyed by registry agent id.
+/// The yolo-mode catalog keyed by registry agent id.
 #[derive(Debug, Clone, Deserialize)]
 pub struct YoloModes {
     /// Catalog schema version.
@@ -72,19 +80,25 @@ impl YoloModes {
             .map_err(|error| anyhow!("failed to decode yolo-modes.json: {error}"))
     }
 
-    /// Returns the catalog compiled into the binary from `data/yolo-modes.json`.
-    ///
-    /// Panics only when the embedded JSON fails to decode, which indicates a
-    /// packaging error rather than a runtime condition.
-    pub fn embedded() -> Self {
-        Self::from_json(include_str!("../data/yolo-modes.json"))
-            .expect("embedded data/yolo-modes.json must decode")
-    }
-
     /// Looks up the yolo-mode mapping for a registry agent id.
     pub fn find(&self, agent_id: &str) -> Option<&YoloModeInfo> {
         self.agents.get(agent_id)
     }
+}
+
+/// Downloads the yolo-mode catalog from [`YOLO_MODES_URL`].
+pub async fn fetch_yolo_modes() -> Result<YoloModes> {
+    let response = reqwest::get(YOLO_MODES_URL)
+        .await
+        .map_err(|error| anyhow!("failed to fetch yolo-mode catalog: {error}"))?;
+    let response = response
+        .error_for_status()
+        .map_err(|error| anyhow!("failed to fetch yolo-mode catalog: {error}"))?;
+    let text = response
+        .text()
+        .await
+        .map_err(|error| anyhow!("failed to fetch yolo-mode catalog: {error}"))?;
+    YoloModes::from_json(&text)
 }
 
 /// Resolves the command-line arguments that activate yolo for an agent.
@@ -94,8 +108,7 @@ impl YoloModes {
 /// only support protocol-level yolo (`session/set_mode` or
 /// `session/set_config_option`) or none at all, it returns an error with
 /// guidance instead of silently skipping the requested auto-approve behavior.
-pub fn yolo_extra_args(agent_id: &str) -> Result<Vec<String>> {
-    let catalog = YoloModes::embedded();
+pub fn yolo_extra_args_from(catalog: &YoloModes, agent_id: &str) -> Result<Vec<String>> {
     let info = catalog.find(agent_id).ok_or_else(|| {
         anyhow!(
             "no yolo mode mapping known for agent \"{agent_id}\"; \
@@ -128,40 +141,63 @@ pub fn yolo_extra_args(agent_id: &str) -> Result<Vec<String>> {
     Err(anyhow!("agent \"{agent_id}\" has no yolo mode"))
 }
 
+/// Fetches the catalog from the CDN and resolves the agent's yolo arguments.
+pub async fn yolo_extra_args(agent_id: &str) -> Result<Vec<String>> {
+    let catalog = fetch_yolo_modes().await?;
+    yolo_extra_args_from(&catalog, agent_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const SAMPLE: &str = r#"{
+        "version": 1,
+        "agents": {
+            "gemini": { "mode": "yolo", "flag": "--yolo" },
+            "devin": { "mode": "bypass", "flag": "--permission-mode bypass" },
+            "qwen-code": { "mode": "yolo" },
+            "amp-acp": { "option": { "configId": "permissions", "value": "bypass" } },
+            "opencode": {}
+        }
+    }"#;
+
+    fn sample_catalog() -> YoloModes {
+        YoloModes::from_json(SAMPLE).expect("sample catalog should decode")
+    }
+
     #[test]
-    fn embedded_catalog_decodes() {
-        let catalog = YoloModes::embedded();
+    fn catalog_decodes() {
+        let catalog = sample_catalog();
         assert!(catalog.version >= 1);
-        assert!(catalog.agents.len() >= 10);
         assert!(catalog.find("gemini").is_some());
+        assert!(catalog.find("missing").is_none());
     }
 
     #[test]
     fn single_token_flag_is_injected() {
-        let args = yolo_extra_args("gemini").expect("gemini has a --yolo flag");
+        let args = yolo_extra_args_from(&sample_catalog(), "gemini").expect("gemini has a flag");
         assert_eq!(args, vec!["--yolo"]);
     }
 
     #[test]
     fn multi_token_flag_is_split() {
-        let args = yolo_extra_args("devin").expect("devin has a permission-mode flag");
+        let args = yolo_extra_args_from(&sample_catalog(), "devin").expect("devin has a flag");
         assert_eq!(args, vec!["--permission-mode", "bypass"]);
     }
 
     #[test]
     fn set_mode_agent_without_flag_errors() {
-        let error = yolo_extra_args("qwen-code").expect_err("qwen has no CLI yolo flag");
+        let error = yolo_extra_args_from(&sample_catalog(), "qwen-code")
+            .expect_err("qwen has no CLI yolo flag");
         assert!(error.to_string().contains("session/set_mode"));
         assert!(error.to_string().contains("yolo"));
     }
 
     #[test]
     fn config_option_agent_errors_with_selector() {
-        let error = yolo_extra_args("amp-acp").expect_err("amp has no CLI yolo flag");
+        let error = yolo_extra_args_from(&sample_catalog(), "amp-acp")
+            .expect_err("amp has no CLI yolo flag");
         let message = error.to_string();
         assert!(message.contains("config option permissions=bypass"));
         assert!(message.contains("session/set_config_option"));
@@ -169,13 +205,15 @@ mod tests {
 
     #[test]
     fn agent_without_yolo_errors() {
-        let error = yolo_extra_args("opencode").expect_err("opencode has no yolo mode");
+        let error = yolo_extra_args_from(&sample_catalog(), "opencode")
+            .expect_err("opencode has no yolo mode");
         assert!(error.to_string().contains("no yolo mode"));
     }
 
     #[test]
     fn unknown_agent_errors() {
-        let error = yolo_extra_args("not-a-real-agent").expect_err("unknown agent");
+        let error =
+            yolo_extra_args_from(&sample_catalog(), "not-a-real-agent").expect_err("unknown agent");
         assert!(error.to_string().contains("no yolo mode mapping"));
     }
 }

@@ -147,7 +147,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             args,
             yolo,
         } => {
-            let args = resolve_yolo_args(&agent_id, yolo, args)?;
+            let args = resolve_yolo_args(&agent_id, yolo, args).await?;
             let status = run::run_agent(&agent_id, &args)
                 .await
                 .with_context(|| format!("failed to run agent \"{agent_id}\""))?;
@@ -164,7 +164,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             yolo,
             args,
         } => {
-            let args = resolve_yolo_args(&agent_id, yolo, args)?;
+            let args = resolve_yolo_args(&agent_id, yolo, args).await?;
             serve::serve_agent(
                 &agent_id,
                 serve::ServeOptions {
@@ -202,12 +202,16 @@ fn exit_from_status(status: ExitStatus) -> CliExit {
 ///
 /// Resolution fails loudly (rather than silently skipping the requested
 /// auto-approve behavior) when the agent only supports protocol-level yolo.
-fn resolve_yolo_args(agent_id: &str, yolo: bool, args: Vec<String>) -> anyhow::Result<Vec<String>> {
+async fn resolve_yolo_args(
+    agent_id: &str,
+    yolo: bool,
+    args: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
     if !yolo {
         return Ok(args);
     }
 
-    let extra = crate::yolo::yolo_extra_args(agent_id)?;
+    let extra = crate::yolo::yolo_extra_args(agent_id).await?;
     Ok(extra.into_iter().chain(args).collect())
 }
 
@@ -361,28 +365,6 @@ mod tests {
                 ..
             } if agent_id == "demo" && yolo
         ));
-    }
-
-    #[test]
-    fn resolve_yolo_args_injects_flag_when_requested() {
-        let args = resolve_yolo_args(
-            "gemini",
-            true,
-            vec!["--model".to_string(), "gpt-5".to_string()],
-        )
-        .expect("gemini yolo flag should resolve");
-        assert_eq!(args, vec!["--yolo", "--model", "gpt-5"]);
-    }
-
-    #[test]
-    fn resolve_yolo_args_passes_through_without_flag() {
-        let args = resolve_yolo_args(
-            "gemini",
-            false,
-            vec!["--model".to_string(), "gpt-5".to_string()],
-        )
-        .expect("no resolution needed");
-        assert_eq!(args, vec!["--model", "gpt-5"]);
     }
 
     #[test]
