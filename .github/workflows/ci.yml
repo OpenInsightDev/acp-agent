@@ -72,6 +72,9 @@ jobs:
         run: cargo test --locked --all-targets
 
   docker-build:
+    # Docker image build is only a smoke test; run it on main pushes only,
+    # not on every pull request, to avoid wasting CI minutes.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
