@@ -31,10 +31,11 @@ acp-agent run codex-acp
 ```
 
 Registry arguments and environment variables are applied first. Additional
-arguments are passed to the agent:
+arguments are passed to the agent; hyphen-prefixed arguments must come after
+the `--` separator:
 
 ```sh
-acp-agent run codex-acp --model gpt-5
+acp-agent run codex-acp -- --model gpt-5
 ```
 
 ## Serve over HTTP
@@ -47,10 +48,10 @@ acp-agent serve codex-acp --host 127.0.0.1 --port 8010
 
 The server exposes:
 
-| URL | Purpose |
-| --- | --- |
-| `http://127.0.0.1:8010/acp` | ACP over HTTP/SSE |
-| `ws://127.0.0.1:8010/acp` | ACP over WebSocket |
+| URL                            | Purpose                    |
+| ------------------------------ | -------------------------- |
+| `http://127.0.0.1:8010/acp`    | ACP over HTTP/SSE          |
+| `ws://127.0.0.1:8010/acp`      | ACP over WebSocket         |
 | `http://127.0.0.1:8010/health` | Health check; returns `ok` |
 
 Both ACP transports use `/acp` by default. Each connection starts an independent
@@ -79,6 +80,15 @@ acp-agent serve codex-acp --port 8010 -- --model gpt-5
 
 The default port is `0`, which lets the operating system select an available
 port. Set an explicit port when another process or container needs to connect.
+
+### Argument boundary
+
+`acp-agent`'s own options (`--host`/`--port`/`--path` on `serve`) must come
+**before** the `--` separator. Hyphen-prefixed agent arguments must come after
+`--` for both `run` and `serve`; anything after `--` is passed through to the
+agent untouched. Omit `--` and a hyphen-prefixed agent argument (such as
+`--model`) is rejected with a clap error that hints at `--`, instead of being
+silently forwarded.
 
 Authentication belongs to the served agent. A client may be able to connect and
 initialize without credentials while authenticated operations, such as creating
