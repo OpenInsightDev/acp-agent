@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "agents": {
+    "claude-acp": {
+      "mode": "bypassPermissions",
+      "flag": "--dangerously-skip-permissions"
+    },
+    "codex-acp": {
+      "mode": "agent-full-access",
+      "flag": "--dangerously-skip-sandbox-and-permissions"
+    },
+    "gemini": {
+      "mode": "yolo",
+      "flag": "--yolo"
+    },
+    "qwen-code": {
+      "mode": "yolo"
+    },
+    "devin": {
+      "mode": "bypass",
+      "flag": "--permission-mode bypass"
+    },
+    "goose": {
+      "mode": "auto"
+    },
+    "amp-acp": {
+      "option": {
+        "configId": "permissions",
+        "value": "bypass"
+      }
+    },
+    "kimi": {
+      "option": {
+        "configId": "mode"
+      }
+    },
+    "opencode": {},
+    "mistral-vibe": {},
+    "dirac": {
+      "flag": "--yolo"
+    },
+    "github-copilot-cli": {
+      "flag": "--yolo"
+    },
+    "grok-build": {
+      "flag": "--always-approve"
+    },
+    "cline": {}
+  }
+}

@@ -52,6 +52,9 @@ enum Commands {
     #[command(trailing_var_arg = true)]
     Run {
         agent_id: String,
+        /// Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).
+        #[arg(long)]
+        yolo: bool,
         /// Arguments passed to the agent process.
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
@@ -81,6 +84,9 @@ enum Commands {
         /// Disable the GET /health endpoint.
         #[arg(long)]
         no_health: bool,
+        /// Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).
+        #[arg(long)]
+        yolo: bool,
         /// Arguments passed to the agent process.
         #[arg(last = true)]
         args: Vec<String>,
@@ -136,7 +142,12 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 .context("failed to install environment dependencies")?;
             Ok(CliExit::Success)
         }
-        Commands::Run { agent_id, args } => {
+        Commands::Run {
+            agent_id,
+            args,
+            yolo,
+        } => {
+            let args = resolve_yolo_args(&agent_id, yolo, args)?;
             let status = run::run_agent(&agent_id, &args)
                 .await
                 .with_context(|| format!("failed to run agent \"{agent_id}\""))?;
@@ -150,21 +161,25 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             cors_origins,
             allow_any_origin,
             no_health,
+            yolo,
             args,
-        } => serve::serve_agent(
-            &agent_id,
-            serve::ServeOptions {
-                host,
-                port,
-                path,
-                cors: serve::cors_options(cors_origins, allow_any_origin)?,
-                health_endpoint: !no_health,
-            },
-            &args,
-        )
-        .await
-        .with_context(|| format!("failed to serve agent \"{agent_id}\""))
-        .map(|()| CliExit::Success),
+        } => {
+            let args = resolve_yolo_args(&agent_id, yolo, args)?;
+            serve::serve_agent(
+                &agent_id,
+                serve::ServeOptions {
+                    host,
+                    port,
+                    path,
+                    cors: serve::cors_options(cors_origins, allow_any_origin)?,
+                    health_endpoint: !no_health,
+                },
+                &args,
+            )
+            .await
+            .with_context(|| format!("failed to serve agent \"{agent_id}\""))
+            .map(|()| CliExit::Success)
+        }
         Commands::Search { query } => {
             search::search_agents(&query, writer)
                 .await
@@ -181,6 +196,19 @@ fn exit_from_status(status: ExitStatus) -> CliExit {
     status
         .code()
         .map_or_else(|| CliExit::Code(signal_exit_code(status)), CliExit::Code)
+}
+
+/// Prepends the agent's yolo startup flag when `--yolo` was requested.
+///
+/// Resolution fails loudly (rather than silently skipping the requested
+/// auto-approve behavior) when the agent only supports protocol-level yolo.
+fn resolve_yolo_args(agent_id: &str, yolo: bool, args: Vec<String>) -> anyhow::Result<Vec<String>> {
+    if !yolo {
+        return Ok(args);
+    }
+
+    let extra = crate::yolo::yolo_extra_args(agent_id)?;
+    Ok(extra.into_iter().chain(args).collect())
 }
 
 #[cfg(unix)]
@@ -210,8 +238,24 @@ mod tests {
         let cli = Cli::try_parse_from(["acp-agent", "run", "demo", "--model", "gpt-5"]).unwrap();
         assert!(matches!(
             cli.command,
-            Commands::Run { agent_id, args }
-                if agent_id == "demo" && args == ["--model", "gpt-5"]
+            Commands::Run {
+                agent_id,
+                args,
+                yolo,
+            } if agent_id == "demo" && args == ["--model", "gpt-5"] && !yolo
+        ));
+    }
+
+    #[test]
+    fn parses_run_subcommand_with_yolo_flag() {
+        let cli = Cli::try_parse_from(["acp-agent", "run", "demo", "--yolo"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Run {
+                agent_id,
+                yolo,
+                ..
+            } if agent_id == "demo" && yolo
         ));
     }
 
@@ -294,6 +338,7 @@ mod tests {
                 cors_origins,
                 allow_any_origin,
                 no_health,
+                yolo,
                 ..
             } if host == "127.0.0.1"
                 && port == 0
@@ -301,7 +346,43 @@ mod tests {
                 && cors_origins.is_empty()
                 && !allow_any_origin
                 && !no_health
+                && !yolo
         ));
+    }
+
+    #[test]
+    fn parses_serve_subcommand_with_yolo_flag() {
+        let cli = Cli::try_parse_from(["acp-agent", "serve", "demo", "--yolo"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Serve {
+                agent_id,
+                yolo,
+                ..
+            } if agent_id == "demo" && yolo
+        ));
+    }
+
+    #[test]
+    fn resolve_yolo_args_injects_flag_when_requested() {
+        let args = resolve_yolo_args(
+            "gemini",
+            true,
+            vec!["--model".to_string(), "gpt-5".to_string()],
+        )
+        .expect("gemini yolo flag should resolve");
+        assert_eq!(args, vec!["--yolo", "--model", "gpt-5"]);
+    }
+
+    #[test]
+    fn resolve_yolo_args_passes_through_without_flag() {
+        let args = resolve_yolo_args(
+            "gemini",
+            false,
+            vec!["--model".to_string(), "gpt-5".to_string()],
+        )
+        .expect("no resolution needed");
+        assert_eq!(args, vec!["--model", "gpt-5"]);
     }
 
     #[test]

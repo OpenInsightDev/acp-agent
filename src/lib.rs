@@ -22,3 +22,5 @@ pub mod installer;
 pub mod registry;
 /// Local ACP agent command resolution and execution.
 pub mod runner;
+/// Embedded yolo-mode catalog and per-agent flag resolution for `--yolo`.
+pub mod yolo;
