@@ -31,7 +31,8 @@ acp-agent run codex-acp
 ```
 
 Registry arguments and environment variables are applied first. Additional
-arguments are passed to the agent after the `--` separator:
+arguments are passed to the agent; hyphen-prefixed arguments must come after
+the `--` separator:
 
 ```sh
 acp-agent run codex-acp -- --model gpt-5
@@ -83,10 +84,11 @@ port. Set an explicit port when another process or container needs to connect.
 ### Argument boundary
 
 `acp-agent`'s own options (`--host`/`--port`/`--path` on `serve`) must come
-**before** the `--` separator. Everything after `--` is passed through to the
-agent untouched, for both `run` and `serve`. Omit `--` and a hyphen-prefixed
-agent argument (such as `--model`) is rejected with a clap error instead of
-being silently forwarded.
+**before** the `--` separator. Hyphen-prefixed agent arguments must come after
+`--` for both `run` and `serve`; anything after `--` is passed through to the
+agent untouched. Omit `--` and a hyphen-prefixed agent argument (such as
+`--model`) is rejected with a clap error that hints at `--`, instead of being
+silently forwarded.
 
 Authentication belongs to the served agent. A client may be able to connect and
 initialize without credentials while authenticated operations, such as creating

@@ -51,7 +51,8 @@ enum Commands {
     /// Run an agent locally over stdio.
     Run {
         agent_id: String,
-        /// Arguments passed to the agent process (after `--`).
+        /// Arguments passed to the agent process. Hyphen-prefixed arguments
+        /// must come after the `--` separator.
         args: Vec<String>,
     },
     /// Serve an agent over ACP HTTP/SSE and WebSocket.
@@ -220,6 +221,11 @@ mod tests {
             Cli::try_parse_from(["acp-agent", "run", "demo", "--model", "gpt-5"]).unwrap_err();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        let message = error.to_string();
+        assert!(
+            message.contains("--"),
+            "expected clap to hint at the `--` separator, got: {message}"
+        );
     }
 
     #[test]
