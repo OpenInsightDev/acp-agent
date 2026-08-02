@@ -9,9 +9,15 @@ CLI and Rust library for discovering, installing, running, and serving
 curl -fsSL https://github.com/OpenInsightDev/acp-agent/releases/latest/download/install.sh | sh
 ```
 
+or with `cargo`:
+
+```sh
+cargo install acp-agent
+```
+
 ## Quick start
 
-Search the registry and install an agent:
+Search the acp registry and install an agent:
 
 ```sh
 acp-agent list
@@ -45,12 +51,10 @@ acp-agent run gemini --yolo
 acp-agent run claude-acp --yolo -- --model opus
 ```
 
-`--yolo` injects the agent's mapped startup flag (fetched from the published
-yolo-mode catalog at `https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json`),
-e.g. `--yolo` for Gemini, `--dangerously-skip-permissions` for Claude,
-`--dangerously-skip-sandbox-and-permissions` for Codex. Agents that only expose
-yolo over the ACP wire protocol (e.g. `session/set_mode`) fail loudly with
-guidance instead of silently skipping the requested behavior.
+`--yolo` injects the agent's mapped startup flag, e.g. `--yolo` for Gemini, `--dangerously-skip-permissions` for Claude,
+`--dangerously-skip-sandbox-and-permissions` for Codex.
+
+> See yolo-mode catalog at <https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json>.
 
 ## Serve over HTTP
 
@@ -95,24 +99,10 @@ acp-agent serve codex-acp --port 8010 -- --model gpt-5
 The default port is `0`, which lets the operating system select an available
 port. Set an explicit port when another process or container needs to connect.
 
-### Argument boundary
-
-`acp-agent`'s own options (`--host`/`--port`/`--path` on `serve`) must come
-**before** the `--` separator. Hyphen-prefixed agent arguments must come after
-`--` for both `run` and `serve`; anything after `--` is passed through to the
-agent untouched. Omit `--` and a hyphen-prefixed agent argument (such as
-`--model`) is rejected with a clap error that hints at `--`, instead of being
-silently forwarded.
-
-Authentication belongs to the served agent. A client may be able to connect and
-initialize without credentials while authenticated operations, such as creating
-a session, still fail. Configure credentials according to the agent's own
-documentation.
-
 ## Docker
 
 The image contains the `acp-agent` CLI and its supported JavaScript/Python
-toolchains (`deno`, `uv`, and `uvx`). It does not install a specific agent during
+toolchains (`deno` and `uv`). It does not install a specific agent during
 the image build. The final image is a small non-root runtime image, and the CLI
 is its entrypoint, so arguments can be passed directly after the image name.
 
@@ -137,8 +127,7 @@ docker run --rm -v acp-agent-cache:/cache acp-agent:local run codex-acp
 ```
 
 `/cache` stores the registry and downloaded agent cache. Mount a named volume
-when containers are recreated. No agent is preloaded into the image; the first
-`install`, `run`, or `serve` command downloads or prepares the selected agent as
+when containers are recreated. No agent is preloaded into the image; the first `run` or `serve` command downloads or prepares the selected agent as
 needed.
 
 Arguments after the image name are passed to `acp-agent`, including agent
@@ -154,12 +143,7 @@ From the host, use `http://127.0.0.1:8010/acp` for HTTP/SSE or
 `http://127.0.0.1:8010/health` should return `ok`.
 
 The image does not include agent credentials. Pass only the environment or
-credential storage required by the selected agent. Without Codex credentials,
-`codex-acp` initializes and reports its authentication methods, but session
-creation returns an authentication error.
-
-The image runs as UID `65532` and does not provide a shell. Use the CLI
-entrypoint directly; do not rely on `--entrypoint sh` for container setup.
+credential storage required by the selected agent.
 
 ## Development
 
