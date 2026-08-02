@@ -19,6 +19,7 @@
 //! absent entry means the mapping is unknown.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
@@ -87,7 +88,17 @@ impl YoloModes {
 }
 
 /// Downloads the yolo-mode catalog from [`YOLO_MODES_URL`].
+///
+/// The parsed catalog is cached for the process lifetime, so repeated
+/// `--yolo` resolutions do not refetch or reparse the payload. Failures are
+/// not cached, so a transient network error can be retried.
 pub async fn fetch_yolo_modes() -> Result<YoloModes> {
+    static CACHE: OnceLock<YoloModes> = OnceLock::new();
+
+    if let Some(cached) = CACHE.get() {
+        return Ok(cached.clone());
+    }
+
     let response = reqwest::get(YOLO_MODES_URL)
         .await
         .map_err(|error| anyhow!("failed to fetch yolo-mode catalog: {error}"))?;
@@ -98,7 +109,10 @@ pub async fn fetch_yolo_modes() -> Result<YoloModes> {
         .text()
         .await
         .map_err(|error| anyhow!("failed to fetch yolo-mode catalog: {error}"))?;
-    YoloModes::from_json(&text)
+
+    let catalog = YoloModes::from_json(&text)?;
+    let _ = CACHE.set(catalog.clone());
+    Ok(catalog)
 }
 
 /// Resolves the command-line arguments that activate yolo for an agent.
