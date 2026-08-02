@@ -49,11 +49,9 @@ enum Commands {
         yes: bool,
     },
     /// Run an agent locally over stdio.
-    #[command(trailing_var_arg = true)]
     Run {
         agent_id: String,
-        /// Arguments passed to the agent process.
-        #[arg(allow_hyphen_values = true)]
+        /// Arguments passed to the agent process (after `--`).
         args: Vec<String>,
     },
     /// Serve an agent over ACP HTTP/SSE and WebSocket.
@@ -207,12 +205,21 @@ mod tests {
 
     #[test]
     fn parses_run_subcommand_and_agent_arguments() {
-        let cli = Cli::try_parse_from(["acp-agent", "run", "demo", "--model", "gpt-5"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["acp-agent", "run", "demo", "--", "--model", "gpt-5"]).unwrap();
         assert!(matches!(
             cli.command,
             Commands::Run { agent_id, args }
                 if agent_id == "demo" && args == ["--model", "gpt-5"]
         ));
+    }
+
+    #[test]
+    fn rejects_hyphenated_run_args_without_separator() {
+        let error =
+            Cli::try_parse_from(["acp-agent", "run", "demo", "--model", "gpt-5"]).unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
