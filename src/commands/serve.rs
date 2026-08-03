@@ -1,6 +1,16 @@
-use agent_client_protocol::{AcpAgent, AcpAgentConfig};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectTo, LineDirection, Role};
 use agent_client_protocol_http::{AcpHttpServer, CorsOptions, ServerOptions};
 use anyhow::{Context, Result, bail};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use tokio::net::TcpListener;
 
 /// HTTP listener and ACP endpoint configuration.
@@ -16,6 +26,11 @@ pub struct ServeOptions {
     pub cors: CorsOptions,
     /// Whether to expose `GET /health`.
     pub health_endpoint: bool,
+    /// Whether to expose `GET /readyz` with agent launch health.
+    ///
+    /// `GET /health` stays `ok` even while agent launches fail, so this probe
+    /// exists for operators/orchestrators to see agent-process health.
+    pub readyz_endpoint: bool,
 }
 
 impl Default for ServeOptions {
@@ -26,6 +41,7 @@ impl Default for ServeOptions {
             path: "/acp".to_string(),
             cors: CorsOptions::disabled(),
             health_endpoint: true,
+            readyz_endpoint: true,
         }
     }
 }
@@ -64,17 +80,44 @@ async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<(
         "Serving ACP agent at http://{address}{} (WebSocket available on the same endpoint)",
         options.path
     );
-    serve_listener(listener, config, server_options).await
+    if options.readyz_endpoint {
+        eprintln!("Agent readiness probe at http://{address}/readyz");
+    }
+    serve_listener(listener, config, options, server_options).await
 }
 
 async fn serve_listener(
     listener: TcpListener,
     config: AcpAgentConfig,
+    options: ServeOptions,
     server_options: ServerOptions,
 ) -> Result<()> {
-    let router = AcpHttpServer::new(move || AcpAgent::new(config.clone()))
+    let health = AgentHealth::default();
+    // Wrap each agent so its stderr lands in this process's logs and its
+    // launch outcome feeds `GET /readyz` (see [`LaunchGuard`] for why the
+    // per-connection `LaunchState` must survive library teardown).
+    let agent_factory = {
+        let config = config.clone();
+        let health = health.clone();
+        move || {
+            let state = Arc::new(LaunchState::default());
+            let callback_state = state.clone();
+            let agent = AcpAgent::new(config.clone()).with_debug(move |line, direction| {
+                forward_agent_line(line, direction, &callback_state)
+            });
+            ObservedAgent::new(agent, health.clone(), state)
+        }
+    };
+
+    let mut router = AcpHttpServer::new(agent_factory)
         .with_options(server_options)
         .into_router();
+    // `/readyz` is added after `into_router()` so it stays outside the CORS
+    // layer (like the library's own `/health`): probes must stay reachable
+    // regardless of CORS policy.
+    if options.readyz_endpoint {
+        router = router.route("/readyz", get(readyz).with_state(health));
+    }
 
     axum::serve(listener, router)
         .await
@@ -91,12 +134,264 @@ fn http_server_options(options: &ServeOptions) -> Result<ServerOptions> {
     if options.health_endpoint && options.path == "/health" {
         bail!("ACP endpoint path conflicts with the health endpoint");
     }
+    if options.readyz_endpoint && options.path == "/readyz" {
+        bail!("ACP endpoint path conflicts with the readiness endpoint");
+    }
 
     Ok(ServerOptions {
         path: options.path.clone(),
         cors: options.cors.clone(),
         health_endpoint: options.health_endpoint,
     })
+}
+
+/// Per-server launch-outcome tracking for `GET /readyz`.
+///
+/// Readiness follows the *most recent* launch, not any historical failure:
+/// one transient failure must not flip the probe permanently, and a later
+/// success clears it (the last failure detail is kept for diagnostics).
+#[derive(Clone, Default)]
+struct AgentHealth {
+    state: Arc<Mutex<AgentHealthState>>,
+}
+
+#[derive(Default)]
+struct AgentHealthState {
+    attempts: u64,
+    failures: u64,
+    last_attempt_failed: bool,
+    last_failure: Option<AgentFailure>,
+}
+
+/// Detail of the most recent failed agent launch.
+#[derive(Clone)]
+struct AgentFailure {
+    at: SystemTime,
+    detail: String,
+}
+
+impl AgentHealth {
+    fn record_ok(&self) {
+        let mut state = self.state.lock().expect("agent health mutex poisoned");
+        state.attempts += 1;
+        state.last_attempt_failed = false;
+    }
+
+    fn record_failure(&self, detail: String) {
+        let mut state = self.state.lock().expect("agent health mutex poisoned");
+        state.attempts += 1;
+        state.failures += 1;
+        state.last_attempt_failed = true;
+        state.last_failure = Some(AgentFailure {
+            at: SystemTime::now(),
+            detail,
+        });
+    }
+}
+
+/// Per-connection launch signals shared between the debug callback and the
+/// connection future.
+///
+/// The library tears a connection down by aborting its agent task, which
+/// cancels the in-flight connection future before it reports its outcome
+/// (observed for ~80% of fast agent-exit failures). Signals recorded from the
+/// debug callback (which always fires) plus a drop guard on the future make
+/// the outcome observable even when the future is cancelled.
+#[derive(Default)]
+struct LaunchState {
+    /// Agent stdout carried a JSON-RPC response. Stderr is not a liveness
+    /// signal — healthy agents write stderr too.
+    protocol_responded: AtomicBool,
+    /// An initialize request was sent; failures are only recorded when this
+    /// is set, so probe connections that never initialize don't count.
+    initialize_requested: AtomicBool,
+    /// Bounded tail of agent stderr, used as failure diagnostics.
+    stderr_tail: Mutex<String>,
+    /// Ensures the outcome is recorded only once (`complete()` and the drop
+    /// guard may both fire for the same launch).
+    outcome_recorded: AtomicBool,
+}
+
+/// Maximum stderr retained per connection for `GET /readyz` diagnostics.
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
+
+impl LaunchState {
+    fn push_stderr(&self, line: &str) {
+        let mut tail = self.stderr_tail.lock().expect("stderr tail mutex poisoned");
+        tail.push_str(line);
+        tail.push('\n');
+        if tail.len() > STDERR_TAIL_BYTES {
+            let start = tail.len() - STDERR_TAIL_BYTES;
+            *tail = tail.split_off(start);
+            if let Some(newline) = tail.find('\n') {
+                tail.drain(..=newline);
+            }
+        }
+    }
+}
+
+/// Forwards agent stderr to this process's logs and records the launch
+/// signals used by `GET /readyz`.
+fn forward_agent_line(line: &str, direction: LineDirection, state: &LaunchState) {
+    match direction {
+        LineDirection::Stderr => {
+            eprintln!("[agent stderr] {line}");
+            state.push_stderr(line);
+        }
+        LineDirection::Stdout => {
+            if is_jsonrpc_response(line) {
+                state.protocol_responded.store(true, Ordering::SeqCst);
+            }
+        }
+        LineDirection::Stdin => {
+            if line.contains("\"method\":\"initialize\"") {
+                state.initialize_requested.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Whether a stdio line is a JSON-RPC response (top-level `result`/`error`),
+/// which proves the agent process is alive and responsive.
+fn is_jsonrpc_response(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|object| object.contains_key("result") || object.contains_key("error"))
+        })
+        .unwrap_or(false)
+}
+
+/// An [`AcpAgent`] whose launch outcome is recorded in [`AgentHealth`].
+struct ObservedAgent {
+    inner: AcpAgent,
+    health: AgentHealth,
+    state: Arc<LaunchState>,
+}
+
+impl ObservedAgent {
+    fn new(inner: AcpAgent, health: AgentHealth, state: Arc<LaunchState>) -> Self {
+        Self {
+            inner,
+            health,
+            state,
+        }
+    }
+}
+
+/// Records a launch outcome exactly once — from the connection result, or,
+/// when the future is cancelled by teardown, from a drop guard using the
+/// observed signals: responded → success; initialize sent but no response →
+/// failure with the stderr tail; neither → client probe, record nothing.
+struct LaunchGuard {
+    state: Arc<LaunchState>,
+    health: AgentHealth,
+    completed: bool,
+}
+
+impl LaunchGuard {
+    fn complete(mut self, result: &agent_client_protocol::Result<()>) {
+        self.completed = true;
+        match result {
+            Ok(()) => self.record(Outcome::Success),
+            Err(error) => self.record(Outcome::Failure(error.to_string())),
+        }
+    }
+
+    fn record(&self, outcome: Outcome) {
+        if self.state.outcome_recorded.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        match outcome {
+            Outcome::Success => self.health.record_ok(),
+            Outcome::Failure(detail) => self.health.record_failure(detail),
+        }
+    }
+}
+
+impl Drop for LaunchGuard {
+    fn drop(&mut self) {
+        if self.completed || self.state.outcome_recorded.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.state.protocol_responded.load(Ordering::SeqCst) {
+            self.record(Outcome::Success);
+        } else if self.state.initialize_requested.load(Ordering::SeqCst) {
+            let tail = self
+                .state
+                .stderr_tail
+                .lock()
+                .expect("stderr tail mutex poisoned");
+            let detail = if tail.is_empty() {
+                "agent connection ended before completing initialize (no stderr captured)"
+                    .to_string()
+            } else {
+                format!("agent connection ended before completing initialize; stderr tail:\n{tail}")
+            };
+            self.record(Outcome::Failure(detail));
+        }
+    }
+}
+
+enum Outcome {
+    Success,
+    Failure(String),
+}
+
+impl ConnectTo<Client> for ObservedAgent {
+    async fn connect_to(
+        self,
+        client: impl ConnectTo<<Client as Role>::Counterpart>,
+    ) -> agent_client_protocol::Result<()> {
+        let guard = LaunchGuard {
+            state: self.state.clone(),
+            health: self.health.clone(),
+            completed: false,
+        };
+        let result = <AcpAgent as ConnectTo<Client>>::connect_to(self.inner, client).await;
+        guard.complete(&result);
+        result
+    }
+}
+
+/// `GET /readyz` handler.
+///
+/// `200 ready` while the most recent agent launch succeeded, otherwise `503`
+/// with the failure counts and the last failure detail (including the agent
+/// stderr tail). Unlike `GET /health` (HTTP-server liveness), this reflects
+/// agent-process health.
+async fn readyz(State(health): State<AgentHealth>) -> Response {
+    let (attempts, failures, last_attempt_failed, last_failure) = {
+        let state = health.state.lock().expect("agent health mutex poisoned");
+        (
+            state.attempts,
+            state.failures,
+            state.last_attempt_failed,
+            state.last_failure.clone(),
+        )
+    };
+
+    if !last_attempt_failed {
+        return (StatusCode::OK, "ready\n").into_response();
+    }
+
+    let detail = last_failure
+        .map(|failure| {
+            let age = failure
+                .at
+                .elapsed()
+                .map(|elapsed| format!("{elapsed:?} ago"))
+                .unwrap_or_else(|_| "recently".to_string());
+            format!("last failure ({age}): {}\n", failure.detail)
+        })
+        .unwrap_or_default();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("not ready: {failures} of {attempts} agent launches failed; {detail}"),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -109,6 +404,7 @@ mod tests {
             ("acp", "must start with '/'"),
             ("/", "cannot be '/'"),
             ("/health", "conflicts with the health endpoint"),
+            ("/readyz", "conflicts with the readiness endpoint"),
         ] {
             let error = http_server_options(&ServeOptions {
                 path: path.to_string(),
@@ -157,7 +453,7 @@ mod tests {
             ORIGIN,
         };
         use serde_json::{Value, json};
-        use tokio::time::timeout;
+        use tokio::time::{sleep, timeout};
 
         use super::*;
 
@@ -198,7 +494,7 @@ done"#,
                     .unwrap();
                 let address = listener.local_addr().unwrap();
                 let task = tokio::spawn(async move {
-                    serve_listener(listener, config, server_options)
+                    serve_listener(listener, config, options, server_options)
                         .await
                         .unwrap();
                 });
@@ -243,6 +539,10 @@ done"#,
             let health = client.get(server.http_url("/health")).send().await.unwrap();
             assert_eq!(health.status(), reqwest::StatusCode::OK);
             assert_eq!(health.text().await.unwrap(), "ok");
+
+            let readyz = client.get(server.http_url("/readyz")).send().await.unwrap();
+            assert_eq!(readyz.status(), reqwest::StatusCode::OK);
+            assert_eq!(readyz.text().await.unwrap(), "ready\n");
 
             let unsupported = client
                 .post(&endpoint)
@@ -436,6 +736,60 @@ done"#,
                     .unwrap()
                     .contains("agent closed before initialize response")
             );
+
+            // The readiness probe must surface the launch failure with its
+            // cause, unlike the liveness probe which only reflects the HTTP
+            // server. The outcome is recorded asynchronously, so poll briefly.
+            let readyz = readyz_until_failure(&client, &server).await;
+            assert!(readyz.contains("1 of 1 agent launches failed"));
+            assert!(
+                readyz.contains("No such file or directory"),
+                "readyz should include the spawn failure cause: {readyz}"
+            );
+        }
+
+        #[tokio::test]
+        async fn readyz_surfaces_agent_stderr_tail_after_exit_failure() {
+            // Mirrors the real-world failure mode where the agent process
+            // starts, writes its startup error to stderr (e.g. Deno's
+            // dependency-age rejection), and exits before initializing.
+            let server = TestServer::start_with_agent(
+                ServeOptions::default(),
+                AcpAgentConfig::new("/bin/sh").args([
+                    "-c",
+                    "echo 'error: Could not find npm package matching version' >&2; exit 1",
+                ]),
+            )
+            .await;
+            let client = reqwest::Client::new();
+            let response = initialize_http(&client, &server.http_url("/acp")).await;
+
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            );
+
+            let readyz = readyz_until_failure(&client, &server).await;
+            assert!(
+                readyz.contains("Could not find npm package matching version"),
+                "readyz should include the agent stderr tail: {readyz}"
+            );
+        }
+
+        /// Polls `GET /readyz` until it reports the launch failure, returning
+        /// the response body.
+        async fn readyz_until_failure(client: &reqwest::Client, server: &TestServer) -> String {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let response = client.get(server.http_url("/readyz")).send().await.unwrap();
+                    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                        return response.text().await.unwrap();
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("readyz should report the agent launch failure")
         }
 
         #[tokio::test]
