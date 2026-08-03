@@ -86,7 +86,7 @@ fn deno_install_args(package: &str) -> [&str; 6] {
         "install",
         "--global",
         "--allow-all",
-        "--min-dep-age",
+        "--minimum-dependency-age",
         "0",
         package,
     ]
@@ -280,7 +280,7 @@ mod tests {
                 "install",
                 "--global",
                 "--allow-all",
-                "--min-dep-age",
+                "--minimum-dependency-age",
                 "0",
                 "@agentclientprotocol/codex-acp@1.1.7",
             ]
