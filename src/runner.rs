@@ -141,7 +141,7 @@ fn npm_command_spec(
     } else {
         package_command_spec(
             "deno",
-            &["x", "--allow-all", "--min-dep-age", "0"],
+            &["x", "--allow-all"],
             package,
             default_args,
             env,
@@ -294,8 +294,6 @@ mod tests {
             strings(&[
                 "x",
                 "--allow-all",
-                "--min-dep-age",
-                "0",
                 "@acme/demo",
                 "--stdio",
                 "--model",
