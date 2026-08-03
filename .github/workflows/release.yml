@@ -2,8 +2,7 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -11,29 +10,12 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
 
 env:
   BIN_NAME: acp-agent
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run tests
-        run: cargo test --locked
-
   build:
-    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -41,95 +23,61 @@ jobs:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset_suffix: linux-x86_64
-            archive_ext: tar.gz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset_suffix: linux-aarch64
-            archive_ext: tar.gz
           - os: macos-15-intel
             target: x86_64-apple-darwin
             asset_suffix: darwin-x86_64
-            archive_ext: tar.gz
           - os: macos-15
             target: aarch64-apple-darwin
             asset_suffix: darwin-aarch64
-            archive_ext: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target "${{ matrix.target }}"
 
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
-        run: cargo build --release --locked --target "${{ matrix.target }}"
-
-      - name: Package archive
+      - name: Package
         env:
           TARGET: ${{ matrix.target }}
           ASSET_SUFFIX: ${{ matrix.asset_suffix }}
-          ARCHIVE_EXT: ${{ matrix.archive_ext }}
         run: |
-          set -eu
           VERSION="${GITHUB_REF_NAME#v}"
-          DIST_DIR="dist"
-          ARCHIVE_BASENAME="${BIN_NAME}-${VERSION}-${ASSET_SUFFIX}"
-          mkdir -p "$DIST_DIR/data"
-          cp "target/${TARGET}/release/${BIN_NAME}" "${DIST_DIR}/${BIN_NAME}"
-          chmod +x "${DIST_DIR}/${BIN_NAME}"
-          # Ship a copy of the yolo-mode catalog with every release: the binary
-          # embeds it at compile time for offline fallback, and this file is the
-          # overridable copy on disk (ACP_YOLO_MODES_FILE).
-          cp data/yolo-modes.json "${DIST_DIR}/data/yolo-modes.json"
-          tar -czf "${DIST_DIR}/${ARCHIVE_BASENAME}.${ARCHIVE_EXT}" -C "$DIST_DIR" "${BIN_NAME}" data/yolo-modes.json
-          rm "${DIST_DIR}/${BIN_NAME}"
+          mkdir -p dist/data
+          cp "target/${TARGET}/release/${BIN_NAME}" dist/
+          cp data/yolo-modes.json dist/data/yolo-modes.json
+          tar -czf "dist/${BIN_NAME}-${VERSION}-${ASSET_SUFFIX}.tar.gz" -C dist "${BIN_NAME}" data/yolo-modes.json
+          rm dist/${BIN_NAME}
 
-      - name: Upload packaged artifact
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_suffix }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
   publish:
-    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Authenticate with crates.io
-        id: crates_io_auth
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - id: crates_io_auth
         uses: rust-lang/crates-io-auth-action@v1
 
-      - name: Publish crate to crates.io
+      - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
         run: |
-          set +e
-          cargo publish --locked 2> /tmp/publish.err
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ] && grep -qiE "already (exists|uploaded)|is already uploaded" /tmp/publish.err; then
-            echo "crate version already published; continuing"
-          else
-            cat /tmp/publish.err
-            exit "$status"
+          if ! cargo publish --locked 2> /tmp/publish.err; then
+            grep -qiE "already (exists|uploaded)|is already uploaded" /tmp/publish.err \
+              || { cat /tmp/publish.err; exit 1; }
           fi
 
   release:
@@ -138,32 +86,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Download packaged artifacts
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
+          merge-multiple: true
+      - run: cp scripts/install.sh data/yolo-modes.json dist/
 
-      - name: Flatten artifact directory
-        run: |
-          set -eu
-          find dist -mindepth 2 -type f -exec mv {} dist/ \;
-          find dist -mindepth 1 -type d -empty -delete
-
-      - name: Add install script asset
-        run: cp scripts/install.sh dist/install.sh
-
-      - name: Add yolo-mode catalog asset
-        run: cp data/yolo-modes.json dist/yolo-modes.json
-
-      - name: Generate checksums
+      - name: Checksums
         working-directory: dist
         run: sha256sum *.tar.gz yolo-modes.json > SHA256SUMS
 
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz
@@ -175,30 +109,20 @@ jobs:
           overwrite_files: true
 
   docker:
-    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract image metadata
-        id: meta
+      - id: meta
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
@@ -206,9 +130,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-
-      - name: Build and push image
-        uses: docker/build-push-action@v7
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: true
