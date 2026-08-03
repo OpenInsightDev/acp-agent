@@ -4,12 +4,16 @@ FROM rust:1.97-bookworm AS builder
 
 WORKDIR /app
 
+ARG TARGETARCH
+
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
+    # Multi-arch builds run amd64 and arm64 concurrently; keep the cargo
+    # target directory separate per architecture to avoid clobbering.
+    --mount=type=cache,target=/app/target,id=cargo-target-$TARGETARCH \
     cargo build --release --locked \
     && install -Dm755 target/release/acp-agent /out/acp-agent
 
