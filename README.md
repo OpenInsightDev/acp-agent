@@ -68,19 +68,28 @@ acp-agent serve codex-acp --host 127.0.0.1 --port 8010
 
 The server exposes:
 
-| URL                            | Purpose                    |
-| ------------------------------ | -------------------------- |
-| `http://127.0.0.1:8010/acp`    | ACP over HTTP/SSE          |
-| `ws://127.0.0.1:8010/acp`      | ACP over WebSocket         |
-| `http://127.0.0.1:8010/health` | Health check; returns `ok` |
+| URL                            | Purpose                                                    |
+| ------------------------------ | ---------------------------------------------------------- |
+| `http://127.0.0.1:8010/acp`    | ACP over HTTP/SSE                                          |
+| `ws://127.0.0.1:8010/acp`      | ACP over WebSocket                                         |
+| `http://127.0.0.1:8010/health` | Liveness check; returns `ok`                               |
+| `http://127.0.0.1:8010/readyz` | Agent readiness; `503` with the last launch failure detail |
 
 Both ACP transports use `/acp` by default. Each connection starts an independent
-agent process. Use `--path` to change the ACP endpoint and `--no-health` to
-disable the health check:
+agent process. Use `--path` to change the ACP endpoint, `--no-health` to disable
+the health check, and `--no-readyz` to disable the readiness probe:
 
 ```sh
 acp-agent serve codex-acp --port 8010 --path /agent --no-health
 ```
+
+`/health` only reflects the HTTP server. `/readyz` reflects agent-process
+health: it returns `200 ready` while the most recent agent launch succeeded,
+and `503` plus the last failure (including the agent's stderr tail) after a
+launch failure. Agent stderr is also forwarded to the serve process's logs, so
+startup failures such as a missing agent executable or a failed package
+install are visible in `docker logs` instead of being swallowed by the
+connection error response.
 
 Browser cross-origin access is disabled by default. Origins can be repeated, or
 all origins can be explicitly allowed:
@@ -131,6 +140,15 @@ docker run --rm -v acp-agent-cache:/cache acp-agent:local run codex-acp
 `/cache` stores the registry and downloaded agent cache. Mount a named volume
 when containers are recreated. No agent is preloaded into the image; the first `run` or `serve` command downloads or prepares the selected agent as
 needed.
+
+Binary agent installs append a human-readable line to
+`/cache/acp-agent/agent-install.log` (successes and failures, with timestamps
+and the full error chain). The image has no shell, so when a container fails
+to prepare an agent, retrieve that log from the host with:
+
+```sh
+docker cp <container>:/cache/acp-agent/agent-install.log .
+```
 
 Arguments after the image name are passed to `acp-agent`, including agent
 arguments after the relevant `--` separator:

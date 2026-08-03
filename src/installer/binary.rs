@@ -12,9 +12,22 @@ use zip::ZipArchive;
 
 use crate::installer::cache::{
     BinaryCacheMetadata, BinaryCachePaths, EXTRACTED_DIR_NAME, METADATA_FILE_NAME,
-    binary_cache_paths, cache_root_dir, safe_path_component,
+    binary_cache_paths, cache_root_dir, platform_cache_key, safe_path_component,
 };
 use crate::registry::{BinaryTarget, Platform, RegistryAgent};
+
+/// Name of the human-readable install log written into the cache root.
+///
+/// The image ships without a shell, so this file is how install state and
+/// failures can be inspected from a container:
+/// `docker cp <container>:/cache/acp-agent/agent-install.log .`
+const INSTALL_LOG_FILE_NAME: &str = "agent-install.log";
+/// Upper bound for the install log; it is append-only and lives in a cache
+/// volume that may persist for a long time.
+const INSTALL_LOG_MAX_BYTES: u64 = 1024 * 1024;
+/// When the cap is hit, the log is rewritten to keep only this tail.
+const INSTALL_LOG_TAIL_BYTES: u64 = 256 * 1024;
+
 /// A validated binary distribution stored in the local cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedBinary {
@@ -27,7 +40,21 @@ pub struct CachedBinary {
 }
 
 /// Ensures the current binary target exists in the stable local cache.
+///
+/// Every attempt (cache hit, fresh install, or failure) is appended to the
+/// install log inside the cache root so that installs can be audited and
+/// failures diagnosed even in images without a shell.
 pub async fn cache_binary_target(
+    agent: &RegistryAgent,
+    platform: Platform,
+    target: &BinaryTarget,
+) -> Result<CachedBinary> {
+    let result = cache_binary_target_inner(agent, platform, target).await;
+    record_install_log(agent, platform, &result);
+    result
+}
+
+async fn cache_binary_target_inner(
     agent: &RegistryAgent,
     platform: Platform,
     target: &BinaryTarget,
@@ -129,6 +156,125 @@ pub async fn cache_binary_target(
             })
         }
     }
+}
+
+/// Appends one line per binary install attempt to `agent-install.log`.
+///
+/// Successes are logged too (cache hits included): a `ready` line is the only
+/// way to confirm from outside the shell-less container which agent versions
+/// are present in `/cache`; failures carry the full error chain.
+fn record_install_log(agent: &RegistryAgent, platform: Platform, result: &Result<CachedBinary>) {
+    let Ok(root_dir) = cache_root_dir() else {
+        return;
+    };
+    let platform = platform_cache_key(platform);
+    let outcome = match result {
+        Ok(cached) => format!(
+            "ready agent={} version={} platform={} executable={}",
+            agent.id,
+            agent.version,
+            platform,
+            cached.executable_path.display()
+        ),
+        Err(error) => format!(
+            "FAILED agent={} version={} platform={} error={error:#}",
+            agent.id, agent.version, platform
+        ),
+    };
+    append_install_log(
+        &root_dir.join(INSTALL_LOG_FILE_NAME),
+        &format!("[{}] {outcome}\n", utc_timestamp()),
+    );
+}
+
+fn append_install_log(path: &Path, line: &str) {
+    if let Err(error) = append_install_log_inner(path, line) {
+        eprintln!(
+            "failed to append to agent install log {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn append_install_log_inner(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if file.metadata()?.len() + line.len() as u64 > INSTALL_LOG_MAX_BYTES {
+        drop(file);
+        truncate_install_log(path)?;
+        file = std::fs::OpenOptions::new().append(true).open(path)?;
+    }
+    file.write_all(line.as_bytes())
+}
+
+/// Keeps only the most recent tail so the append-only log stays bounded in a
+/// long-lived cache volume; the leading partial line is dropped so retained
+/// lines stay complete.
+fn truncate_install_log(path: &Path) -> std::io::Result<()> {
+    let bytes = std::fs::read(path)?;
+    let mut kept = bytes
+        .iter()
+        .copied()
+        .skip(bytes.len().saturating_sub(INSTALL_LOG_TAIL_BYTES as usize))
+        .collect::<Vec<_>>();
+    // Drop the leading partial line so every retained line is complete.
+    if let Some(newline) = kept.iter().position(|&byte| byte == b'\n') {
+        kept.drain(..=newline);
+    }
+    let mut rewritten = format!(
+        "[install log truncated; keeping the last {} bytes]\n",
+        INSTALL_LOG_TAIL_BYTES
+    )
+    .into_bytes();
+    rewritten.append(&mut kept);
+    std::fs::write(path, rewritten)
+}
+
+/// UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` form, without extra dependencies.
+fn utc_timestamp() -> String {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let days = (since_epoch.as_secs() / 86_400) as i64;
+    let secs_of_day = since_epoch.as_secs() % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60
+    )
+}
+
+/// Converts days since the Unix epoch to a `(year, month, day)` civil date
+/// using Howard Hinnant's `civil_from_days` algorithm.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (
+        if month <= 2 { year + 1 } else { year },
+        month as u32,
+        day as u32,
+    )
 }
 
 pub(crate) async fn download_archive(target: &BinaryTarget, temp_dir: &Path) -> Result<PathBuf> {
@@ -523,5 +669,60 @@ mod tests {
                 .is_none()
         );
         assert!(!try_exists(&paths.cache_dir).await.unwrap());
+    }
+
+    #[test]
+    fn install_log_appends_lines_in_order() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("agent-install.log");
+
+        append_install_log_inner(&path, "first\n").unwrap();
+        append_install_log_inner(&path, "second\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn install_log_is_capped_and_keeps_a_complete_tail() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("agent-install.log");
+        let oversized = "a".repeat(INSTALL_LOG_MAX_BYTES as usize + 64 * 1024);
+
+        append_install_log_inner(&path, &oversized).unwrap();
+        append_install_log_inner(&path, &oversized).unwrap();
+        append_install_log_inner(&path, "final-marker\n").unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.len() as u64 <= INSTALL_LOG_MAX_BYTES,
+            "log exceeded its cap: {}",
+            contents.len()
+        );
+        assert!(contents.starts_with("[install log truncated;"));
+        assert!(contents.ends_with("final-marker\n"));
+        assert!(
+            contents
+                .lines()
+                .all(|line| line.len() < INSTALL_LOG_MAX_BYTES as usize)
+        );
+    }
+
+    #[test]
+    fn timestamps_are_utc_iso_8601() {
+        let timestamp = utc_timestamp();
+        assert_eq!(timestamp.len(), 20);
+        assert!(timestamp.ends_with('Z'));
+        assert_eq!(&timestamp[4..5], "-");
+        assert_eq!(&timestamp[7..8], "-");
+        assert_eq!(&timestamp[10..11], "T");
+        assert_eq!(&timestamp[13..14], ":");
+        assert_eq!(&timestamp[16..17], ":");
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
+        assert_eq!(civil_from_days(20_668), (2026, 8, 3));
     }
 }
