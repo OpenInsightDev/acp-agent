@@ -80,8 +80,7 @@ COPY --from=toolchain --chown=65532:65532 /workspace /workspace
 COPY --from=toolchain --chown=65532:65532 /cache /cache
 COPY --from=toolchain --chown=65532:65532 /home/nonroot /home/nonroot
 # Ship the yolo-mode catalog with the image: the CLI embeds it for offline
-# fallback, and this copy is available for inspection or as the target of
-# ACP_YOLO_MODES_FILE.
+# fallback, and this copy is available for inspection.
 COPY data/yolo-modes.json /usr/local/share/acp-agent/yolo-modes.json
 
 ENV HOME=/home/nonroot \

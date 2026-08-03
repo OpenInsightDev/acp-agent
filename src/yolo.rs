@@ -20,7 +20,6 @@
 //! absent entry means the mapping is unknown.
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -43,13 +42,6 @@ pub const YOLO_MODES_URL: &str =
 /// when the CDN is unreachable (offline, air-gapped, firewalled environments)
 /// so `--yolo` never hard-fails on a missing network.
 pub const EMBEDDED_YOLO_MODES: &str = include_str!("../data/yolo-modes.json");
-
-/// Environment variable naming a local yolo-mode catalog file.
-///
-/// When set, the file replaces both the CDN fetch and the embedded catalog
-/// entirely. Useful for pinning a specific catalog version or maintaining the
-/// catalog locally.
-pub const YOLO_MODES_FILE_ENV: &str = "ACP_YOLO_MODES_FILE";
 
 /// Timeout for the CDN catalog fetch, so offline environments fall back to the
 /// bundled catalog quickly instead of hanging on the connect attempt.
@@ -113,9 +105,8 @@ impl YoloModes {
 /// Resolves the yolo-mode catalog for `--yolo` resolution.
 ///
 /// The catalog is resolved in this order:
-/// 1. `ACP_YOLO_MODES_FILE` — a local catalog pinned by the user;
-/// 2. the published CDN catalog ([`YOLO_MODES_URL`]) — the update source;
-/// 3. the catalog bundled with this release ([`EMBEDDED_YOLO_MODES`]).
+/// 1. the published CDN catalog ([`YOLO_MODES_URL`]) — the update source;
+/// 2. the catalog bundled with this release ([`EMBEDDED_YOLO_MODES`]).
 ///
 /// The parsed catalog is cached for the process lifetime, so repeated
 /// `--yolo` resolutions do not refetch or reparse the payload.
@@ -126,12 +117,6 @@ pub async fn fetch_yolo_modes() -> Result<YoloModes> {
         return Ok(cached.clone());
     }
 
-    if let Some(path) = std::env::var_os(YOLO_MODES_FILE_ENV) {
-        let catalog = load_yolo_modes_file(&path)?;
-        let _ = CACHE.set(catalog.clone());
-        return Ok(catalog);
-    }
-
     match fetch_remote_yolo_modes().await {
         Ok(catalog) => {
             let _ = CACHE.set(catalog.clone());
@@ -139,8 +124,7 @@ pub async fn fetch_yolo_modes() -> Result<YoloModes> {
         }
         Err(error) => {
             eprintln!(
-                "warning: {error}; using the yolo-mode catalog bundled with this release \
-                 (set {YOLO_MODES_FILE_ENV} to pin a local catalog)"
+                "warning: {error}; using the yolo-mode catalog bundled with this release"
             );
             let catalog = embedded_yolo_modes().clone();
             let _ = CACHE.set(catalog.clone());
@@ -177,15 +161,6 @@ fn embedded_yolo_modes() -> &'static YoloModes {
         YoloModes::from_json(EMBEDDED_YOLO_MODES)
             .expect("embedded yolo-mode catalog (data/yolo-modes.json) must decode")
     })
-}
-
-/// Reads and decodes a local yolo-mode catalog file.
-fn load_yolo_modes_file(path: &OsStr) -> Result<YoloModes> {
-    let display = path.to_string_lossy();
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| anyhow!("failed to read yolo-mode catalog from {display}: {error}"))?;
-    YoloModes::from_json(&text)
-        .map_err(|error| anyhow!("failed to decode yolo-mode catalog from {display}: {error}"))
 }
 
 /// Resolves the command-line arguments that activate yolo for an agent.
@@ -318,25 +293,5 @@ mod tests {
         let args = yolo_extra_args_from(embedded_yolo_modes(), "codex-acp")
             .expect("codex-acp has a yolo flag");
         assert_eq!(args, vec!["--dangerously-skip-sandbox-and-permissions"]);
-    }
-
-    #[test]
-    fn local_override_file_loads() {
-        let path = std::env::temp_dir().join(format!("acp-agent-yolo-{}.json", std::process::id()));
-        std::fs::write(&path, SAMPLE).expect("write temp catalog");
-        let catalog = load_yolo_modes_file(path.as_os_str()).expect("override should load");
-        assert!(catalog.find("gemini").is_some());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn missing_override_file_errors() {
-        let error = load_yolo_modes_file(OsStr::new("/nonexistent/yolo-modes.json"))
-            .expect_err("missing override file should error");
-        assert!(
-            error
-                .to_string()
-                .contains("failed to read yolo-mode catalog")
-        );
     }
 }
