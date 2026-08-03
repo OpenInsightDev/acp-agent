@@ -38,8 +38,6 @@
         "configId": "mode"
       }
     },
-    "opencode": {},
-    "mistral-vibe": {},
     "dirac": {
       "flag": "--yolo"
     },
@@ -48,7 +46,6 @@
     },
     "grok-build": {
       "flag": "--always-approve"
-    },
-    "cline": {}
+    }
   }
 }

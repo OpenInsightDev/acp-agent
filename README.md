@@ -171,6 +171,10 @@ cargo fmt --all -- --check
 
 The server is implemented with [`agent-client-protocol-http` 2.0](https://docs.rs/agent-client-protocol-http/2.0.0/agent_client_protocol_http/) and its `server` feature.
 
+## Contribution
+
+If you know how to enable yolo mode for the acp agent you are using, you are welcome to add new entries to the `data/yolo-modes.json` list.
+
 ## License
 
 MIT
