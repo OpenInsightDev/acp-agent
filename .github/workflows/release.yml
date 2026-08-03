@@ -46,11 +46,13 @@ jobs:
           TARGET: ${{ matrix.target }}
           ASSET_SUFFIX: ${{ matrix.asset_suffix }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p dist/data
           cp "target/${TARGET}/release/${BIN_NAME}" dist/
           cp data/yolo-modes.json dist/data/yolo-modes.json
-          tar -czf "dist/${BIN_NAME}-${VERSION}-${ASSET_SUFFIX}.tar.gz" -C dist "${BIN_NAME}" data/yolo-modes.json
+          # Asset names carry no version so installers can use the
+          # releases/latest/download/ redirect; old versions stay reachable
+          # via releases/download/<tag>/.
+          tar -czf "dist/${BIN_NAME}-${ASSET_SUFFIX}.tar.gz" -C dist "${BIN_NAME}" data/yolo-modes.json
           rm dist/${BIN_NAME}
 
       - uses: actions/upload-artifact@v7
