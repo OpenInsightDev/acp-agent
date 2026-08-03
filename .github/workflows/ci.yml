@@ -36,6 +36,8 @@ jobs:
               - 'Cargo.lock'
 
   check:
+    needs: changes
+    if: needs.changes.outputs.src == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -48,7 +50,7 @@ jobs:
 
   test:
     needs: changes
-    if: needs.changes.outputs.src == 'true'
+    if: needs.changes.outputs.src == 'true' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
