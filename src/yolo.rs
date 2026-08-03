@@ -2,10 +2,11 @@
 //!
 //! ACP does not standardize a "yolo" mode: every agent names its
 //! auto-approve-everything mode differently (Claude uses `bypassPermissions`,
-//! Codex uses `agent-full-access`, Gemini uses `yolo`). This module fetches the
-//! curated catalog from the published CDN (mirroring how the registry itself is
-//! fetched) and resolves the correct command-line flag — or a helpful
-//! protocol-level hint — for a given registry agent id.
+//! Codex uses `agent-full-access`, Gemini uses `yolo`). This module resolves
+//! the correct command-line flag — or a helpful protocol-level hint — for a
+//! given registry agent id from a curated catalog. The catalog is fetched from
+//! the published CDN (the update source) and falls back to the copy bundled
+//! with this release when the network is unavailable.
 //!
 //! The catalog stores only yolo-specific information; everything else (name,
 //! description, distribution) already lives in the public ACP registry. Each
@@ -20,6 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
@@ -28,9 +30,22 @@ use serde::Deserialize;
 ///
 /// The catalog is maintained in the repository at `data/yolo-modes.json` and
 /// served through jsDelivr's GitHub CDN, so it can be updated independently of
-/// new CLI releases.
+/// new CLI releases. The CDN is the update source: [`fetch_yolo_modes`] tries
+/// it first and falls back to [`EMBEDDED_YOLO_MODES`] when it is unreachable.
 pub const YOLO_MODES_URL: &str =
     "https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json";
+
+/// Yolo-mode catalog bundled with the release.
+///
+/// `data/yolo-modes.json` is embedded at compile time, so every released
+/// binary (and Docker image) carries a local copy of the catalog. It is used
+/// when the CDN is unreachable (offline, air-gapped, firewalled environments)
+/// so `--yolo` never hard-fails on a missing network.
+pub const EMBEDDED_YOLO_MODES: &str = include_str!("../data/yolo-modes.json");
+
+/// Timeout for the CDN catalog fetch, so offline environments fall back to the
+/// bundled catalog quickly instead of hanging on the connect attempt.
+const YOLO_MODES_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ACP config-option selector for agents whose yolo mode lives in
 /// `session/set_config_option` rather than `session/set_mode`.
@@ -87,11 +102,14 @@ impl YoloModes {
     }
 }
 
-/// Downloads the yolo-mode catalog from [`YOLO_MODES_URL`].
+/// Resolves the yolo-mode catalog for `--yolo` resolution.
+///
+/// The catalog is resolved in this order:
+/// 1. the published CDN catalog ([`YOLO_MODES_URL`]) — the update source;
+/// 2. the catalog bundled with this release ([`EMBEDDED_YOLO_MODES`]).
 ///
 /// The parsed catalog is cached for the process lifetime, so repeated
-/// `--yolo` resolutions do not refetch or reparse the payload. Failures are
-/// not cached, so a transient network error can be retried.
+/// `--yolo` resolutions do not refetch or reparse the payload.
 pub async fn fetch_yolo_modes() -> Result<YoloModes> {
     static CACHE: OnceLock<YoloModes> = OnceLock::new();
 
@@ -99,7 +117,29 @@ pub async fn fetch_yolo_modes() -> Result<YoloModes> {
         return Ok(cached.clone());
     }
 
-    let response = reqwest::get(YOLO_MODES_URL)
+    match fetch_remote_yolo_modes().await {
+        Ok(catalog) => {
+            let _ = CACHE.set(catalog.clone());
+            Ok(catalog)
+        }
+        Err(error) => {
+            eprintln!("warning: {error}; using the yolo-mode catalog bundled with this release");
+            let catalog = embedded_yolo_modes().clone();
+            let _ = CACHE.set(catalog.clone());
+            Ok(catalog)
+        }
+    }
+}
+
+/// Downloads the yolo-mode catalog from [`YOLO_MODES_URL`].
+async fn fetch_remote_yolo_modes() -> Result<YoloModes> {
+    let client = reqwest::Client::builder()
+        .timeout(YOLO_MODES_FETCH_TIMEOUT)
+        .build()
+        .map_err(|error| anyhow!("failed to build HTTP client for yolo-mode catalog: {error}"))?;
+    let response = client
+        .get(YOLO_MODES_URL)
+        .send()
         .await
         .map_err(|error| anyhow!("failed to fetch yolo-mode catalog: {error}"))?;
     let response = response
@@ -109,10 +149,16 @@ pub async fn fetch_yolo_modes() -> Result<YoloModes> {
         .text()
         .await
         .map_err(|error| anyhow!("failed to fetch yolo-mode catalog: {error}"))?;
+    YoloModes::from_json(&text)
+}
 
-    let catalog = YoloModes::from_json(&text)?;
-    let _ = CACHE.set(catalog.clone());
-    Ok(catalog)
+/// Returns the catalog bundled with this release, parsed once per process.
+fn embedded_yolo_modes() -> &'static YoloModes {
+    static EMBEDDED: OnceLock<YoloModes> = OnceLock::new();
+    EMBEDDED.get_or_init(|| {
+        YoloModes::from_json(EMBEDDED_YOLO_MODES)
+            .expect("embedded yolo-mode catalog (data/yolo-modes.json) must decode")
+    })
 }
 
 /// Resolves the command-line arguments that activate yolo for an agent.
@@ -229,5 +275,21 @@ mod tests {
         let error =
             yolo_extra_args_from(&sample_catalog(), "not-a-real-agent").expect_err("unknown agent");
         assert!(error.to_string().contains("no yolo mode mapping"));
+    }
+
+    #[test]
+    fn embedded_catalog_decodes_and_covers_released_agents() {
+        let catalog = embedded_yolo_modes();
+        assert!(catalog.version >= 1);
+        assert!(catalog.find("codex-acp").is_some());
+        assert!(catalog.find("gemini").is_some());
+        assert!(catalog.find("claude-acp").is_some());
+    }
+
+    #[test]
+    fn embedded_catalog_resolves_flags() {
+        let args = yolo_extra_args_from(embedded_yolo_modes(), "codex-acp")
+            .expect("codex-acp has a yolo flag");
+        assert_eq!(args, vec!["--dangerously-skip-sandbox-and-permissions"]);
     }
 }
