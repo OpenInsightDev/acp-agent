@@ -9,12 +9,16 @@
       "mode": "agent-full-access",
       "flag": "--dangerously-skip-sandbox-and-permissions"
     },
+    "cursor": {
+      "flag": "--yolo"
+    },
     "gemini": {
       "mode": "yolo",
       "flag": "--yolo"
     },
     "qwen-code": {
-      "mode": "yolo"
+      "mode": "yolo",
+      "flag": "--yolo"
     },
     "devin": {
       "mode": "bypass",
