@@ -123,9 +123,7 @@ pub async fn fetch_yolo_modes() -> Result<YoloModes> {
             Ok(catalog)
         }
         Err(error) => {
-            eprintln!(
-                "warning: {error}; using the yolo-mode catalog bundled with this release"
-            );
+            eprintln!("warning: {error}; using the yolo-mode catalog bundled with this release");
             let catalog = embedded_yolo_modes().clone();
             let _ = CACHE.set(catalog.clone());
             Ok(catalog)
