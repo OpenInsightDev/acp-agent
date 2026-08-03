@@ -83,6 +83,9 @@ enum Commands {
         /// Disable the GET /health endpoint.
         #[arg(long)]
         no_health: bool,
+        /// Disable the GET /readyz agent readiness endpoint.
+        #[arg(long)]
+        no_readyz: bool,
         /// Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).
         #[arg(long)]
         yolo: bool,
@@ -160,6 +163,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             cors_origins,
             allow_any_origin,
             no_health,
+            no_readyz,
             yolo,
             args,
         } => {
@@ -172,6 +176,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                     path,
                     cors: serve::cors_options(cors_origins, allow_any_origin)?,
                     health_endpoint: !no_health,
+                    readyz_endpoint: !no_readyz,
                 },
                 &args,
             )
@@ -316,6 +321,7 @@ mod tests {
             "--cors-origin",
             "https://example.com",
             "--no-health",
+            "--no-readyz",
             "--",
             "--model",
             "gpt-5",
@@ -330,6 +336,7 @@ mod tests {
                 path,
                 cors_origins,
                 no_health,
+                no_readyz,
                 args,
                 ..
             }
@@ -339,6 +346,7 @@ mod tests {
                     && path == "/rpc"
                     && cors_origins == ["https://example.com"]
                     && no_health
+                    && no_readyz
                     && args == ["--model", "gpt-5"]
         ));
     }
@@ -355,6 +363,7 @@ mod tests {
                 cors_origins,
                 allow_any_origin,
                 no_health,
+                no_readyz,
                 yolo,
                 ..
             } if host == "127.0.0.1"
@@ -363,6 +372,7 @@ mod tests {
                 && cors_origins.is_empty()
                 && !allow_any_origin
                 && !no_health
+                && !no_readyz
                 && !yolo
         ));
     }
