@@ -81,8 +81,15 @@ async fn install_npx(
     })
 }
 
-fn deno_install_args(package: &str) -> [&str; 4] {
-    ["install", "--global", "--allow-all", package]
+fn deno_install_args(package: &str) -> [&str; 6] {
+    [
+        "install",
+        "--global",
+        "--allow-all",
+        "--minimum-dependency-age",
+        "0",
+        package,
+    ]
 }
 
 async fn install_uvx(
@@ -273,6 +280,8 @@ mod tests {
                 "install",
                 "--global",
                 "--allow-all",
+                "--minimum-dependency-age",
+                "0",
                 "@agentclientprotocol/codex-acp@1.1.7",
             ]
         );
