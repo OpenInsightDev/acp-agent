@@ -4,4 +4,5 @@
 !Dockerfile
 !src/
 !src/**
+!data/
 !data/yolo-modes.json

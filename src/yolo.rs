@@ -118,9 +118,7 @@ impl YoloModes {
 /// 3. the catalog bundled with this release ([`EMBEDDED_YOLO_MODES`]).
 ///
 /// The parsed catalog is cached for the process lifetime, so repeated
-/// `--yolo` resolutions do not refetch or reparse the payload. Failed CDN
-/// fetches are not cached, so a transient network error can be retried; while
-/// the CDN is down, the bundled catalog is used instead of failing.
+/// `--yolo` resolutions do not refetch or reparse the payload.
 pub async fn fetch_yolo_modes() -> Result<YoloModes> {
     static CACHE: OnceLock<YoloModes> = OnceLock::new();
 
@@ -144,7 +142,9 @@ pub async fn fetch_yolo_modes() -> Result<YoloModes> {
                 "warning: {error}; using the yolo-mode catalog bundled with this release \
                  (set {YOLO_MODES_FILE_ENV} to pin a local catalog)"
             );
-            Ok(embedded_yolo_modes().clone())
+            let catalog = embedded_yolo_modes().clone();
+            let _ = CACHE.set(catalog.clone());
+            Ok(catalog)
         }
     }
 }
