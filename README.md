@@ -54,7 +54,10 @@ acp-agent run claude-acp --yolo -- --model opus
 `--yolo` injects the agent's mapped startup flag, e.g. `--yolo` for Gemini, `--dangerously-skip-permissions` for Claude,
 `--dangerously-skip-sandbox-and-permissions` for Codex.
 
-> See yolo-mode catalog at <https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json>.
+The yolo-mode catalog is fetched from the CDN
+(<https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json>) when possible and falls
+back to the copy bundled with this release when the network is unavailable, so `--yolo` keeps working
+offline. Set `ACP_YOLO_MODES_FILE=/path/to/yolo-modes.json` to override the catalog with a local file.
 
 ## Serve over HTTP
 

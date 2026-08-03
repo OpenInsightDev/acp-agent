@@ -6,6 +6,7 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY data ./data
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -78,6 +79,10 @@ COPY --from=toolchain /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certi
 COPY --from=toolchain --chown=65532:65532 /workspace /workspace
 COPY --from=toolchain --chown=65532:65532 /cache /cache
 COPY --from=toolchain --chown=65532:65532 /home/nonroot /home/nonroot
+# Ship the yolo-mode catalog with the image: the CLI embeds it for offline
+# fallback, and this copy is available for inspection or as the target of
+# ACP_YOLO_MODES_FILE.
+COPY data/yolo-modes.json /usr/local/share/acp-agent/yolo-modes.json
 
 ENV HOME=/home/nonroot \
     XDG_CACHE_HOME=/cache \

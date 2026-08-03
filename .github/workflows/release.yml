@@ -80,10 +80,14 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           DIST_DIR="dist"
           ARCHIVE_BASENAME="${BIN_NAME}-${VERSION}-${ASSET_SUFFIX}"
-          mkdir -p "$DIST_DIR"
+          mkdir -p "$DIST_DIR/data"
           cp "target/${TARGET}/release/${BIN_NAME}" "${DIST_DIR}/${BIN_NAME}"
           chmod +x "${DIST_DIR}/${BIN_NAME}"
-          tar -czf "${DIST_DIR}/${ARCHIVE_BASENAME}.${ARCHIVE_EXT}" -C "$DIST_DIR" "${BIN_NAME}"
+          # Ship a copy of the yolo-mode catalog with every release: the binary
+          # embeds it at compile time for offline fallback, and this file is the
+          # overridable copy on disk (ACP_YOLO_MODES_FILE).
+          cp data/yolo-modes.json "${DIST_DIR}/data/yolo-modes.json"
+          tar -czf "${DIST_DIR}/${ARCHIVE_BASENAME}.${ARCHIVE_EXT}" -C "$DIST_DIR" "${BIN_NAME}" data/yolo-modes.json
           rm "${DIST_DIR}/${BIN_NAME}"
 
       - name: Upload packaged artifact
@@ -151,9 +155,12 @@ jobs:
       - name: Add install script asset
         run: cp scripts/install.sh dist/install.sh
 
+      - name: Add yolo-mode catalog asset
+        run: cp data/yolo-modes.json dist/yolo-modes.json
+
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum *.tar.gz > SHA256SUMS
+        run: sha256sum *.tar.gz yolo-modes.json > SHA256SUMS
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
@@ -161,6 +168,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/install.sh
+            dist/yolo-modes.json
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           generate_release_notes: true
