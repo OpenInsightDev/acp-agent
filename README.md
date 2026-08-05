@@ -215,13 +215,12 @@ The server is implemented with [`agent-client-protocol-http` 2.0](https://docs.r
 
 If you know how to enable yolo mode for the acp agent you are using, you are welcome to add new entries to the `data/yolo-modes.json` list.
 
-Releases are published to npm automatically (see `release.yml`) using npm
-[trusted publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC) — no long-lived
-`NPM_TOKEN` is stored. Each package
-(`@open-insight/acp-agent` and the four platform packages) must have a trusted publisher
-configured on npmjs.com: package **Settings → Trusted publishing**, provider GitHub Actions,
-Organization `OpenInsightDev`, Repository `acp-agent`, Workflow filename `release.yml`, allowed
-action `npm publish`. The workflow only needs the `id-token: write` permission.
+Releases are published to npm automatically (see `release.yml`). Publishing uses npm
+[trusted publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC), with `NPM_TOKEN`
+only as the first-publish fallback. Once the five `@open-insight/acp-agent*` packages are on
+npm, configure each one on npmjs.com (Settings → Trusted publishing → GitHub Actions:
+`OpenInsightDev`/`acp-agent`, workflow `release.yml`, allow `npm publish`), then remove the
+`NPM_TOKEN` secret and the `NODE_AUTH_TOKEN` env in `release.yml`.
 
 ## License
 

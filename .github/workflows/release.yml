@@ -147,13 +147,8 @@ jobs:
           node-version: 24 # npm trusted publishing requires Node >= 22.14
           registry-url: https://registry.npmjs.org
           package-manager-cache: false # never cache in release builds
-      # Trusted publishing (OIDC): npm CLI 11.5.1+ detects the Actions OIDC
-      # environment (id-token: write above) and exchanges it for a short-lived
-      # publish token automatically. NODE_AUTH_TOKEN is only a fallback for the
-      # first publish - the packages do not exist on the registry yet, and npm
-      # requires a package to exist before a trusted publisher can be attached.
-      # Once the 5 packages are published and trusted publishers are configured
-      # on npmjs.com (see README), delete the NPM_TOKEN secret and this env.
+      # NODE_AUTH_TOKEN only needed for the first publish; switch to OIDC
+      # trusted publishing afterwards (see README).
       - name: Publish to npm
         run: cargo npm publish -- --access public
         env:
