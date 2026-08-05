@@ -101,6 +101,31 @@ acp-agent serve codex-acp --port 8010 -- --model gpt-5
 The default port is `0`, which lets the operating system select an available port.
 Set an explicit port when another process or container needs to connect.
 
+## Manage the local cache
+
+Binary agents are stored in the platform cache directory (`$HOME/.cache/acp-agent` on macOS and Linux, `%LOCALAPPDATA%\acp-agent` on Windows, `/cache/acp-agent` inside the Docker image).
+
+List agents installed locally (`id`, `version`, `platform`, and cache directory):
+
+```sh
+acp-agent list --installed
+```
+
+Remove an agent from the local cache, and uninstall its globally installed npm/uv wrapper when it ships as a package:
+
+```sh
+acp-agent uninstall codex-acp
+```
+
+Refresh an agent to the registry's latest release.
+Stale cached versions are discarded before the preferred distribution is (re)installed:
+
+```sh
+acp-agent update codex-acp
+```
+
+Package-manager installs (`npm`, `deno`, `uv`) live in the global toolchain rather than the agent cache, so `list --installed` only reports cached binary distributions.
+
 ## Docker
 
 The image contains the `acp-agent` CLI and its supported JavaScript/Python toolchains (`deno` and `uv`).
@@ -133,6 +158,9 @@ docker run --rm acp-agent:latest list
 docker run --rm acp-agent:latest search codex
 docker run --rm acp-agent:latest install-env --yes
 docker run --rm -v acp-agent-cache:/cache acp-agent:latest install codex-acp
+docker run --rm -v acp-agent-cache:/cache acp-agent:latest list --installed
+docker run --rm -v acp-agent-cache:/cache acp-agent:latest update codex-acp
+docker run --rm -v acp-agent-cache:/cache acp-agent:latest uninstall codex-acp
 docker run --rm -v acp-agent-cache:/cache acp-agent:latest run codex-acp
 ```
 

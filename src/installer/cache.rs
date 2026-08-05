@@ -1,7 +1,9 @@
+use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use tokio::fs;
 
 use crate::registry::Platform;
 
@@ -107,9 +109,106 @@ pub(crate) fn safe_path_component(value: &str) -> String {
     }
 }
 
+/// A binary distribution discovered in the local agent cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedAgent {
+    /// Registry ID of the cached agent.
+    pub agent_id: String,
+    /// Agent version held by this cache entry.
+    pub agent_version: String,
+    /// Platform cache key (for example `linux-x86_64`) of this entry.
+    pub platform: String,
+    /// Stable cache directory that owns the extracted payload.
+    pub cache_dir: PathBuf,
+    /// Executable entry point inside the extracted payload.
+    pub executable_path: PathBuf,
+}
+
+/// Scans the cache for every installed binary distribution.
+///
+/// Entries with missing or corrupt metadata are skipped so a damaged cache
+/// never breaks `list --installed`; staging directories left behind by
+/// interrupted installs are ignored as well.
+pub(crate) async fn list_cached_agents(root_dir: &Path) -> Vec<CachedAgent> {
+    let mut agents = Vec::new();
+    let agents_dir = root_dir.join(AGENTS_DIR);
+    let Ok(mut agent_entries) = fs::read_dir(&agents_dir).await else {
+        return agents;
+    };
+
+    while let Ok(Some(agent_entry)) = agent_entries.next_entry().await {
+        let Ok(mut platform_entries) = fs::read_dir(agent_entry.path()).await else {
+            continue;
+        };
+        while let Ok(Some(platform_entry)) = platform_entries.next_entry().await {
+            let Ok(mut version_entries) = fs::read_dir(platform_entry.path()).await else {
+                continue;
+            };
+            while let Ok(Some(version_entry)) = version_entries.next_entry().await {
+                if version_entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                if let Some(agent) = read_cached_agent(&version_entry.path()).await {
+                    agents.push(agent);
+                }
+            }
+        }
+    }
+
+    agents
+}
+
+async fn read_cached_agent(cache_dir: &Path) -> Option<CachedAgent> {
+    let metadata_bytes = fs::read(cache_dir.join(METADATA_FILE_NAME)).await.ok()?;
+    let metadata: BinaryCacheMetadata = serde_json::from_slice(&metadata_bytes).ok()?;
+    Some(CachedAgent {
+        agent_id: metadata.agent_id,
+        agent_version: metadata.agent_version,
+        platform: metadata.platform,
+        cache_dir: cache_dir.to_path_buf(),
+        executable_path: cache_dir.join(EXTRACTED_DIR_NAME).join(&metadata.cmd),
+    })
+}
+
+/// Removes every cached binary distribution for an agent.
+///
+/// Returns `true` when at least one cache entry was removed.
+pub(crate) async fn remove_cached_agent(root_dir: &Path, agent_id: &str) -> Result<bool> {
+    let agent_dir = root_dir
+        .join(AGENTS_DIR)
+        .join(safe_path_component(agent_id));
+    remove_dir_if_present(&agent_dir).await
+}
+
+/// Removes the cached binary distributions of an agent for one platform.
+///
+/// Used by `update` to discard stale versions before downloading the
+/// registry's current release. Returns `true` when entries were removed.
+pub(crate) async fn remove_cached_platform(
+    root_dir: &Path,
+    agent_id: &str,
+    platform: Platform,
+) -> Result<bool> {
+    let platform_dir = root_dir
+        .join(AGENTS_DIR)
+        .join(safe_path_component(agent_id))
+        .join(platform_cache_key(platform));
+    remove_dir_if_present(&platform_dir).await
+}
+
+async fn remove_dir_if_present(path: &Path) -> Result<bool> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to remove cache directory {}", path.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn builds_binary_cache_paths_under_namespace() {
@@ -145,5 +244,127 @@ mod tests {
     fn sanitizes_non_filename_characters() {
         assert_eq!(safe_path_component("demo/agent:beta"), "demo_agent_beta");
         assert_eq!(safe_path_component("..."), "_");
+    }
+
+    #[tokio::test]
+    async fn lists_cached_binaries_across_agents_and_platforms() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let demo_100 = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        let demo_110 = binary_cache_paths(&cache_root, "demo", "1.1.0", Platform::LinuxX86_64);
+        let zebra = binary_cache_paths(&cache_root, "zebra", "0.2.0", Platform::DarwinAarch64);
+
+        for (paths, agent_id, version, platform, cmd) in [
+            (
+                &demo_100,
+                "demo",
+                "1.0.0",
+                Platform::LinuxX86_64,
+                "./bin/demo",
+            ),
+            (
+                &demo_110,
+                "demo",
+                "1.1.0",
+                Platform::LinuxX86_64,
+                "./bin/demo",
+            ),
+            (&zebra, "zebra", "0.2.0", Platform::DarwinAarch64, "zebra"),
+        ] {
+            fs::create_dir_all(&paths.cache_dir).await.unwrap();
+            let metadata = BinaryCacheMetadata::new(
+                agent_id,
+                version,
+                platform,
+                "https://example.com/agent.tar.gz",
+                cmd,
+            );
+            fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let cached = list_cached_agents(&cache_root).await;
+        assert_eq!(cached.len(), 3);
+
+        let demo_100_entry = cached
+            .iter()
+            .find(|agent| agent.agent_version == "1.0.0")
+            .unwrap();
+        assert_eq!(demo_100_entry.agent_id, "demo");
+        assert_eq!(demo_100_entry.platform, "linux-x86_64");
+        assert_eq!(demo_100_entry.cache_dir, demo_100.cache_dir);
+        assert_eq!(
+            demo_100_entry.executable_path,
+            demo_100
+                .cache_dir
+                .join("extracted")
+                .join("bin")
+                .join("demo")
+        );
+
+        let zebra_entry = cached
+            .iter()
+            .find(|agent| agent.agent_id == "zebra")
+            .unwrap();
+        assert_eq!(zebra_entry.agent_version, "0.2.0");
+        assert_eq!(zebra_entry.platform, "darwin-aarch64");
+    }
+
+    #[tokio::test]
+    async fn skips_corrupt_and_staging_entries_when_listing() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        fs::create_dir_all(&paths.cache_dir).await.unwrap();
+        fs::write(&paths.metadata_path, b"{not-json").await.unwrap();
+
+        let staging_dir = paths.parent_dir.join(".1.0.0-staging-1-2");
+        fs::create_dir_all(&staging_dir).await.unwrap();
+        let metadata = BinaryCacheMetadata::new(
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            "https://example.com/a",
+            "./demo",
+        );
+        fs::write(
+            staging_dir.join(METADATA_FILE_NAME),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(list_cached_agents(&cache_root).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removes_cached_agent_directories() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        fs::create_dir_all(&paths.cache_dir).await.unwrap();
+
+        assert!(remove_cached_agent(&cache_root, "demo").await.unwrap());
+        assert!(!remove_cached_agent(&cache_root, "demo").await.unwrap());
+        assert!(!remove_cached_agent(&cache_root, "absent").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn removes_only_requested_platform_when_updating() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let linux = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        let darwin = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::DarwinAarch64);
+        fs::create_dir_all(&linux.cache_dir).await.unwrap();
+        fs::create_dir_all(&darwin.cache_dir).await.unwrap();
+
+        assert!(
+            remove_cached_platform(&cache_root, "demo", Platform::LinuxX86_64)
+                .await
+                .unwrap()
+        );
+        assert!(darwin.cache_dir.exists());
+        assert!(!linux.cache_dir.exists());
     }
 }

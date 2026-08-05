@@ -121,7 +121,7 @@ async fn install_binary(agent: &RegistryAgent, target: &BinaryTarget) -> Result<
     })
 }
 
-async fn run_command<I, S>(program: &str, args: I, subject: &str) -> Result<()>
+pub(crate) async fn run_command<I, S>(program: &str, args: I, subject: &str) -> Result<()>
 where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
@@ -157,6 +157,17 @@ pub enum InstallMethod {
     Deno,
     /// The registry points to a uvx package invoking `uv`.
     Uvx,
+}
+
+impl std::fmt::Display for InstallMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let installer = match self {
+            Self::Npm => "npm",
+            Self::Deno => "deno",
+            Self::Uvx => "uv",
+        };
+        write!(f, "{installer}")
+    }
 }
 
 /// Outcome data that is printed by the `install` subcommand.
@@ -201,14 +212,7 @@ impl std::fmt::Display for InstallOutcome {
                 agent_id,
                 method,
                 package,
-            } => {
-                let installer = match method {
-                    InstallMethod::Npm => "npm",
-                    InstallMethod::Deno => "deno",
-                    InstallMethod::Uvx => "uv",
-                };
-                write!(f, "Installed {agent_id} via {installer}: {package}")
-            }
+            } => write!(f, "Installed {agent_id} via {method}: {package}"),
         }
     }
 }
