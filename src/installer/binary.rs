@@ -50,18 +50,44 @@ pub async fn cache_binary_target(
     platform: Platform,
     target: &BinaryTarget,
 ) -> Result<CachedBinary> {
-    let result = cache_binary_target_inner(agent, platform, target).await;
+    let result = match cache_root_dir() {
+        Ok(root_dir) => cache_binary_target_in(&root_dir, agent, platform, target).await,
+        Err(error) => Err(error),
+    };
     record_install_log(agent, platform, &result);
     result
 }
 
-async fn cache_binary_target_inner(
+pub(crate) async fn cache_binary_target_in(
+    root_dir: &Path,
     agent: &RegistryAgent,
     platform: Platform,
     target: &BinaryTarget,
 ) -> Result<CachedBinary> {
-    let root_dir = cache_root_dir()?;
-    let paths = binary_cache_paths(&root_dir, &agent.id, &agent.version, platform);
+    cache_binary_target_in_mode(root_dir, agent, platform, target, false).await
+}
+
+/// Rebuilds a cached target even when its registry metadata has not changed.
+/// The existing entry remains available until the replacement is ready.
+pub(crate) async fn refresh_binary_target_in(
+    root_dir: &Path,
+    agent: &RegistryAgent,
+    platform: Platform,
+    target: &BinaryTarget,
+) -> Result<CachedBinary> {
+    let result = cache_binary_target_in_mode(root_dir, agent, platform, target, true).await;
+    record_install_log_in(root_dir, agent, platform, &result);
+    result
+}
+
+async fn cache_binary_target_in_mode(
+    root_dir: &Path,
+    agent: &RegistryAgent,
+    platform: Platform,
+    target: &BinaryTarget,
+    force_refresh: bool,
+) -> Result<CachedBinary> {
+    let paths = binary_cache_paths(root_dir, &agent.id, &agent.version, platform);
     let expected = BinaryCacheMetadata::new(
         &agent.id,
         &agent.version,
@@ -71,7 +97,7 @@ async fn cache_binary_target_inner(
         target.sha256.as_deref(),
     );
 
-    if let Some(prepared) = validate_cached_binary(&paths, &expected).await? {
+    if !force_refresh && let Some(prepared) = validate_cached_binary(&paths, &expected).await? {
         make_executable(&prepared.executable_path)
             .await
             .with_context(|| {
@@ -103,9 +129,18 @@ async fn cache_binary_target_inner(
         }
     }
 
-    match fs::rename(&staging_dir, &paths.cache_dir).await {
+    promote_staged_cache(&staging_dir, &paths, &expected, force_refresh).await
+}
+
+async fn promote_staged_cache(
+    staging_dir: &Path,
+    paths: &BinaryCachePaths,
+    expected: &BinaryCacheMetadata,
+    replace_existing: bool,
+) -> Result<CachedBinary> {
+    match fs::rename(staging_dir, &paths.cache_dir).await {
         Ok(()) => {
-            if let Some(cached) = validate_cached_binary(&paths, &expected).await? {
+            if let Some(cached) = validate_cached_binary(paths, expected).await? {
                 return Ok(cached);
             }
             bail!(
@@ -114,41 +149,71 @@ async fn cache_binary_target_inner(
             );
         }
         Err(rename_error) => {
-            if let Some(cached) = validate_cached_binary(&paths, &expected).await? {
-                cleanup_dir(&staging_dir).await;
+            if !replace_existing
+                && let Some(cached) = validate_cached_binary(paths, expected).await?
+            {
+                cleanup_dir(staging_dir).await;
                 return Ok(cached);
             }
 
             if try_exists(&paths.cache_dir).await? {
-                if let Err(remove_error) = fs::remove_dir_all(&paths.cache_dir).await {
-                    cleanup_dir(&staging_dir).await;
-                    return Err(remove_error).with_context(|| {
+                let backup_dir = paths
+                    .parent_dir
+                    .join(unique_backup_dir_name(&paths.cache_dir));
+                if let Err(backup_error) = fs::rename(&paths.cache_dir, &backup_dir).await {
+                    cleanup_dir(staging_dir).await;
+                    return Err(backup_error).with_context(|| {
                         format!(
-                            "failed to replace invalid cache directory {}",
+                            "failed to preserve existing cache directory {} before replacement",
                             paths.cache_dir.display()
                         )
                     });
                 }
-                if let Err(rename_error) = fs::rename(&staging_dir, &paths.cache_dir).await {
-                    cleanup_dir(&staging_dir).await;
-                    return Err(rename_error).with_context(|| {
-                        format!(
-                            "failed to promote staged cache {} to {}",
-                            staging_dir.display(),
-                            paths.cache_dir.display()
-                        )
-                    });
+
+                if let Err(promote_error) = fs::rename(staging_dir, &paths.cache_dir).await {
+                    let restore_result = fs::rename(&backup_dir, &paths.cache_dir).await;
+                    cleanup_dir(staging_dir).await;
+                    return match restore_result {
+                        Ok(()) => Err(promote_error).with_context(|| {
+                            format!(
+                                "failed to promote staged cache {} to {}; restored the previous cache",
+                                staging_dir.display(),
+                                paths.cache_dir.display()
+                            )
+                        }),
+                        Err(restore_error) => Err(promote_error).with_context(|| {
+                            format!(
+                                "failed to promote staged cache {} to {} and failed to restore {}: {}",
+                                staging_dir.display(),
+                                paths.cache_dir.display(),
+                                backup_dir.display(),
+                                restore_error
+                            )
+                        }),
+                    };
                 }
-                if let Some(cached) = validate_cached_binary(&paths, &expected).await? {
+
+                if let Some(cached) = validate_cached_binary(paths, expected).await? {
+                    cleanup_dir(&backup_dir).await;
                     return Ok(cached);
                 }
+
+                cleanup_dir(&paths.cache_dir).await;
+                if let Err(restore_error) = fs::rename(&backup_dir, &paths.cache_dir).await {
+                    return Err(restore_error).with_context(|| {
+                        format!(
+                            "replacement cache validation failed and the previous cache at {} could not be restored",
+                            backup_dir.display()
+                        )
+                    });
+                }
                 bail!(
-                    "cache directory {} was created, but validation still failed",
+                    "replacement cache {} failed validation; restored the previous cache",
                     paths.cache_dir.display()
                 );
             }
 
-            cleanup_dir(&staging_dir).await;
+            cleanup_dir(staging_dir).await;
             Err(rename_error).with_context(|| {
                 format!(
                     "failed to promote staged cache {} to {}",
@@ -169,6 +234,15 @@ fn record_install_log(agent: &RegistryAgent, platform: Platform, result: &Result
     let Ok(root_dir) = cache_root_dir() else {
         return;
     };
+    record_install_log_in(&root_dir, agent, platform, result);
+}
+
+fn record_install_log_in(
+    root_dir: &Path,
+    agent: &RegistryAgent,
+    platform: Platform,
+    result: &Result<CachedBinary>,
+) {
     let platform = platform_cache_key(platform);
     let outcome = match result {
         Ok(cached) => format!(
@@ -593,6 +667,23 @@ fn unique_staging_dir_name(agent_version: &str) -> String {
     )
 }
 
+fn unique_backup_dir_name(cache_dir: &Path) -> String {
+    let version = cache_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cache");
+    unique_work_dir_name(version, "backup")
+}
+
+fn unique_work_dir_name(component: &str, kind: &str) -> String {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(".{}-{kind}-{pid}-{nanos}", safe_path_component(component))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +833,94 @@ mod tests {
                 .is_none()
         );
         assert!(!try_exists(&paths.cache_dir).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_promotion_restores_the_previous_cache() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        let previous = BinaryCacheMetadata::new(
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            "https://example.com/previous.tar.gz",
+            "./bin/demo",
+            None,
+        );
+        let replacement = BinaryCacheMetadata::new(
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            "https://example.com/replacement.tar.gz",
+            "./bin/demo",
+            None,
+        );
+        fs::create_dir_all(&paths.extracted_dir).await.unwrap();
+        fs::write(&paths.metadata_path, serde_json::to_vec(&previous).unwrap())
+            .await
+            .unwrap();
+        let executable = paths.extracted_dir.join("bin").join("demo");
+        fs::create_dir_all(executable.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&executable, b"previous").await.unwrap();
+
+        let missing_staging = paths.parent_dir.join(".missing-staging");
+        assert!(
+            promote_staged_cache(&missing_staging, &paths, &replacement, true)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(fs::read(&executable).await.unwrap(), b"previous");
+        let restored: BinaryCacheMetadata =
+            serde_json::from_slice(&fs::read(&paths.metadata_path).await.unwrap()).unwrap();
+        assert_eq!(restored, previous);
+    }
+
+    #[tokio::test]
+    async fn forced_promotion_replaces_cache_with_unchanged_metadata() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        let metadata = BinaryCacheMetadata::new(
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            "https://example.com/demo.tar.gz",
+            "./demo",
+            None,
+        );
+        fs::create_dir_all(&paths.extracted_dir).await.unwrap();
+        fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())
+            .await
+            .unwrap();
+        fs::write(paths.extracted_dir.join("demo"), b"old")
+            .await
+            .unwrap();
+
+        let staging_dir = paths.parent_dir.join(".staging");
+        let staging_extracted = staging_dir.join(EXTRACTED_DIR_NAME);
+        fs::create_dir_all(&staging_extracted).await.unwrap();
+        fs::write(
+            staging_dir.join(METADATA_FILE_NAME),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+        fs::write(staging_extracted.join("demo"), b"new")
+            .await
+            .unwrap();
+
+        promote_staged_cache(&staging_dir, &paths, &metadata, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fs::read(paths.extracted_dir.join("demo")).await.unwrap(),
+            b"new"
+        );
     }
 
     #[test]

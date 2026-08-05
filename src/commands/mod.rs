@@ -5,6 +5,8 @@ use std::process::ExitStatus;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
+/// Local cache management commands (`list --installed`, `uninstall`, `update`).
+pub mod cache;
 /// Agent installation command.
 pub mod install;
 /// Registry listing output helpers.
@@ -39,9 +41,17 @@ enum Commands {
         args: Vec<String>,
     },
     /// List every published agent.
-    List,
+    List {
+        /// List agents cached locally instead of the published registry.
+        #[arg(long)]
+        installed: bool,
+    },
     /// Install an agent from its preferred registry distribution.
     Install { agent_id: String },
+    /// Remove an installed agent from the local cache and/or package managers.
+    Uninstall { agent_id: String },
+    /// Update an installed agent to the registry's latest distribution.
+    Update { agent_id: String },
     /// Install Deno or uv when no compatible local toolchain exists.
     InstallEnv {
         /// Skip the confirmation prompt.
@@ -125,16 +135,36 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 })?;
             Ok(exit_from_status(status))
         }
-        Commands::List => {
-            list::list_agents(writer)
-                .await
-                .context("failed to list registry agents")?;
+        Commands::List { installed } => {
+            if installed {
+                cache::list_installed(writer)
+                    .await
+                    .context("failed to list installed agents")?;
+            } else {
+                list::list_agents(writer)
+                    .await
+                    .context("failed to list registry agents")?;
+            }
             Ok(CliExit::Success)
         }
         Commands::Install { agent_id } => {
             let outcome = install::install_agent(&agent_id)
                 .await
                 .with_context(|| format!("failed to install agent \"{agent_id}\""))?;
+            writeln!(writer, "{outcome}")?;
+            Ok(CliExit::Success)
+        }
+        Commands::Uninstall { agent_id } => {
+            let outcome = cache::uninstall_agent(&agent_id)
+                .await
+                .with_context(|| format!("failed to uninstall agent \"{agent_id}\""))?;
+            writeln!(writer, "{outcome}")?;
+            Ok(CliExit::Success)
+        }
+        Commands::Update { agent_id } => {
+            let outcome = cache::update_agent(&agent_id)
+                .await
+                .with_context(|| format!("failed to update agent \"{agent_id}\""))?;
             writeln!(writer, "{outcome}")?;
             Ok(CliExit::Success)
         }
@@ -234,6 +264,33 @@ fn signal_exit_code(_: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_list_subcommand_with_installed_flag() {
+        let cli = Cli::try_parse_from(["acp-agent", "list", "--installed"]).unwrap();
+        assert!(matches!(cli.command, Commands::List { installed: true }));
+
+        let cli = Cli::try_parse_from(["acp-agent", "list"]).unwrap();
+        assert!(matches!(cli.command, Commands::List { installed: false }));
+    }
+
+    #[test]
+    fn parses_uninstall_subcommand() {
+        let cli = Cli::try_parse_from(["acp-agent", "uninstall", "codex-acp"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Uninstall { agent_id } if agent_id == "codex-acp"
+        ));
+    }
+
+    #[test]
+    fn parses_update_subcommand() {
+        let cli = Cli::try_parse_from(["acp-agent", "update", "codex-acp"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Update { agent_id } if agent_id == "codex-acp"
+        ));
+    }
 
     #[test]
     fn parses_install_env_yes_flag() {
