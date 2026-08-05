@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use serde_json::to_vec_pretty;
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use zip::ZipArchive;
 
@@ -67,6 +68,7 @@ async fn cache_binary_target_inner(
         platform,
         &target.archive,
         &target.cmd,
+        target.sha256.as_deref(),
     );
 
     if let Some(prepared) = validate_cached_binary(&paths, &expected).await? {
@@ -297,6 +299,8 @@ pub(crate) async fn download_archive(target: &BinaryTarget, temp_dir: &Path) -> 
         .bytes()
         .await
         .with_context(|| format!("failed to read archive response from {}", target.archive))?;
+    verify_sha256(bytes.as_ref(), target.sha256.as_deref())
+        .with_context(|| format!("integrity check failed for archive {}", target.archive))?;
     fs::write(&destination, bytes.as_ref())
         .await
         .with_context(|| {
@@ -306,6 +310,47 @@ pub(crate) async fn download_archive(target: &BinaryTarget, temp_dir: &Path) -> 
             )
         })?;
     Ok(destination)
+}
+
+/// Verifies downloaded bytes against the registry-declared SHA-256 digest.
+///
+/// A `None` digest means the registry published no checksum for this target;
+/// the download is accepted without verification so older entries keep working.
+fn verify_sha256(bytes: &[u8], expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let expected = parse_sha256(expected)?;
+    let actual = Sha256::digest(bytes);
+    if actual.as_slice() != expected {
+        bail!(
+            "sha256 checksum mismatch: expected {}, got {}",
+            hex_encode(&expected),
+            hex_encode(actual.as_slice())
+        );
+    }
+    Ok(())
+}
+
+/// Parses a registry-declared SHA-256 hex string into raw bytes.
+fn parse_sha256(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid sha256 checksum \"{value}\": expected 64 hexadecimal characters");
+    }
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .expect("hex digits were validated above");
+    }
+    Ok(digest)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 pub(crate) async fn extract_archive(archive_path: PathBuf, destination: PathBuf) -> Result<()> {
@@ -555,6 +600,30 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn accepts_download_without_declared_sha256() {
+        verify_sha256(b"payload", None).expect("missing digest should be accepted");
+    }
+
+    #[test]
+    fn accepts_download_matching_declared_sha256() {
+        let payload: &[u8] = b"payload";
+        let digest = hex_encode(Sha256::digest(payload).as_slice());
+        verify_sha256(payload, Some(&digest)).expect("matching digest should pass");
+    }
+
+    #[test]
+    fn rejects_download_mismatching_declared_sha256() {
+        let error = verify_sha256(b"payload", Some(&"0".repeat(64))).unwrap_err();
+        assert!(error.to_string().contains("sha256 checksum mismatch"));
+    }
+
+    #[test]
+    fn rejects_malformed_declared_sha256() {
+        let error = verify_sha256(b"payload", Some("not-a-sha256")).unwrap_err();
+        assert!(error.to_string().contains("invalid sha256 checksum"));
+    }
+
+    #[test]
     fn resolves_relative_cmd_paths() {
         let base = Path::new("/tmp/acp-agent");
         let resolved = resolve_cmd_path(base, "./dist-package/cursor-agent").unwrap();
@@ -590,6 +659,7 @@ mod tests {
             Platform::LinuxX86_64,
             "https://example.com/demo.tar.gz",
             "./bin/demo",
+            Some("a".repeat(64).as_str()),
         );
 
         fs::create_dir_all(&paths.extracted_dir).await.unwrap();
@@ -624,13 +694,15 @@ mod tests {
             Platform::LinuxX86_64,
             "https://example.com/demo.tar.gz",
             "./bin/demo",
+            Some("a".repeat(64).as_str()),
         );
         let cached = BinaryCacheMetadata::new(
             "demo",
             "1.0.0",
             Platform::LinuxX86_64,
-            "https://example.com/other.tar.gz",
+            "https://example.com/demo.tar.gz",
             "./bin/demo",
+            Some("b".repeat(64).as_str()),
         );
 
         fs::create_dir_all(&paths.extracted_dir).await.unwrap();
@@ -657,6 +729,7 @@ mod tests {
             Platform::LinuxX86_64,
             "https://example.com/demo.tar.gz",
             "./bin/demo",
+            Some("a".repeat(64).as_str()),
         );
 
         fs::create_dir_all(&paths.cache_dir).await.unwrap();

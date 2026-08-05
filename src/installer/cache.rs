@@ -26,6 +26,11 @@ pub(crate) struct BinaryCacheMetadata {
     pub platform: String,
     pub archive: String,
     pub cmd: String,
+    /// Optional SHA-256 of the downloaded archive. Binding the digest into the
+    /// metadata means a re-published archive (or a newly published digest)
+    /// invalidates the cached entry through the existing equality check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 impl BinaryCacheMetadata {
@@ -35,6 +40,7 @@ impl BinaryCacheMetadata {
         platform: Platform,
         archive: &str,
         cmd: &str,
+        sha256: Option<&str>,
     ) -> Self {
         Self {
             agent_id: agent_id.to_string(),
@@ -42,6 +48,7 @@ impl BinaryCacheMetadata {
             platform: platform_cache_key(platform).to_string(),
             archive: archive.to_string(),
             cmd: cmd.to_string(),
+            sha256: sha256.map(str::to_owned),
         }
     }
 }

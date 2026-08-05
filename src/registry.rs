@@ -55,6 +55,10 @@ pub struct BinaryTarget {
     pub archive: String,
     /// Relative path within the archive to the command that should be executed.
     pub cmd: String,
+    /// Optional hex-encoded SHA-256 checksum of the archive, verified after
+    /// download to protect against supply-chain tampering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     /// Optional default command-line arguments that accompany the executable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<CommandArgs>,
@@ -432,6 +436,7 @@ mod tests {
             linux_x86_64: Some(BinaryTarget {
                 archive: "https://example.com/tool.tar.gz".to_string(),
                 cmd: "./tool".to_string(),
+                sha256: None,
                 args: None,
                 env: None,
             }),
@@ -442,5 +447,46 @@ mod tests {
             .for_platform(Platform::LinuxX86_64)
             .expect("target should exist");
         assert_eq!(target.cmd, "./tool");
+    }
+
+    #[test]
+    fn decodes_binary_target_with_sha256() {
+        let registry = Registry::from_value(json!({
+            "version": "1",
+            "agents": [
+                {
+                    "id": "checksummed-agent",
+                    "name": "Checksummed Agent",
+                    "version": "0.1.0",
+                    "description": "Agent with a published sha256",
+                    "authors": ["ACP"],
+                    "license": "MIT",
+                    "distribution": {
+                        "binary": {
+                            "linux-x86_64": {
+                                "archive": "https://example.com/checksummed.tar.gz",
+                                "cmd": "checksummed",
+                                "sha256": "240a1a464f2a400ae51e9613b7f52b2abb6e7a29759001e9185291325671ccf1"
+                            }
+                        }
+                    }
+                }
+            ]
+        }))
+        .expect("registry should decode");
+
+        let agent = registry.get_agent("checksummed-agent").unwrap();
+        let target = agent
+            .distribution
+            .binary
+            .as_ref()
+            .unwrap()
+            .linux_x86_64
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            target.sha256.as_deref(),
+            Some("240a1a464f2a400ae51e9613b7f52b2abb6e7a29759001e9185291325671ccf1")
+        );
     }
 }
