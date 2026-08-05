@@ -7,8 +7,15 @@
 #   https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-<platform>@<version>/acp-agent
 # If the CDN is unreachable, the script falls back to the GitHub release
 # archive (verified against the SHA256SUMS published with the release).
-# No GitHub API call is made: assets are fetched via the deterministic
-# releases/latest/download/ (or releases/download/<tag>/) URLs.
+#
+# No GitHub API call is made. The version to install is resolved from
+# ACP_AGENT_VERSION, or - for the default "latest" install - by following
+# the deterministic releases/latest/download/ redirect once (a single HEAD
+# request) to learn the current release tag. The CDN is only ever queried
+# with that exact version: `@latest` is not used because it silently serves
+# the newest *published npm* version, which can lag behind the GitHub
+# release if the npm publish step fails or is slow. Downloaded CDN binaries
+# are additionally checked to report the expected version.
 #
 # Optional env overrides:
 #   ACP_AGENT_REPO          GitHub repo (default: OpenInsightDev/acp-agent)
@@ -57,17 +64,24 @@ case "$OS-$ARCH" in
   *) NPM_PLATFORM="" ;;
 esac
 
+# Resolve the exact version to install. Prefer ACP_AGENT_VERSION; otherwise
+# follow the releases/latest/download/ redirect (one HEAD request, no API).
+# Prints the version, or nothing if it cannot be determined (e.g. GitHub
+# unreachable); callers fall back to the plain latest URLs in that case.
+resolve_latest_version() {
+  # GitHub redirects latest -> releases/download/vX.y.z/... -> signed asset
+  # URL, so follow only the first hop and read its Location header.
+  curl -sSI --retry 2 --proto '=https' --tlsv1.2 \
+    -H "User-Agent: ${BIN_NAME}-install" \
+    "https://github.com/$REPO/releases/latest/download/$ASSET" 2>/dev/null |
+    tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | head -n 1 |
+    sed -n 's#.*/releases/download/v\([^/]*\)/.*#\1#p'
+}
+
 if [ -n "${ACP_AGENT_VERSION:-}" ]; then
   VERSION="${ACP_AGENT_VERSION#v}"
 else
-  VERSION="latest"
-fi
-
-NPM_BIN_URL="https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-${NPM_PLATFORM}@${VERSION}/acp-agent"
-if [ -n "${ACP_AGENT_VERSION:-}" ]; then
-  BASE_URL="https://github.com/$REPO/releases/download/v$VERSION"
-else
-  BASE_URL="https://github.com/$REPO/releases/latest/download"
+  VERSION="$(resolve_latest_version)"
 fi
 
 download() {
@@ -75,23 +89,41 @@ download() {
     -H "User-Agent: ${BIN_NAME}-install" -o "$2" "$1"
 }
 
+# True if the binary runs and reports the expected version, e.g.
+# `acp-agent 0.0.4` -> "0.0.4". Also guards against truncated or
+# wrong-architecture downloads.
+binary_version_matches() {
+  [ "$("$1" --version 2>/dev/null | sed 's/.* //')" = "$2" ]
+}
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
-# 1. Try the jsDelivr CDN first: the npm platform package carries the bare
-# binary, so no archive extraction is needed.
-if [ -n "$NPM_PLATFORM" ]; then
+# 1. Prefer the jsDelivr CDN: the npm platform package carries the bare
+# binary, so no archive extraction is needed. Only exact versions are used
+# and the downloaded binary must report that version - anything else falls
+# back to GitHub.
+if [ -n "$NPM_PLATFORM" ] && [ -n "$VERSION" ]; then
   BIN_PATH="$TMP_DIR/$BIN_NAME"
+  NPM_BIN_URL="https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-${NPM_PLATFORM}@${VERSION}/acp-agent"
   if download "$NPM_BIN_URL" "$BIN_PATH"; then
-    mkdir -p "$INSTALL_DIR"
-    install -m 0755 "$BIN_PATH" "$INSTALL_DIR/$BIN_NAME"
-    echo "installed $BIN_NAME to $INSTALL_DIR/$BIN_NAME"
-    exit 0
+    chmod +x "$BIN_PATH" # curl -o does not set the executable bit
+    if binary_version_matches "$BIN_PATH" "$VERSION"; then
+      mkdir -p "$INSTALL_DIR"
+      install -m 0755 "$BIN_PATH" "$INSTALL_DIR/$BIN_NAME"
+      echo "installed $BIN_NAME $VERSION to $INSTALL_DIR/$BIN_NAME"
+      exit 0
+    fi
   fi
-  echo "warning: jsDelivr download failed ($NPM_BIN_URL); falling back to GitHub releases" >&2
+  echo "warning: jsDelivr download failed or version mismatch ($NPM_BIN_URL); falling back to GitHub releases" >&2
 fi
 
 # 2. Fallback: GitHub release archive, verified against SHA256SUMS.
+if [ -n "$VERSION" ]; then
+  BASE_URL="https://github.com/$REPO/releases/download/v$VERSION"
+else
+  BASE_URL="https://github.com/$REPO/releases/latest/download"
+fi
 ARCHIVE="$TMP_DIR/$ASSET"
 download "$BASE_URL/$ASSET" "$ARCHIVE" || {
   echo "failed to download $BASE_URL/$ASSET" >&2

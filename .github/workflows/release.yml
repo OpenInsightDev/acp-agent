@@ -135,6 +135,7 @@ jobs:
               *linux-aarch64*) triple="aarch64-unknown-linux-gnu" ;;
               *darwin-x86_64*) triple="x86_64-apple-darwin" ;;
               *darwin-aarch64*) triple="aarch64-apple-darwin" ;;
+              *) echo "error: no cargo-npm target mapped for $tarball" >&2; exit 1 ;;
             esac
             mkdir -p "target/$triple/release"
             tar -xzf "$tarball" -C "target/$triple/release" acp-agent
@@ -149,6 +150,15 @@ jobs:
         run: cargo npm publish -- --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Smoke test CDN URLs
+        run: |
+          set -eux
+          VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "acp-agent") | .version')"
+          for p in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            curl -fsSL --retry 5 --retry-all-errors -o /dev/null \
+              "https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-${p}@${VERSION}/acp-agent"
+          done
 
   docker:
     runs-on: ubuntu-latest

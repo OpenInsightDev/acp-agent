@@ -18,7 +18,10 @@ The installer fetches the binary from the [jsDelivr CDN](https://www.jsdelivr.co
 binaries are published to npm as platform packages
 (`@open-insight/acp-agent-<platform>`, built with [cargo-npm](https://github.com/abemedia/cargo-npm))
 and served from `https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-<platform>@<version>/acp-agent`.
-If the CDN is unreachable, `install.sh` falls back to the GitHub release archives.
+The installer always resolves the exact version to install (from `ACP_AGENT_VERSION`, or by
+following the GitHub `latest` redirect) and verifies the CDN binary reports that version;
+if the CDN is unreachable or mismatched, it falls back to the GitHub release archives
+(verified against SHA256SUMS).
 
 ## Quick start
 
