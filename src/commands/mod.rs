@@ -18,6 +18,15 @@ pub mod search;
 /// ACP HTTP agent serving command.
 pub mod serve;
 
+/// Output format for registry listing and search commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentOutputFormat {
+    /// A tab-separated `name`, `id`, `description` table.
+    Tsv,
+    /// Full agent records as a pretty-printed JSON array.
+    Json,
+}
+
 /// CLI arguments consumed by the `acp-agent` binary.
 #[derive(Debug, Parser)]
 #[command(
@@ -43,10 +52,10 @@ enum Commands {
     /// List every published agent.
     List {
         /// List agents cached locally instead of the published registry.
-        #[arg(long, conflicts_with = "json")]
+        #[arg(long)]
         installed: bool,
         /// Emit the full agent records as a pretty-printed JSON array.
-        #[arg(long, conflicts_with = "installed")]
+        #[arg(long)]
         json: bool,
     },
     /// Install an agent from its preferred registry distribution.
@@ -144,12 +153,17 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             Ok(exit_from_status(status))
         }
         Commands::List { installed, json } => {
+            let format = if json {
+                AgentOutputFormat::Json
+            } else {
+                AgentOutputFormat::Tsv
+            };
             if installed {
-                cache::list_installed(writer)
+                cache::list_installed_with_format(writer, format)
                     .await
                     .context("failed to list installed agents")?;
             } else {
-                list::list_agents(writer, json)
+                list::list_agents_with_format(writer, format)
                     .await
                     .context("failed to list registry agents")?;
             }
@@ -223,7 +237,12 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             .map(|()| CliExit::Success)
         }
         Commands::Search { query, json } => {
-            search::search_agents(&query, writer, json)
+            let format = if json {
+                AgentOutputFormat::Json
+            } else {
+                AgentOutputFormat::Tsv
+            };
+            search::search_agents_with_format(&query, writer, format)
                 .await
                 .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
             Ok(CliExit::Success)
@@ -350,6 +369,18 @@ mod tests {
     fn parses_list_subcommand_with_json_flag() {
         let cli = Cli::try_parse_from(["acp-agent", "list", "--json"]).unwrap();
         assert!(matches!(cli.command, Commands::List { json: true }));
+    }
+
+    #[test]
+    fn list_and_search_default_to_tsv_output() {
+        let list = Cli::try_parse_from(["acp-agent", "list"]).unwrap();
+        assert!(matches!(list.command, Commands::List { json: false }));
+
+        let search = Cli::try_parse_from(["acp-agent", "search", "helper"]).unwrap();
+        assert!(matches!(
+            search.command,
+            Commands::Search { json: false, .. }
+        ));
     }
 
     #[test]

@@ -2,19 +2,32 @@ use std::io::{self, Write};
 
 use anyhow::{Context, Result};
 
-use crate::registry::{Registry, RegistryAgent, fetch_registry};
+use crate::{
+    commands::AgentOutputFormat,
+    registry::{Registry, RegistryAgent, fetch_registry},
+};
 
 /// Prints the canonical registry agent directory.
 ///
-/// Defaults to a tab-separated `name`, `id`, `description` table sorted by
-/// name (case-insensitive). With `json` set, the full agent records are
-/// serialized as a pretty-printed JSON array instead.
-pub async fn list_agents<W: Write>(writer: &mut W, json: bool) -> Result<()> {
+/// The output is a tab-separated `name`, `id`, `description` table sorted by
+/// name (case-insensitive).
+pub async fn list_agents<W: Write>(writer: &mut W) -> Result<()> {
+    list_agents_with_format(writer, AgentOutputFormat::Tsv).await
+}
+
+/// Prints the canonical registry agent directory using `format`.
+pub async fn list_agents_with_format<W: Write>(
+    writer: &mut W,
+    format: AgentOutputFormat,
+) -> Result<()> {
     let registry = fetch_registry().await?;
-    if json {
-        write_agent_list_json(&registry, writer).context("failed to write agent list as JSON")
-    } else {
-        write_agent_list(&registry, writer).context("failed to write agent list")
+    match format {
+        AgentOutputFormat::Tsv => {
+            write_agent_list(&registry, writer).context("failed to write agent list")
+        }
+        AgentOutputFormat::Json => {
+            write_agent_list_json(&registry, writer).context("failed to write agent list as JSON")
+        }
     }
 }
 
@@ -52,6 +65,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn legacy_list_agents_api_keeps_tsv_signature() {
+        fn accepts_legacy_api<W: Write>(writer: &mut W) {
+            let future = list_agents(writer);
+            drop(future);
+        }
+
+        accepts_legacy_api(&mut Vec::new());
+    }
 
     #[test]
     fn writes_name_id_and_description_for_each_agent() {

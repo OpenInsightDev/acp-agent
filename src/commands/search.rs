@@ -2,20 +2,32 @@ use std::io::{self, Write};
 
 use anyhow::{Context, Result};
 
-use crate::registry::{Registry, RegistryAgent, fetch_registry};
+use crate::{
+    commands::AgentOutputFormat,
+    registry::{Registry, RegistryAgent, fetch_registry},
+};
 
 /// Prints registry agents whose name/id/description fuzzily match `query`.
 ///
-/// Defaults to the same `name`, `id`, `description` columns as `list`, but
-/// only for the matching subset. With `json` set, the full matching agent
-/// records are serialized as a pretty-printed JSON array instead.
-pub async fn search_agents<W: Write>(query: &str, writer: &mut W, json: bool) -> Result<()> {
+/// The output uses the same tab-separated columns as [`super::list::list_agents`],
+/// restricted to the matching subset.
+pub async fn search_agents<W: Write>(query: &str, writer: &mut W) -> Result<()> {
+    search_agents_with_format(query, writer, AgentOutputFormat::Tsv).await
+}
+
+/// Prints registry agents matching `query` using `format`.
+pub async fn search_agents_with_format<W: Write>(
+    query: &str,
+    writer: &mut W,
+    format: AgentOutputFormat,
+) -> Result<()> {
     let registry = fetch_registry().await?;
-    if json {
-        write_search_results_json(&registry, query, writer)
-            .context("failed to write search results as JSON")
-    } else {
-        write_search_results(&registry, query, writer).context("failed to write search results")
+    match format {
+        AgentOutputFormat::Tsv => {
+            write_search_results(&registry, query, writer).context("failed to write search results")
+        }
+        AgentOutputFormat::Json => write_search_results_json(&registry, query, writer)
+            .context("failed to write search results as JSON"),
     }
 }
 
@@ -61,6 +73,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn legacy_search_agents_api_keeps_tsv_signature() {
+        fn accepts_legacy_api<W: Write>(query: &str, writer: &mut W) {
+            let future = search_agents(query, writer);
+            drop(future);
+        }
+
+        accepts_legacy_api("agent", &mut Vec::new());
+    }
 
     #[test]
     fn writes_fuzzy_search_matches_using_name_id_and_description() {
