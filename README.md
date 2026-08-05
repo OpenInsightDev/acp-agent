@@ -5,7 +5,7 @@ CLI and Rust library for discovering, installing, running, and serving [Agent Cl
 ## Install
 
 ```sh
-curl -fsSL https://github.com/OpenInsightDev/acp-agent/releases/latest/download/install.sh | sh
+curl -fsSL https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/scripts/install.sh | sh
 ```
 
 or with `cargo`:
@@ -13,6 +13,12 @@ or with `cargo`:
 ```sh
 cargo install acp-agent
 ```
+
+The installer fetches the binary from the [jsDelivr CDN](https://www.jsdelivr.com/):
+binaries are published to npm as platform packages
+(`@open-insight/acp-agent-<platform>`, built with [cargo-npm](https://github.com/abemedia/cargo-npm))
+and served from `https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-<platform>@<version>/acp-agent`.
+If the CDN is unreachable, `install.sh` falls back to the GitHub release archives.
 
 ## Quick start
 
@@ -205,6 +211,8 @@ The server is implemented with [`agent-client-protocol-http` 2.0](https://docs.r
 ## Contribution
 
 If you know how to enable yolo mode for the acp agent you are using, you are welcome to add new entries to the `data/yolo-modes.json` list.
+
+Releases are published to npm automatically (see `release.yml`); the workflow requires an `NPM_TOKEN` secret with read/write access to the `@open-insight` scope.
 
 ## License
 

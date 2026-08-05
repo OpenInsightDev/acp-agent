@@ -110,6 +110,46 @@ jobs:
           generate_release_notes: true
           overwrite_files: true
 
+  npm-publish:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-npm
+        run: cargo install cargo-npm --locked
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Stage binaries for cargo-npm
+        run: |
+          set -eux
+          for tarball in dist/acp-agent-*.tar.gz; do
+            case "$tarball" in
+              *linux-x86_64*) triple="x86_64-unknown-linux-gnu" ;;
+              *linux-aarch64*) triple="aarch64-unknown-linux-gnu" ;;
+              *darwin-x86_64*) triple="x86_64-apple-darwin" ;;
+              *darwin-aarch64*) triple="aarch64-apple-darwin" ;;
+            esac
+            mkdir -p "target/$triple/release"
+            tar -xzf "$tarball" -C "target/$triple/release" acp-agent
+          done
+      - name: Generate npm packages
+        run: cargo npm generate --clean
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Publish to npm
+        run: cargo npm publish -- --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
   docker:
     runs-on: ubuntu-latest
     permissions:
