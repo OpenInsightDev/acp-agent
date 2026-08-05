@@ -21,9 +21,9 @@ pub mod serve;
 /// Output format for registry listing and search commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentOutputFormat {
-    /// A tab-separated `name`, `id`, `description` table.
+    /// Human-readable tab-separated output.
     Tsv,
-    /// Full agent records as a pretty-printed JSON array.
+    /// Full records as a pretty-printed JSON array.
     Json,
 }
 
@@ -295,10 +295,22 @@ mod tests {
     #[test]
     fn parses_list_subcommand_with_installed_flag() {
         let cli = Cli::try_parse_from(["acp-agent", "list", "--installed"]).unwrap();
-        assert!(matches!(cli.command, Commands::List { installed: true }));
+        assert!(matches!(
+            cli.command,
+            Commands::List {
+                installed: true,
+                ..
+            }
+        ));
 
         let cli = Cli::try_parse_from(["acp-agent", "list"]).unwrap();
-        assert!(matches!(cli.command, Commands::List { installed: false }));
+        assert!(matches!(
+            cli.command,
+            Commands::List {
+                installed: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -368,13 +380,25 @@ mod tests {
     #[test]
     fn parses_list_subcommand_with_json_flag() {
         let cli = Cli::try_parse_from(["acp-agent", "list", "--json"]).unwrap();
-        assert!(matches!(cli.command, Commands::List { json: true }));
+        assert!(matches!(cli.command, Commands::List { json: true, .. }));
+    }
+
+    #[test]
+    fn parses_installed_list_with_json_output() {
+        let cli = Cli::try_parse_from(["acp-agent", "list", "--installed", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::List {
+                installed: true,
+                json: true
+            }
+        ));
     }
 
     #[test]
     fn list_and_search_default_to_tsv_output() {
         let list = Cli::try_parse_from(["acp-agent", "list"]).unwrap();
-        assert!(matches!(list.command, Commands::List { json: false }));
+        assert!(matches!(list.command, Commands::List { json: false, .. }));
 
         let search = Cli::try_parse_from(["acp-agent", "search", "helper"]).unwrap();
         assert!(matches!(

@@ -111,6 +111,9 @@ List agents installed locally (`id`, `version`, `platform`, and cache directory)
 acp-agent list --installed
 ```
 
+Add `--json` to return the installed records as structured JSON, including
+their cache and executable paths.
+
 Remove an agent from the local cache, and uninstall its globally installed npm/uv wrapper when it ships as a package:
 
 ```sh

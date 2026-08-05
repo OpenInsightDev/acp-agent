@@ -109,11 +109,13 @@ pub(crate) fn safe_path_component(value: &str) -> String {
 }
 
 /// A binary distribution discovered in the local agent cache.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CachedAgent {
     /// Registry ID of the cached agent.
+    #[serde(rename = "id")]
     pub agent_id: String,
     /// Agent version held by this cache entry.
+    #[serde(rename = "version")]
     pub agent_version: String,
     /// Platform cache key (for example `linux-x86_64`) of this entry.
     pub platform: String,
