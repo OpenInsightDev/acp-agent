@@ -846,6 +846,7 @@ mod tests {
             Platform::LinuxX86_64,
             "https://example.com/previous.tar.gz",
             "./bin/demo",
+            None,
         );
         let replacement = BinaryCacheMetadata::new(
             "demo",
@@ -853,6 +854,7 @@ mod tests {
             Platform::LinuxX86_64,
             "https://example.com/replacement.tar.gz",
             "./bin/demo",
+            None,
         );
         fs::create_dir_all(&paths.extracted_dir).await.unwrap();
         fs::write(&paths.metadata_path, serde_json::to_vec(&previous).unwrap())
@@ -888,6 +890,7 @@ mod tests {
             Platform::LinuxX86_64,
             "https://example.com/demo.tar.gz",
             "./demo",
+            None,
         );
         fs::create_dir_all(&paths.extracted_dir).await.unwrap();
         fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())

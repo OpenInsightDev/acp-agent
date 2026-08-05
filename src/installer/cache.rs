@@ -313,6 +313,7 @@ mod tests {
                 platform,
                 "https://example.com/agent.tar.gz",
                 cmd,
+                None,
             );
             fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())
                 .await
@@ -362,6 +363,7 @@ mod tests {
             Platform::LinuxX86_64,
             "https://example.com/a",
             "./demo",
+            None,
         );
         fs::write(
             staging_dir.join(METADATA_FILE_NAME),
@@ -456,6 +458,7 @@ mod tests {
             platform,
             "https://example.com/agent.tar.gz",
             "./agent",
+            None,
         );
         fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())
             .await

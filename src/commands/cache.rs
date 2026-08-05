@@ -412,6 +412,7 @@ mod tests {
             Platform::LinuxX86_64,
             "https://example.com/demo.tar.gz",
             "./demo",
+            None,
         );
         fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())
             .await
@@ -565,7 +566,7 @@ mod tests {
         let old = binary_cache_paths(temp_dir.path(), "demo", "1.0.0", platform);
         write_binary_cache(&old, "demo", "1.0.0", platform, "old").await;
         let unchanged_metadata =
-            BinaryCacheMetadata::new("demo", "1.0.0", platform, "not a valid URL", "./demo");
+            BinaryCacheMetadata::new("demo", "1.0.0", platform, "not a valid URL", "./demo", None);
         fs::write(
             &old.metadata_path,
             serde_json::to_vec(&unchanged_metadata).unwrap(),
@@ -579,6 +580,7 @@ mod tests {
             BinaryTarget {
                 archive: "not a valid URL".to_string(),
                 cmd: "./demo".to_string(),
+                sha256: None,
                 args: None,
                 env: None,
             },
@@ -656,6 +658,7 @@ mod tests {
             platform,
             &format!("https://example.com/demo-{version}.tar.gz"),
             "./demo",
+            None,
         );
         fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())
             .await
