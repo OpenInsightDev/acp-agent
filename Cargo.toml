@@ -1,6 +1,6 @@
 [package]
 name = "acp-agent"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "CLI for discovering, installing, and running ACP agents"
 rust-version = "1.96"
