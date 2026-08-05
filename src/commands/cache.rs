@@ -4,10 +4,15 @@ use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use serde_json::Value;
+use tokio::fs;
+use tokio::process::Command;
 
 use crate::commands::install::{InstallMethod, InstallOutcome, install_from_registry, run_command};
+use crate::installer::binary::refresh_binary_target_in;
 use crate::installer::cache::{
-    CachedAgent, cache_root_dir, list_cached_agents, remove_cached_agent, remove_cached_platform,
+    CachedAgent, cache_root_dir, list_cached_agents, remove_cached_agent,
+    remove_cached_platform_except,
 };
 use crate::installer::environment::program_available;
 use crate::registry::{Platform, Registry, fetch_registry};
@@ -102,7 +107,22 @@ async fn uninstall_from(
 
 async fn uninstall_npx_package(agent_id: &str, package: &str) -> Result<UninstallOutcome> {
     let package = bare_package_name(package);
-    if program_available("npm")? {
+    let npm_available = program_available("npm")?;
+    let npm_installed = if npm_available {
+        npm_package_installed(package).await?
+    } else {
+        false
+    };
+    let deno_root = deno_install_root()?;
+    let deno_installations = find_deno_installations(&deno_root, package).await?;
+
+    if npm_installed && !deno_installations.is_empty() {
+        bail!(
+            "npm package {package} is installed through both npm and Deno; remove one installation explicitly and retry"
+        );
+    }
+
+    if npm_installed {
         run_command(
             "npm",
             ["uninstall", "--global", package],
@@ -116,13 +136,13 @@ async fn uninstall_npx_package(agent_id: &str, package: &str) -> Result<Uninstal
         });
     }
 
-    if program_available("deno")? {
-        run_command(
-            "deno",
-            ["uninstall", "--global", package],
-            &format!("npm package {package}"),
-        )
-        .await?;
+    if !deno_installations.is_empty() {
+        if !program_available("deno")? {
+            bail!("npm package {package} is installed through Deno, but deno is not available");
+        }
+        let mut args = vec!["uninstall".to_string(), "--global".to_string()];
+        args.extend(deno_installations);
+        run_command("deno", args, &format!("npm package {package}")).await?;
         return Ok(UninstallOutcome::PackageManager {
             agent_id: agent_id.to_string(),
             method: InstallMethod::Deno,
@@ -130,22 +150,107 @@ async fn uninstall_npx_package(agent_id: &str, package: &str) -> Result<Uninstal
         });
     }
 
-    bail!("cannot uninstall npm package {package}: neither npm nor deno is available")
+    bail!("npm package {package} is not installed through npm or Deno")
 }
 
 async fn uninstall_uvx_package(agent_id: &str, package: &str) -> Result<UninstallOutcome> {
+    let tool_name = uv_tool_name(package)?;
     run_command(
         "uv",
-        ["tool", "uninstall", package],
-        &format!("uv package {package}"),
+        ["tool", "uninstall", tool_name],
+        &format!("uv package {tool_name}"),
     )
     .await?;
 
     Ok(UninstallOutcome::PackageManager {
         agent_id: agent_id.to_string(),
         method: InstallMethod::Uvx,
-        package: package.to_string(),
+        package: tool_name.to_string(),
     })
+}
+
+fn uv_tool_name(package: &str) -> Result<&str> {
+    let package = package.trim();
+    let end = package
+        .char_indices()
+        .find_map(|(index, ch)| {
+            (ch.is_whitespace() || matches!(ch, '[' | '<' | '>' | '=' | '!' | '~' | '@'))
+                .then_some(index)
+        })
+        .unwrap_or(package.len());
+    let name = &package[..end];
+    if name.is_empty() {
+        bail!("invalid uv package requirement: {package}");
+    }
+    Ok(name)
+}
+
+async fn npm_package_installed(package: &str) -> Result<bool> {
+    let output = Command::new("npm")
+        .args(["list", "--global", "--depth=0", "--json"])
+        .output()
+        .await
+        .context("failed to inspect globally installed npm packages")?;
+    let value: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        format!(
+            "npm did not return a valid global package list: {}",
+            detail.trim()
+        )
+    })?;
+    Ok(npm_list_contains(&value, package))
+}
+
+fn npm_list_contains(value: &Value, package: &str) -> bool {
+    value
+        .get("dependencies")
+        .and_then(Value::as_object)
+        .is_some_and(|dependencies| dependencies.contains_key(package))
+}
+
+fn deno_install_root() -> Result<std::path::PathBuf> {
+    if let Some(root) = std::env::var_os("DENO_INSTALL_ROOT").filter(|root| !root.is_empty()) {
+        return Ok(root.into());
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".deno"))
+        .context("could not determine the Deno installation root")
+}
+
+async fn find_deno_installations(root_dir: &Path, package: &str) -> Result<Vec<String>> {
+    let bin_dir = root_dir.join("bin");
+    let mut entries = match fs::read_dir(&bin_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", bin_dir.display()));
+        }
+    };
+    let mut installations = Vec::new();
+
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(name) = file_name.strip_prefix('.').filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let package_json = entry.path().join("package.json");
+        let Ok(bytes) = fs::read(package_json).await else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if npm_list_contains(&value, package) {
+            installations.push(name.to_string());
+        }
+    }
+
+    installations.sort();
+    installations.dedup();
+    Ok(installations)
 }
 
 /// Strips a trailing `@version` specifier from an npm package reference so
@@ -165,9 +270,8 @@ fn bare_package_name(package: &str) -> &str {
 
 /// Refreshes an agent from the registry.
 ///
-/// Cached binary distributions for the current platform are discarded before
-/// the registry's preferred distribution is (re)installed, so the agent is
-/// brought to the latest published version.
+/// A replacement binary is fully prepared before stale cache entries are
+/// removed, so a failed refresh leaves the currently working version intact.
 pub async fn update_agent(agent_id: &str) -> Result<InstallOutcome> {
     let registry = fetch_registry().await?;
     let root_dir = cache_root_dir()?;
@@ -183,10 +287,18 @@ async fn update_from(
 
     if let Some(binary) = &agent.distribution.binary {
         let platform = Platform::current()?;
-        if binary.for_platform(platform).is_some()
-            && remove_cached_platform(root_dir, agent_id, platform).await?
-        {
-            eprintln!("removed stale cached binaries for \"{agent_id}\"");
+        if let Some(target) = binary.for_platform(platform) {
+            let cached = refresh_binary_target_in(root_dir, agent, platform, target).await?;
+            if remove_cached_platform_except(root_dir, agent_id, platform, &cached.cache_dir)
+                .await?
+            {
+                eprintln!("removed stale cached binaries for \"{agent_id}\"");
+            }
+            return Ok(InstallOutcome::Binary {
+                agent_id: agent.id.clone(),
+                executable_path: cached.executable_path,
+                cache_dir: cached.cache_dir,
+            });
         }
     }
 
@@ -235,8 +347,8 @@ mod tests {
     use tokio::fs;
 
     use super::*;
-    use crate::installer::cache::binary_cache_paths;
-    use crate::registry::{AgentDistribution, RegistryAgent};
+    use crate::installer::cache::{BinaryCacheMetadata, binary_cache_paths};
+    use crate::registry::{AgentDistribution, BinaryDistribution, BinaryTarget, RegistryAgent};
 
     fn cached_agent(
         agent_id: &str,
@@ -294,6 +406,16 @@ mod tests {
         let cache_root = temp_dir.path().join("cache").join("acp-agent");
         let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
         fs::create_dir_all(&paths.cache_dir).await.unwrap();
+        let metadata = BinaryCacheMetadata::new(
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            "https://example.com/demo.tar.gz",
+            "./demo",
+        );
+        fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())
+            .await
+            .unwrap();
 
         let outcome = uninstall_from("demo", Err(anyhow!("offline")), &cache_root)
             .await
@@ -384,6 +506,160 @@ mod tests {
         assert_eq!(bare_package_name("acp-demo@2.0.0"), "acp-demo");
         assert_eq!(bare_package_name("@acme/demo"), "@acme/demo");
         assert_eq!(bare_package_name("acp-demo"), "acp-demo");
+    }
+
+    #[test]
+    fn extracts_uv_tool_names_from_registry_requirements() {
+        assert_eq!(
+            uv_tool_name("fast-agent-acp==0.9.30").unwrap(),
+            "fast-agent-acp"
+        );
+        assert_eq!(uv_tool_name("minion-code@0.1.44").unwrap(), "minion-code");
+        assert_eq!(uv_tool_name("demo[cli]>=1.2").unwrap(), "demo");
+        assert!(uv_tool_name("==1.2").is_err());
+    }
+
+    #[test]
+    fn detects_exact_packages_in_npm_global_list() {
+        let list = json!({
+            "dependencies": {
+                "@acme/demo": { "version": "1.0.0" },
+                "demo-extra": { "version": "1.0.0" }
+            }
+        });
+
+        assert!(npm_list_contains(&list, "@acme/demo"));
+        assert!(!npm_list_contains(&list, "demo"));
+    }
+
+    #[tokio::test]
+    async fn detects_existing_deno_installation_by_package_metadata() {
+        let temp_dir = tempdir().unwrap();
+        let install_dir = temp_dir.path().join("bin").join(".demo-command");
+        fs::create_dir_all(&install_dir).await.unwrap();
+        fs::write(
+            install_dir.join("package.json"),
+            br#"{"dependencies":{"@acme/demo":"1.2.3"}}"#,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            find_deno_installations(temp_dir.path(), "@acme/demo")
+                .await
+                .unwrap(),
+            vec!["demo-command"]
+        );
+        assert!(
+            find_deno_installations(temp_dir.path(), "@acme/other")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn same_version_update_refreshes_but_preserves_cache_on_failure() {
+        let temp_dir = tempdir().unwrap();
+        let platform = Platform::current().unwrap();
+        let old = binary_cache_paths(temp_dir.path(), "demo", "1.0.0", platform);
+        write_binary_cache(&old, "demo", "1.0.0", platform, "old").await;
+        let unchanged_metadata =
+            BinaryCacheMetadata::new("demo", "1.0.0", platform, "not a valid URL", "./demo");
+        fs::write(
+            &old.metadata_path,
+            serde_json::to_vec(&unchanged_metadata).unwrap(),
+        )
+        .await
+        .unwrap();
+        let registry = binary_registry(
+            "demo",
+            "1.0.0",
+            platform,
+            BinaryTarget {
+                archive: "not a valid URL".to_string(),
+                cmd: "./demo".to_string(),
+                args: None,
+                env: None,
+            },
+        );
+
+        // A cache hit would return success. This error proves that update
+        // attempted a fresh download despite unchanged registry metadata.
+        assert!(
+            update_from("demo", &registry, temp_dir.path())
+                .await
+                .is_err()
+        );
+        assert!(old.cache_dir.exists());
+        assert_eq!(
+            fs::read(old.extracted_dir.join("demo")).await.unwrap(),
+            b"old"
+        );
+        let install_log = fs::read_to_string(temp_dir.path().join("agent-install.log"))
+            .await
+            .unwrap();
+        assert!(install_log.contains("FAILED agent=demo version=1.0.0"));
+    }
+
+    fn binary_registry(
+        agent_id: &str,
+        version: &str,
+        platform: Platform,
+        target: BinaryTarget,
+    ) -> Registry {
+        let mut binary = BinaryDistribution::default();
+        match platform {
+            Platform::DarwinAarch64 => binary.darwin_aarch64 = Some(target),
+            Platform::DarwinX86_64 => binary.darwin_x86_64 = Some(target),
+            Platform::LinuxAarch64 => binary.linux_aarch64 = Some(target),
+            Platform::LinuxX86_64 => binary.linux_x86_64 = Some(target),
+            Platform::WindowsAarch64 => binary.windows_aarch64 = Some(target),
+            Platform::WindowsX86_64 => binary.windows_x86_64 = Some(target),
+        }
+        Registry {
+            version: "1".to_string(),
+            agents: vec![RegistryAgent {
+                id: agent_id.to_string(),
+                name: "Demo".to_string(),
+                version: version.to_string(),
+                description: "Demo agent".to_string(),
+                repository: None,
+                website: None,
+                authors: vec!["ACP".to_string()],
+                license: "MIT".to_string(),
+                icon: None,
+                distribution: AgentDistribution {
+                    binary: Some(binary),
+                    npx: None,
+                    uvx: None,
+                },
+            }],
+            extensions: None,
+        }
+    }
+
+    async fn write_binary_cache(
+        paths: &crate::installer::cache::BinaryCachePaths,
+        agent_id: &str,
+        version: &str,
+        platform: Platform,
+        contents: &str,
+    ) {
+        fs::create_dir_all(&paths.extracted_dir).await.unwrap();
+        fs::write(paths.extracted_dir.join("demo"), contents)
+            .await
+            .unwrap();
+        let metadata = BinaryCacheMetadata::new(
+            agent_id,
+            version,
+            platform,
+            &format!("https://example.com/demo-{version}.tar.gz"),
+            "./demo",
+        );
+        fs::write(&paths.metadata_path, serde_json::to_vec(&metadata).unwrap())
+            .await
+            .unwrap();
     }
 
     #[test]
