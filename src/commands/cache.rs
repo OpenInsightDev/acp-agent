@@ -8,6 +8,7 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::process::Command;
 
+use crate::commands::AgentOutputFormat;
 use crate::commands::install::{InstallMethod, InstallOutcome, install_from_registry, run_command};
 use crate::installer::binary::refresh_binary_target_in;
 use crate::installer::cache::{
@@ -23,21 +24,27 @@ use crate::registry::{Platform, Registry, fetch_registry};
 /// tab-separated table of `id`, `version`, `platform`, and the cache
 /// directory that owns the extracted payload, sorted by id/version/platform.
 pub async fn list_installed<W: Write>(writer: &mut W) -> Result<()> {
+    list_installed_with_format(writer, AgentOutputFormat::Tsv).await
+}
+
+/// Prints locally cached binary distributions using `format`.
+pub async fn list_installed_with_format<W: Write>(
+    writer: &mut W,
+    format: AgentOutputFormat,
+) -> Result<()> {
     let root_dir = cache_root_dir()?;
     let agents = list_cached_agents(&root_dir).await;
-    write_installed_list(&agents, writer).context("failed to write installed agent list")
+    match format {
+        AgentOutputFormat::Tsv => {
+            write_installed_list(&agents, writer).context("failed to write installed agent list")
+        }
+        AgentOutputFormat::Json => write_installed_list_json(&agents, writer)
+            .context("failed to write installed agent list as JSON"),
+    }
 }
 
 fn write_installed_list<W: Write>(agents: &[CachedAgent], writer: &mut W) -> std::io::Result<()> {
-    let mut agents = agents.to_vec();
-    agents.sort_by(|left, right| {
-        left.agent_id
-            .cmp(&right.agent_id)
-            .then_with(|| left.agent_version.cmp(&right.agent_version))
-            .then_with(|| left.platform.cmp(&right.platform))
-    });
-
-    for agent in agents {
+    for agent in sorted_cached_agents(agents) {
         writeln!(
             writer,
             "{}\t{}\t{}\t{}",
@@ -49,6 +56,25 @@ fn write_installed_list<W: Write>(agents: &[CachedAgent], writer: &mut W) -> std
     }
 
     Ok(())
+}
+
+fn write_installed_list_json<W: Write>(agents: &[CachedAgent], writer: &mut W) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *writer, &sorted_cached_agents(agents))
+        .context("failed to serialize installed agent list")?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn sorted_cached_agents(agents: &[CachedAgent]) -> Vec<&CachedAgent> {
+    let mut agents = agents.iter().collect::<Vec<_>>();
+    agents.sort_by(|left, right| {
+        left.agent_id
+            .cmp(&right.agent_id)
+            .then_with(|| left.agent_version.cmp(&right.agent_version))
+            .then_with(|| left.platform.cmp(&right.platform))
+    });
+
+    agents
 }
 
 /// Uninstalls an agent by removing its cached binaries and, for package-manager
@@ -398,6 +424,36 @@ mod tests {
         assert!(lines[0].starts_with("alpha\t1.0.0\tdarwin-aarch64\t"));
         assert!(lines[1].starts_with("alpha\t1.0.0\tlinux-x86_64\t"));
         assert!(lines[2].starts_with("zebra\t0.1.0\tlinux-x86_64\t"));
+    }
+
+    #[test]
+    fn writes_installed_agents_as_sorted_json_records() {
+        let temp_dir = tempdir().unwrap();
+        let agents = vec![
+            cached_agent(
+                "zebra",
+                "0.1.0",
+                "linux-x86_64",
+                &temp_dir.path().join("zebra"),
+            ),
+            cached_agent(
+                "alpha",
+                "1.0.0",
+                "darwin-aarch64",
+                &temp_dir.path().join("alpha"),
+            ),
+        ];
+        let mut output = Vec::new();
+
+        write_installed_list_json(&agents, &mut output).unwrap();
+
+        let value: Value = serde_json::from_slice(&output).unwrap();
+        let records = value.as_array().unwrap();
+        assert_eq!(records[0]["id"], "alpha");
+        assert_eq!(records[0]["version"], "1.0.0");
+        assert_eq!(records[1]["id"], "zebra");
+        assert!(records[0]["cache_dir"].is_string());
+        assert!(records[0]["executable_path"].is_string());
     }
 
     #[tokio::test]
