@@ -43,8 +43,11 @@ enum Commands {
     /// List every published agent.
     List {
         /// List agents cached locally instead of the published registry.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         installed: bool,
+        /// Emit the full agent records as a pretty-printed JSON array.
+        #[arg(long, conflicts_with = "installed")]
+        json: bool,
     },
     /// Install an agent from its preferred registry distribution.
     Install { agent_id: String },
@@ -104,7 +107,12 @@ enum Commands {
         args: Vec<String>,
     },
     /// Search agents by ID, name, or description.
-    Search { query: String },
+    Search {
+        query: String,
+        /// Emit the full matching agent records as a pretty-printed JSON array.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Process outcome returned by a CLI command.
@@ -135,13 +143,13 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 })?;
             Ok(exit_from_status(status))
         }
-        Commands::List { installed } => {
+        Commands::List { installed, json } => {
             if installed {
                 cache::list_installed(writer)
                     .await
                     .context("failed to list installed agents")?;
             } else {
-                list::list_agents(writer)
+                list::list_agents(writer, json)
                     .await
                     .context("failed to list registry agents")?;
             }
@@ -214,8 +222,8 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             .with_context(|| format!("failed to serve agent \"{agent_id}\""))
             .map(|()| CliExit::Success)
         }
-        Commands::Search { query } => {
-            search::search_agents(&query, writer)
+        Commands::Search { query, json } => {
+            search::search_agents(&query, writer, json)
                 .await
                 .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
             Ok(CliExit::Success)
@@ -336,6 +344,21 @@ mod tests {
             message.contains("--"),
             "expected clap to hint at the `--` separator, got: {message}"
         );
+    }
+
+    #[test]
+    fn parses_list_subcommand_with_json_flag() {
+        let cli = Cli::try_parse_from(["acp-agent", "list", "--json"]).unwrap();
+        assert!(matches!(cli.command, Commands::List { json: true }));
+    }
+
+    #[test]
+    fn parses_search_subcommand_with_json_flag() {
+        let cli = Cli::try_parse_from(["acp-agent", "search", "helper", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Search { query, json: true } if query == "helper"
+        ));
     }
 
     #[test]

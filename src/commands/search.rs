@@ -2,15 +2,21 @@ use std::io::{self, Write};
 
 use anyhow::{Context, Result};
 
-use crate::registry::{Registry, fetch_registry};
+use crate::registry::{Registry, RegistryAgent, fetch_registry};
 
 /// Prints registry agents whose name/id/description fuzzily match `query`.
 ///
-/// This mirrors the CLI `search` subcommand that writes the same `name`, `id`,
-/// `description` columns as `list`, but only for the matching subset.
-pub async fn search_agents<W: Write>(query: &str, writer: &mut W) -> Result<()> {
+/// Defaults to the same `name`, `id`, `description` columns as `list`, but
+/// only for the matching subset. With `json` set, the full matching agent
+/// records are serialized as a pretty-printed JSON array instead.
+pub async fn search_agents<W: Write>(query: &str, writer: &mut W, json: bool) -> Result<()> {
     let registry = fetch_registry().await?;
-    write_search_results(&registry, query, writer).context("failed to write search results")
+    if json {
+        write_search_results_json(&registry, query, writer)
+            .context("failed to write search results as JSON")
+    } else {
+        write_search_results(&registry, query, writer).context("failed to write search results")
+    }
 }
 
 fn write_search_results<W: Write>(
@@ -18,15 +24,7 @@ fn write_search_results<W: Write>(
     query: &str,
     writer: &mut W,
 ) -> io::Result<()> {
-    let mut agents = registry.search_agents(query);
-    agents.sort_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.id.cmp(&right.id))
-    });
-
-    for agent in agents {
+    for agent in sorted_matches(registry, query) {
         writeln!(
             writer,
             "{}\t{}\t{}",
@@ -35,6 +33,28 @@ fn write_search_results<W: Write>(
     }
 
     Ok(())
+}
+
+fn write_search_results_json<W: Write>(
+    registry: &Registry,
+    query: &str,
+    writer: &mut W,
+) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *writer, &sorted_matches(registry, query))
+        .context("failed to serialize search results")?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+fn sorted_matches<'a>(registry: &'a Registry, query: &str) -> Vec<&'a RegistryAgent> {
+    let mut agents = registry.search_agents(query);
+    agents.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    agents
 }
 #[cfg(test)]
 mod tests {
@@ -109,5 +129,42 @@ mod tests {
         write_search_results(&registry, "missing", &mut output).unwrap();
 
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn writes_full_matching_records_as_json() {
+        let registry = Registry::from_value(json!({
+            "version": "1",
+            "agents": [
+                {
+                    "id": "alpha-agent",
+                    "name": "Alpha",
+                    "version": "1.0.0",
+                    "description": "General purpose agent",
+                    "authors": ["Example"],
+                    "license": "MIT",
+                    "distribution": { "npx": { "package": "@acme/alpha" } }
+                },
+                {
+                    "id": "beta-helper",
+                    "name": "Beta Helper",
+                    "version": "1.0.0",
+                    "description": "Useful assistant",
+                    "authors": ["Example"],
+                    "license": "MIT",
+                    "distribution": { "npx": { "package": "@acme/beta" } }
+                }
+            ]
+        }))
+        .unwrap();
+
+        let mut output = Vec::new();
+        write_search_results_json(&registry, "helper", &mut output).unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let agents = value.as_array().expect("output should be a JSON array");
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["id"], "beta-helper");
+        assert_eq!(agents[0]["license"], "MIT");
     }
 }
