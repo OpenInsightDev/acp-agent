@@ -142,14 +142,17 @@ jobs:
           done
       - name: Generate npm packages
         run: cargo npm generate --clean
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24 # npm trusted publishing requires Node >= 22.14
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false # never cache in release builds
+      # Trusted publishing (OIDC): no NPM_TOKEN needed. npm CLI 11.5.1+
+      # detects the Actions OIDC environment (id-token: write above) and
+      # exchanges it for a short-lived publish token automatically; the
+      # trusted publisher is configured per package on npmjs.com.
       - name: Publish to npm
         run: cargo npm publish -- --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Smoke test CDN URLs
         run: |
           set -eux
