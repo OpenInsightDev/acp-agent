@@ -1,5 +1,7 @@
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
@@ -20,6 +22,93 @@ pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome> {
     let agent = registry.get_agent(agent_id)?;
 
     install_from_registry(&registry, agent).await
+}
+
+/// Maximum number of simultaneous agent operations (install/update/uninstall).
+const INSTALL_CONCURRENCY: usize = 4;
+
+/// Runs a fallible async operation concurrently over the given agent IDs.
+///
+/// Each operation is spawned onto its own tokio task so subprocess launches
+/// (`npm`/`uv`/`deno`) actually execute in parallel, while a shared semaphore
+/// caps how many can run at once. Returns one `(id, result)` pair per input ID
+/// in the order the IDs were requested.
+pub(crate) async fn run_concurrently<T, F, Fut>(
+    agent_ids: &[String],
+    operation: F,
+) -> Vec<(String, Result<T>)>
+where
+    T: Send + 'static,
+    F: Fn(String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<T>> + Send + 'static,
+{
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(INSTALL_CONCURRENCY));
+    let operation = Arc::new(operation);
+    let mut set = tokio::task::JoinSet::new();
+
+    // Drop duplicate IDs so the same agent cache/package is never operated on
+    // concurrently (which would race on shared cache promotion and removal).
+    // First-occurrence order is preserved.
+    let mut seen = std::collections::HashSet::with_capacity(agent_ids.len());
+    let ids = agent_ids
+        .iter()
+        .filter(|id| seen.insert((*id).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for id in &ids {
+        let semaphore = Arc::clone(&semaphore);
+        let operation = Arc::clone(&operation);
+        let id = id.clone();
+        set.spawn(async move {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .expect("concurrency semaphore must stay open");
+            let task_id = id.clone();
+            // Run the operation on a nested task so a panic inside a single
+            // agent's operation is surfaced as a `JoinError` instead of
+            // unwinding through (and aborting) the rest of the concurrent
+            // install/update/uninstall batch.
+            let handle = tokio::spawn(async move {
+                let result = operation(task_id.clone()).await;
+                (task_id, result)
+            });
+            match handle.await {
+                Ok(completed) => completed,
+                Err(join_error) => {
+                    let message = format!("operation for agent \"{id}\" panicked: {join_error}");
+                    (id, Err(anyhow!(message)))
+                }
+            }
+        });
+    }
+
+    let mut completed = std::collections::HashMap::with_capacity(ids.len());
+    while let Some(joined) = set.join_next().await {
+        let (id, result) = joined.expect("outer concurrent task panicked");
+        completed.insert(id, result);
+    }
+
+    // Re-emit results in the order the IDs were requested so the printed
+    // output is stable even though the work completed in parallel.
+    ids.into_iter()
+        .map(|id| {
+            let result = completed
+                .remove(&id)
+                .expect("every spawned task produced a result");
+            (id, result)
+        })
+        .collect()
+}
+
+/// Installs several agents concurrently, returning one result per requested ID.
+///
+/// The returned vector is in the same order as `agent_ids`; each entry pairs
+/// the original ID with its own result so callers can report per-agent success
+/// or failure independently.
+pub async fn install_agents(agent_ids: &[String]) -> Vec<(String, Result<InstallOutcome>)> {
+    run_concurrently(agent_ids, |id| async move { install_agent(&id).await }).await
 }
 
 /// Core installer that inspects each distribution in priority order.
@@ -239,6 +328,58 @@ mod tests {
                 uvx: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn run_concurrently_turns_panicking_operation_into_error() {
+        let ids = vec!["panics".to_string(), "ok".to_string()];
+        let results = run_concurrently(&ids, |id| async move {
+            if id == "panics" {
+                panic!("boom");
+            }
+            Ok::<_, anyhow::Error>(format!("done {id}"))
+        })
+        .await;
+
+        assert_eq!(results.len(), 2);
+        let panicked = results.iter().find(|(id, _)| id == "panics").unwrap();
+        assert!(
+            panicked.1.is_err(),
+            "a panicking operation should surface as an Err, not unwind"
+        );
+        let error_message = panicked.1.as_ref().unwrap_err().to_string();
+        assert!(error_message.contains("panics"));
+        assert!(error_message.contains("boom"));
+        let ok = results.iter().find(|(id, _)| id == "ok").unwrap();
+        assert!(ok.1.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_concurrently_deduplicates_agent_ids() {
+        let ids = vec!["a".to_string(), "b".to_string(), "a".to_string()];
+        let results = run_concurrently(&ids, |id| async move {
+            Ok::<_, anyhow::Error>(format!("ran {id}"))
+        })
+        .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.iter().filter(|(id, _)| id == "a").count(), 1);
+        assert_eq!(results.iter().filter(|(id, _)| id == "b").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_concurrently_preserves_requested_order() {
+        let ids = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        let results = run_concurrently(&ids, |id| async move {
+            Ok::<_, anyhow::Error>(format!("ran {id}"))
+        })
+        .await;
+
+        let returned: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            returned, ids,
+            "results should follow the requested ID order"
+        );
     }
 
     #[tokio::test]

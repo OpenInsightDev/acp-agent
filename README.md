@@ -23,6 +23,8 @@ acp-agent list
 acp-agent search codex
 acp-agent install-env --yes
 acp-agent install codex-acp
+# install several agents concurrently
+acp-agent install codex-acp claude dev
 ```
 
 `install-env` installs Deno or uv when a compatible JavaScript or Python toolchain is unavailable.
@@ -119,6 +121,15 @@ Remove an agent from the local cache, and uninstall its globally installed npm/u
 ```sh
 acp-agent uninstall codex-acp
 ```
+
+Multiple agents (install, update, and uninstall) are handled concurrently, e.g.:
+
+```sh
+acp-agent update codex-acp claude dev
+```
+
+The multi-agent commands are all-or-nothing: the command exits non-zero if any
+requested agent fails, and only reports `Success` when every agent succeeded.
 
 Refresh an agent to the registry's latest release.
 Stale cached versions are discarded before the preferred distribution is (re)installed:

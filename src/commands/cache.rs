@@ -9,7 +9,9 @@ use tokio::fs;
 use tokio::process::Command;
 
 use crate::commands::AgentOutputFormat;
-use crate::commands::install::{InstallMethod, InstallOutcome, install_from_registry, run_command};
+use crate::commands::install::{
+    InstallMethod, InstallOutcome, install_from_registry, run_command, run_concurrently,
+};
 use crate::installer::binary::refresh_binary_target_in;
 use crate::installer::cache::{
     CachedAgent, cache_root_dir, list_cached_agents, remove_cached_agent,
@@ -83,6 +85,11 @@ pub async fn uninstall_agent(agent_id: &str) -> Result<UninstallOutcome> {
     let registry = fetch_registry().await;
     let root_dir = cache_root_dir()?;
     uninstall_from(agent_id, registry, &root_dir).await
+}
+
+/// Uninstalls several agents concurrently, returning one result per ID.
+pub async fn uninstall_agents(agent_ids: &[String]) -> Vec<(String, Result<UninstallOutcome>)> {
+    run_concurrently(agent_ids, |id| async move { uninstall_agent(&id).await }).await
 }
 
 async fn uninstall_from(
@@ -302,6 +309,11 @@ pub async fn update_agent(agent_id: &str) -> Result<InstallOutcome> {
     let registry = fetch_registry().await?;
     let root_dir = cache_root_dir()?;
     update_from(agent_id, &registry, &root_dir).await
+}
+
+/// Updates several agents concurrently, returning one result per ID.
+pub async fn update_agents(agent_ids: &[String]) -> Vec<(String, Result<InstallOutcome>)> {
+    run_concurrently(agent_ids, |id| async move { update_agent(&id).await }).await
 }
 
 async fn update_from(
