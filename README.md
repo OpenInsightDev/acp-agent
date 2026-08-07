@@ -122,6 +122,12 @@ Remove an agent from the local cache, and uninstall its globally installed npm/u
 acp-agent uninstall codex-acp
 ```
 
+Multiple agents (install, update, and uninstall) are handled concurrently, e.g.:
+
+```sh
+acp-agent update codex-acp claude dev
+```
+
 Refresh an agent to the registry's latest release.
 Stale cached versions are discarded before the preferred distribution is (re)installed:
 

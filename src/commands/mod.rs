@@ -66,10 +66,18 @@ enum Commands {
         #[arg(value_name = "AGENT_ID", required = true)]
         agent_id: Vec<String>,
     },
-    /// Remove an installed agent from the local cache and/or package managers.
-    Uninstall { agent_id: String },
-    /// Update an installed agent to the registry's latest distribution.
-    Update { agent_id: String },
+    /// Remove one or more installed agents from the local cache and/or package managers.
+    Uninstall {
+        /// IDs of the agents to uninstall.
+        #[arg(value_name = "AGENT_ID", required = true)]
+        agent_id: Vec<String>,
+    },
+    /// Update one or more installed agents to the registry's latest distribution.
+    Update {
+        /// IDs of the agents to update.
+        #[arg(value_name = "AGENT_ID", required = true)]
+        agent_id: Vec<String>,
+    },
     /// Install Deno or uv when no compatible local toolchain exists.
     InstallEnv {
         /// Skip the confirmation prompt.
@@ -189,21 +197,51 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                     }
                 }
             }
-            Ok(if failed { CliExit::Code(1) } else { CliExit::Success })
+            Ok(if failed {
+                CliExit::Code(1)
+            } else {
+                CliExit::Success
+            })
         }
         Commands::Uninstall { agent_id } => {
-            let outcome = cache::uninstall_agent(&agent_id)
-                .await
-                .with_context(|| format!("failed to uninstall agent \"{agent_id}\""))?;
-            writeln!(writer, "{outcome}")?;
-            Ok(CliExit::Success)
+            let outcomes = cache::uninstall_agents(&agent_id).await;
+            let mut failed = false;
+            for (id, outcome) in &outcomes {
+                match outcome {
+                    Ok(outcome) => {
+                        writeln!(writer, "{outcome}")?;
+                    }
+                    Err(error) => {
+                        failed = true;
+                        writeln!(writer, "failed to uninstall agent \"{id}\": {error:#}")?;
+                    }
+                }
+            }
+            Ok(if failed {
+                CliExit::Code(1)
+            } else {
+                CliExit::Success
+            })
         }
         Commands::Update { agent_id } => {
-            let outcome = cache::update_agent(&agent_id)
-                .await
-                .with_context(|| format!("failed to update agent \"{agent_id}\""))?;
-            writeln!(writer, "{outcome}")?;
-            Ok(CliExit::Success)
+            let outcomes = cache::update_agents(&agent_id).await;
+            let mut failed = false;
+            for (id, outcome) in &outcomes {
+                match outcome {
+                    Ok(outcome) => {
+                        writeln!(writer, "{outcome}")?;
+                    }
+                    Err(error) => {
+                        failed = true;
+                        writeln!(writer, "failed to update agent \"{id}\": {error:#}")?;
+                    }
+                }
+            }
+            Ok(if failed {
+                CliExit::Code(1)
+            } else {
+                CliExit::Success
+            })
         }
         Commands::InstallEnv { yes } => {
             crate::installer::environment::install_env(writer, yes)
@@ -337,8 +375,7 @@ mod tests {
         ));
 
         let multiple =
-            Cli::try_parse_from(["acp-agent", "install", "codex-acp", "claude", "dev"])
-                .unwrap();
+            Cli::try_parse_from(["acp-agent", "install", "codex-acp", "claude", "dev"]).unwrap();
         assert!(matches!(
             multiple.command,
             Commands::Install { agent_id } if agent_id == ["codex-acp", "claude", "dev"]
@@ -355,21 +392,48 @@ mod tests {
     }
 
     #[test]
-    fn parses_uninstall_subcommand() {
-        let cli = Cli::try_parse_from(["acp-agent", "uninstall", "codex-acp"]).unwrap();
+    fn parses_uninstall_subcommand_with_single_and_multiple_agents() {
+        let single = Cli::try_parse_from(["acp-agent", "uninstall", "codex-acp"]).unwrap();
         assert!(matches!(
-            cli.command,
-            Commands::Uninstall { agent_id } if agent_id == "codex-acp"
+            single.command,
+            Commands::Uninstall { agent_id } if agent_id == ["codex-acp"]
+        ));
+
+        let multiple = Cli::try_parse_from(["acp-agent", "uninstall", "codex-acp", "dev"]).unwrap();
+        assert!(matches!(
+            multiple.command,
+            Commands::Uninstall { agent_id } if agent_id == ["codex-acp", "dev"]
         ));
     }
 
     #[test]
-    fn parses_update_subcommand() {
-        let cli = Cli::try_parse_from(["acp-agent", "update", "codex-acp"]).unwrap();
+    fn parses_update_subcommand_with_single_and_multiple_agents() {
+        let single = Cli::try_parse_from(["acp-agent", "update", "codex-acp"]).unwrap();
         assert!(matches!(
-            cli.command,
-            Commands::Update { agent_id } if agent_id == "codex-acp"
+            single.command,
+            Commands::Update { agent_id } if agent_id == ["codex-acp"]
         ));
+
+        let multiple = Cli::try_parse_from(["acp-agent", "update", "codex-acp", "dev"]).unwrap();
+        assert!(matches!(
+            multiple.command,
+            Commands::Update { agent_id } if agent_id == ["codex-acp", "dev"]
+        ));
+    }
+
+    #[test]
+    fn uninstall_and_update_require_at_least_one_agent() {
+        let error = Cli::try_parse_from(["acp-agent", "uninstall"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let error = Cli::try_parse_from(["acp-agent", "update"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]
