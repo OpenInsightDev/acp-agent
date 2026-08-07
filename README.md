@@ -128,6 +128,9 @@ Multiple agents (install, update, and uninstall) are handled concurrently, e.g.:
 acp-agent update codex-acp claude dev
 ```
 
+The multi-agent commands are all-or-nothing: the command exits non-zero if any
+requested agent fails, and only reports `Success` when every agent succeeded.
+
 Refresh an agent to the registry's latest release.
 Stale cached versions are discarded before the preferred distribution is (re)installed:
 

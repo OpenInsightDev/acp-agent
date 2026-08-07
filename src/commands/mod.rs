@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -147,6 +148,39 @@ pub enum CliExit {
     Code(i32),
 }
 
+/// Reports the outcome of a multi-agent operation with all-or-nothing
+/// semantics, matching the convention of npm and other package managers.
+///
+/// Success is only reported (and `CliExit::Success` returned) when every
+/// requested agent succeeded. If any agent failed, the failures are printed
+/// and a non-zero exit is returned; the command never reports overall success
+/// when part of the batch failed.
+fn report_batch_outcome<W, T>(
+    writer: &mut W,
+    outcomes: &[(String, anyhow::Result<T>)],
+    action: &str,
+) -> anyhow::Result<CliExit>
+where
+    W: Write,
+    T: Display,
+{
+    if outcomes.iter().all(|(_, result)| result.is_ok()) {
+        for (_, result) in outcomes {
+            if let Ok(outcome) = result {
+                writeln!(writer, "{outcome}")?;
+            }
+        }
+        return Ok(CliExit::Success);
+    }
+
+    for (id, result) in outcomes {
+        if let Err(error) = result {
+            writeln!(writer, "failed to {action} agent \"{id}\": {error:#}")?;
+        }
+    }
+    Ok(CliExit::Code(1))
+}
+
 /// Dispatches a parsed CLI command.
 pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<CliExit> {
     match cli.command {
@@ -185,63 +219,15 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
         }
         Commands::Install { agent_id } => {
             let outcomes = install::install_agents(&agent_id).await;
-            let mut failed = false;
-            for (id, outcome) in &outcomes {
-                match outcome {
-                    Ok(outcome) => {
-                        writeln!(writer, "{outcome}")?;
-                    }
-                    Err(error) => {
-                        failed = true;
-                        writeln!(writer, "failed to install agent \"{id}\": {error:#}")?;
-                    }
-                }
-            }
-            Ok(if failed {
-                CliExit::Code(1)
-            } else {
-                CliExit::Success
-            })
+            report_batch_outcome(writer, &outcomes, "install")
         }
         Commands::Uninstall { agent_id } => {
             let outcomes = cache::uninstall_agents(&agent_id).await;
-            let mut failed = false;
-            for (id, outcome) in &outcomes {
-                match outcome {
-                    Ok(outcome) => {
-                        writeln!(writer, "{outcome}")?;
-                    }
-                    Err(error) => {
-                        failed = true;
-                        writeln!(writer, "failed to uninstall agent \"{id}\": {error:#}")?;
-                    }
-                }
-            }
-            Ok(if failed {
-                CliExit::Code(1)
-            } else {
-                CliExit::Success
-            })
+            report_batch_outcome(writer, &outcomes, "uninstall")
         }
         Commands::Update { agent_id } => {
             let outcomes = cache::update_agents(&agent_id).await;
-            let mut failed = false;
-            for (id, outcome) in &outcomes {
-                match outcome {
-                    Ok(outcome) => {
-                        writeln!(writer, "{outcome}")?;
-                    }
-                    Err(error) => {
-                        failed = true;
-                        writeln!(writer, "failed to update agent \"{id}\": {error:#}")?;
-                    }
-                }
-            }
-            Ok(if failed {
-                CliExit::Code(1)
-            } else {
-                CliExit::Success
-            })
+            report_batch_outcome(writer, &outcomes, "update")
         }
         Commands::InstallEnv { yes } => {
             crate::installer::environment::install_env(writer, yes)
@@ -344,6 +330,56 @@ fn signal_exit_code(_: ExitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_outcome_is_all_or_nothing_success() {
+        let mut output = Vec::new();
+        let outcomes = vec![
+            (
+                "a".to_string(),
+                Ok::<_, anyhow::Error>("installed a".to_string()),
+            ),
+            (
+                "b".to_string(),
+                Ok::<_, anyhow::Error>("installed b".to_string()),
+            ),
+        ];
+
+        let exit = report_batch_outcome(&mut output, &outcomes, "install").unwrap();
+
+        assert!(matches!(exit, CliExit::Success));
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "installed a\ninstalled b\n"
+        );
+    }
+
+    #[test]
+    fn batch_outcome_fails_when_any_agent_fails() {
+        let mut output = Vec::new();
+        let outcomes = vec![
+            (
+                "a".to_string(),
+                Ok::<_, anyhow::Error>("installed a".to_string()),
+            ),
+            ("b".to_string(), Err::<String, _>(anyhow::anyhow!("boom"))),
+        ];
+
+        let exit = report_batch_outcome(&mut output, &outcomes, "install").unwrap();
+
+        assert!(matches!(exit, CliExit::Code(1)));
+        // Success lines are not printed when the batch failed.
+        assert!(
+            !String::from_utf8(output.clone())
+                .unwrap()
+                .contains("installed a")
+        );
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("failed to install agent \"b\": boom")
+        );
+    }
 
     #[test]
     fn parses_list_subcommand_with_installed_flag() {
