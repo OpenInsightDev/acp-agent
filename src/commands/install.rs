@@ -46,7 +46,17 @@ where
     let operation = Arc::new(operation);
     let mut set = tokio::task::JoinSet::new();
 
-    for id in agent_ids {
+    // Drop duplicate IDs so the same agent cache/package is never operated on
+    // concurrently (which would race on shared cache promotion and removal).
+    // First-occurrence order is preserved.
+    let mut seen = std::collections::HashSet::with_capacity(agent_ids.len());
+    let ids = agent_ids
+        .iter()
+        .filter(|id| seen.insert((*id).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for id in &ids {
         let semaphore = Arc::clone(&semaphore);
         let operation = Arc::clone(&operation);
         let id = id.clone();
@@ -74,7 +84,7 @@ where
         });
     }
 
-    let mut results = Vec::with_capacity(agent_ids.len());
+    let mut results = Vec::with_capacity(ids.len());
     while let Some(joined) = set.join_next().await {
         results.push(joined.expect("outer concurrent task panicked"));
     }
@@ -331,6 +341,19 @@ mod tests {
         assert!(error_message.contains("boom"));
         let ok = results.iter().find(|(id, _)| id == "ok").unwrap();
         assert!(ok.1.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_concurrently_deduplicates_agent_ids() {
+        let ids = vec!["a".to_string(), "b".to_string(), "a".to_string()];
+        let results = run_concurrently(&ids, |id| async move {
+            Ok::<_, anyhow::Error>(format!("ran {id}"))
+        })
+        .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results.iter().filter(|(id, _)| id == "a").count(), 1);
+        assert_eq!(results.iter().filter(|(id, _)| id == "b").count(), 1);
     }
 
     #[tokio::test]
