@@ -55,13 +55,28 @@ where
                 .acquire()
                 .await
                 .expect("concurrency semaphore must stay open");
-            (id.clone(), operation(id).await)
+            let task_id = id.clone();
+            // Run the operation on a nested task so a panic inside a single
+            // agent's operation is surfaced as a `JoinError` instead of
+            // unwinding through (and aborting) the rest of the concurrent
+            // install/update/uninstall batch.
+            let handle = tokio::spawn(async move {
+                let result = operation(task_id.clone()).await;
+                (task_id, result)
+            });
+            match handle.await {
+                Ok(completed) => completed,
+                Err(join_error) => {
+                    let message = format!("operation for agent \"{id}\" panicked: {join_error}");
+                    (id, Err(anyhow!(message)))
+                }
+            }
         });
     }
 
     let mut results = Vec::with_capacity(agent_ids.len());
     while let Some(joined) = set.join_next().await {
-        results.push(joined.expect("concurrent task panicked"));
+        results.push(joined.expect("outer concurrent task panicked"));
     }
     results
 }
@@ -292,6 +307,30 @@ mod tests {
                 uvx: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn run_concurrently_turns_panicking_operation_into_error() {
+        let ids = vec!["panics".to_string(), "ok".to_string()];
+        let results = run_concurrently(&ids, |id| async move {
+            if id == "panics" {
+                panic!("boom");
+            }
+            Ok::<_, anyhow::Error>(format!("done {id}"))
+        })
+        .await;
+
+        assert_eq!(results.len(), 2);
+        let panicked = results.iter().find(|(id, _)| id == "panics").unwrap();
+        assert!(
+            panicked.1.is_err(),
+            "a panicking operation should surface as an Err, not unwind"
+        );
+        let error_message = panicked.1.as_ref().unwrap_err().to_string();
+        assert!(error_message.contains("panics"));
+        assert!(error_message.contains("boom"));
+        let ok = results.iter().find(|(id, _)| id == "ok").unwrap();
+        assert!(ok.1.is_ok());
     }
 
     #[tokio::test]
