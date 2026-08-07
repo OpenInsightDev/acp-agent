@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -28,6 +29,14 @@ const INSTALL_LOG_FILE_NAME: &str = "agent-install.log";
 const INSTALL_LOG_MAX_BYTES: u64 = 1024 * 1024;
 /// When the cap is hit, the log is rewritten to keep only this tail.
 const INSTALL_LOG_TAIL_BYTES: u64 = 256 * 1024;
+
+/// Serializes appends to the shared install log.
+///
+/// Concurrent installs (multiple agents at once) write to one log file, and
+/// the truncation path rewrites the whole file. Without a lock, two racing
+/// appends could interleave or silently drop lines, so every append (and its
+/// potential truncate-and-rewrite) runs under this mutex.
+static INSTALL_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// A validated binary distribution stored in the local cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +283,9 @@ fn append_install_log(path: &Path, line: &str) {
 
 fn append_install_log_inner(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
+
+    let lock = INSTALL_LOG_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -932,6 +944,41 @@ mod tests {
         append_install_log_inner(&path, "second\n").unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn install_log_appends_concurrently_without_losing_lines() {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().join("agent-install.log");
+        let thread_count = 16;
+        let lines_per_thread = 50;
+
+        let mut threads = Vec::new();
+        for t in 0..thread_count {
+            let path = path.clone();
+            threads.push(std::thread::spawn(move || {
+                for i in 0..lines_per_thread {
+                    append_install_log_inner(&path, &format!("thread-{t}-line-{i}\n")).unwrap();
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines().map(String::from).collect::<Vec<_>>();
+        lines.sort_unstable();
+        assert_eq!(lines.len(), thread_count * lines_per_thread);
+
+        let mut expected = Vec::with_capacity(thread_count * lines_per_thread);
+        for t in 0..thread_count {
+            for i in 0..lines_per_thread {
+                expected.push(format!("thread-{t}-line-{i}"));
+            }
+        }
+        expected.sort_unstable();
+        assert_eq!(lines, expected);
     }
 
     #[test]
