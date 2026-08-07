@@ -32,7 +32,7 @@ const INSTALL_CONCURRENCY: usize = 4;
 /// Each operation is spawned onto its own tokio task so subprocess launches
 /// (`npm`/`uv`/`deno`) actually execute in parallel, while a shared semaphore
 /// caps how many can run at once. Returns one `(id, result)` pair per input ID
-/// in completion order.
+/// in the order the IDs were requested.
 pub(crate) async fn run_concurrently<T, F, Fut>(
     agent_ids: &[String],
     operation: F,
@@ -84,18 +84,29 @@ where
         });
     }
 
-    let mut results = Vec::with_capacity(ids.len());
+    let mut completed = std::collections::HashMap::with_capacity(ids.len());
     while let Some(joined) = set.join_next().await {
-        results.push(joined.expect("outer concurrent task panicked"));
+        let (id, result) = joined.expect("outer concurrent task panicked");
+        completed.insert(id, result);
     }
-    results
+
+    // Re-emit results in the order the IDs were requested so the printed
+    // output is stable even though the work completed in parallel.
+    ids.into_iter()
+        .map(|id| {
+            let result = completed
+                .remove(&id)
+                .expect("every spawned task produced a result");
+            (id, result)
+        })
+        .collect()
 }
 
 /// Installs several agents concurrently, returning one result per requested ID.
 ///
-/// Order of the returned vector is unspecified because installations run in
-/// parallel; each entry pairs the original ID with its own result so callers
-/// can report per-agent success or failure independently.
+/// The returned vector is in the same order as `agent_ids`; each entry pairs
+/// the original ID with its own result so callers can report per-agent success
+/// or failure independently.
 pub async fn install_agents(agent_ids: &[String]) -> Vec<(String, Result<InstallOutcome>)> {
     run_concurrently(agent_ids, |id| async move { install_agent(&id).await }).await
 }
@@ -354,6 +365,21 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results.iter().filter(|(id, _)| id == "a").count(), 1);
         assert_eq!(results.iter().filter(|(id, _)| id == "b").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_concurrently_preserves_requested_order() {
+        let ids = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        let results = run_concurrently(&ids, |id| async move {
+            Ok::<_, anyhow::Error>(format!("ran {id}"))
+        })
+        .await;
+
+        let returned: Vec<_> = results.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            returned, ids,
+            "results should follow the requested ID order"
+        );
     }
 
     #[tokio::test]
