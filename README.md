@@ -23,6 +23,8 @@ acp-agent list
 acp-agent search codex
 acp-agent install-env --yes
 acp-agent install codex-acp
+# install several agents concurrently
+acp-agent install codex-acp claude dev
 ```
 
 `install-env` installs Deno or uv when a compatible JavaScript or Python toolchain is unavailable.

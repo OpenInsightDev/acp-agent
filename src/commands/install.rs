@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
@@ -20,6 +21,41 @@ pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome> {
     let agent = registry.get_agent(agent_id)?;
 
     install_from_registry(&registry, agent).await
+}
+
+/// Maximum number of simultaneous agent installations.
+const INSTALL_CONCURRENCY: usize = 4;
+
+/// Installs several agents concurrently, returning one result per requested ID.
+///
+/// Order of the returned vector is unspecified because installations run in
+/// parallel; each entry pairs the original ID with its own result so callers
+/// can report per-agent success or failure independently.
+///
+/// Each installation runs in its own spawned task so subprocess launches
+/// (`npm`/`uv`/`deno`) actually execute in parallel, while a shared semaphore
+/// caps how many can run at once.
+pub async fn install_agents(agent_ids: &[String]) -> Vec<(String, Result<InstallOutcome>)> {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(INSTALL_CONCURRENCY));
+    let mut set = tokio::task::JoinSet::new();
+
+    for id in agent_ids {
+        let semaphore = Arc::clone(&semaphore);
+        let id = id.clone();
+        set.spawn(async move {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .expect("installation semaphore must stay open");
+            (id.clone(), install_agent(&id).await)
+        });
+    }
+
+    let mut results = Vec::with_capacity(agent_ids.len());
+    while let Some(joined) = set.join_next().await {
+        results.push(joined.expect("installation task panicked"));
+    }
+    results
 }
 
 /// Core installer that inspects each distribution in priority order.

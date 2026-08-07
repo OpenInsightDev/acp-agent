@@ -58,8 +58,14 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Install an agent from its preferred registry distribution.
-    Install { agent_id: String },
+    /// Install one or more agents from their preferred registry distributions.
+    ///
+    /// Multiple agent IDs are installed concurrently.
+    Install {
+        /// IDs of the agents to install.
+        #[arg(value_name = "AGENT_ID", required = true)]
+        agent_id: Vec<String>,
+    },
     /// Remove an installed agent from the local cache and/or package managers.
     Uninstall { agent_id: String },
     /// Update an installed agent to the registry's latest distribution.
@@ -170,11 +176,20 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             Ok(CliExit::Success)
         }
         Commands::Install { agent_id } => {
-            let outcome = install::install_agent(&agent_id)
-                .await
-                .with_context(|| format!("failed to install agent \"{agent_id}\""))?;
-            writeln!(writer, "{outcome}")?;
-            Ok(CliExit::Success)
+            let outcomes = install::install_agents(&agent_id).await;
+            let mut failed = false;
+            for (id, outcome) in &outcomes {
+                match outcome {
+                    Ok(outcome) => {
+                        writeln!(writer, "{outcome}")?;
+                    }
+                    Err(error) => {
+                        failed = true;
+                        writeln!(writer, "failed to install agent \"{id}\": {error:#}")?;
+                    }
+                }
+            }
+            Ok(if failed { CliExit::Code(1) } else { CliExit::Success })
         }
         Commands::Uninstall { agent_id } => {
             let outcome = cache::uninstall_agent(&agent_id)
@@ -311,6 +326,32 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_install_subcommand_with_single_and_multiple_agents() {
+        let single = Cli::try_parse_from(["acp-agent", "install", "codex-acp"]).unwrap();
+        assert!(matches!(
+            single.command,
+            Commands::Install { agent_id } if agent_id == ["codex-acp"]
+        ));
+
+        let multiple =
+            Cli::try_parse_from(["acp-agent", "install", "codex-acp", "claude", "dev"])
+                .unwrap();
+        assert!(matches!(
+            multiple.command,
+            Commands::Install { agent_id } if agent_id == ["codex-acp", "claude", "dev"]
+        ));
+    }
+
+    #[test]
+    fn install_requires_at_least_one_agent() {
+        let error = Cli::try_parse_from(["acp-agent", "install"]).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]
