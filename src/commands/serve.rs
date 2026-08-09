@@ -69,7 +69,7 @@ pub async fn serve_agent(agent_id: &str, options: ServeOptions, args: &[String])
 }
 
 async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<()> {
-    let server_options = http_server_options(&options)?;
+    let router = agent_router(config, &options)?;
     let listener = TcpListener::bind((options.host.as_str(), options.port))
         .await
         .with_context(|| {
@@ -92,15 +92,16 @@ async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<(
             options.subpath.as_deref().unwrap_or("")
         );
     }
-    serve_listener(listener, config, options, server_options).await
+    serve_listener(listener, router).await
 }
 
-async fn serve_listener(
-    listener: TcpListener,
-    config: AcpAgentConfig,
-    options: ServeOptions,
-    server_options: ServerOptions,
-) -> Result<()> {
+/// Builds the complete ACP HTTP service for an agent.
+///
+/// This includes the ACP HTTP/SSE/WebSocket routes, CORS policy, health
+/// probes, readiness tracking, and an optional subpath. Named servers reuse
+/// this builder so they expose exactly the same agent service as `serve`.
+pub(crate) fn agent_router(config: AcpAgentConfig, options: &ServeOptions) -> Result<Router> {
+    let server_options = http_server_options(options)?;
     let health = AgentHealth::default();
     // Wrap each agent so its stderr lands in this process's logs and its
     // launch outcome feeds `GET /readyz` (see [`LaunchGuard`] for why the
@@ -133,6 +134,10 @@ async fn serve_listener(
         router = Router::new().nest(subpath, router);
     }
 
+    Ok(router)
+}
+
+async fn serve_listener(listener: TcpListener, router: Router) -> Result<()> {
     axum::serve(listener, router)
         .await
         .context("ACP HTTP server failed")
@@ -478,6 +483,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn agent_router_applies_serve_routing_configuration() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+
+        let options = ServeOptions {
+            subpath: Some("/agent".to_string()),
+            ..ServeOptions::default()
+        };
+        let router = agent_router(AcpAgentConfig::new("unused-agent"), &options).unwrap();
+
+        let health = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let readyz = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readyz.status(), StatusCode::OK);
+
+        let bare_health = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bare_health.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn agent_router_uses_serve_validation() {
+        let options = ServeOptions {
+            path: "acp".to_string(),
+            ..ServeOptions::default()
+        };
+
+        let error = agent_router(AcpAgentConfig::new("unused-agent"), &options)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("ACP endpoint path must start with '/'")
+        );
+    }
+
     #[cfg(unix)]
     mod network {
         use std::net::SocketAddr;
@@ -526,15 +595,13 @@ done"#,
             }
 
             async fn start_with_agent(options: ServeOptions, config: AcpAgentConfig) -> Self {
-                let server_options = http_server_options(&options).unwrap();
                 let listener = TcpListener::bind((options.host.as_str(), options.port))
                     .await
                     .unwrap();
                 let address = listener.local_addr().unwrap();
+                let router = agent_router(config, &options).unwrap();
                 let task = tokio::spawn(async move {
-                    serve_listener(listener, config, options, server_options)
-                        .await
-                        .unwrap();
+                    serve_listener(listener, router).await.unwrap();
                 });
                 Self { address, task }
             }
