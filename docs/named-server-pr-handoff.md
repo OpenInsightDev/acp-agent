@@ -38,7 +38,6 @@ PR #32 目前不应直接合并。
 - 默认注册路由为 `/<agent-id>`。
 - `/api/agents` 支持 POST 和 DELETE。
 - 每个注册路由支持 ACP HTTP/SSE 和 WebSocket。
-- 管理 API 的最低限度本地 token 鉴权。
 - 私有状态目录、状态文件和日志权限。
 - 正确处理 IPv4、IPv6、通配监听地址和端口 `0`。
 - 启动失败或超时时不遗留后台进程和错误状态。
@@ -48,10 +47,10 @@ PR #32 目前不应直接合并。
 以下内容已经拆为后续 issue，不应阻塞当前 PR：
 
 - [#33](https://github.com/OpenInsightDev/acp-agent/issues/33)：`server list/status/registrations/logs` 等运维命令。
-- [#34](https://github.com/OpenInsightDev/acp-agent/issues/34)：面向远程部署的正式认证、token 轮换、TLS 指引和限流。
+- [#34](https://github.com/OpenInsightDev/acp-agent/issues/34)：管理 API 的全部鉴权需求，包括本地控制凭据、远程认证、token 轮换、TLS 指引和限流。
 - [#35](https://github.com/OpenInsightDev/acp-agent/issues/35)：跨进程锁、generation、并发 start 串行化和崩溃恢复。
 
-当前 PR 仍需提供基本安全边界。不能因为 #34 和 #35 已存在，就在本 PR 中保留未鉴权的写 API、宽松文件权限或确定会遗留进程的失败路径。
+当前 PR 明确不实现管理 API 鉴权。它仍需处理与鉴权无关的安全和正确性问题，例如宽松文件权限、任意 target 形成的 open proxy、裸 PID，以及确定会遗留进程的失败路径。
 
 ## 3. 推荐目标架构
 
@@ -69,7 +68,7 @@ route prefix -> agent ACP Router
 
 ```mermaid
 flowchart LR
-    CLI["server register CLI"] -->|"authenticated POST /api/agents"| Server["named Axum server"]
+    CLI["server register CLI"] -->|"POST /api/agents"| Server["named Axum server"]
     Client["ACP client"] -->|"/codex-acp/acp"| Dispatch["dynamic prefix dispatcher"]
     Server --> Dispatch
     Dispatch --> Router["AcpHttpServer Router"]
@@ -157,7 +156,6 @@ struct RegisteredAgent {
 struct ServerState {
     agents: Arc<RwLock<HashMap<String, RegisteredAgent>>>,
     shutdown: ShutdownHandle,
-    control_token: SecretToken,
 }
 ```
 
@@ -238,8 +236,6 @@ WebSocket upgrade 必须直接交给目标 ACP Router。不要读取或重建 ha
 
 - `201 Created`：注册成功。
 - `400 Bad Request`：route、path、CORS 或参数不合法。
-- `401 Unauthorized`：缺少或无法解析认证 header。
-- `403 Forbidden`：token 不匹配。
 - `404 Not Found`：agent ID 不存在于 registry。
 - `409 Conflict`：agent ID 或 route 已注册。
 - `422 Unprocessable Entity`：agent 存在但无法构造 runnable config，可选；也可以统一为 `400`。
@@ -270,7 +266,6 @@ WebSocket upgrade 必须直接交给目标 ACP Router。不要读取或重建 ha
 建议响应：
 
 - `204 No Content`：删除成功。
-- `401/403`：认证失败。
 - `404 Not Found`：agent 未注册。
 
 删除只需从动态 Router 表移除条目。已经开始的连接持有 Router clone，可以选择自然结束；新请求立即返回 `404`。如果产品语义要求 unregister 强制断开现有连接，需要额外的 per-agent cancellation token，但当前需求没有明确要求，建议本 PR 采用“停止新连接，现有连接自然结束”。
@@ -280,9 +275,9 @@ WebSocket upgrade 必须直接交给目标 ACP Router。不要读取或重建 ha
 `server register` 不再启动子进程。它应：
 
 1. 读取命名 server 的私有状态文件。
-2. 验证 server 身份和存活状态。
+2. 检查 server 存活状态。
 3. 根据 CLI 参数构造 POST body。
-4. 携带控制 token 调用 `/api/agents`。
+4. 调用 `/api/agents`。
 5. 将 server 的结构化错误转换为带上下文的 CLI 错误。
 6. 成功后输出公开路由 URL。
 
@@ -290,57 +285,38 @@ WebSocket upgrade 必须直接交给目标 ACP Router。不要读取或重建 ha
 
 ### 5.4 unregister CLI
 
-`server unregister` 应携带相同 token。当前实现没有为 DELETE 添加 token，这是一个直接安全缺陷。
+`server unregister` 调用 `DELETE /api/agents` 并将结构化错误转换为 CLI 错误。鉴权留给 #34。
 
-## 6. 最低限度认证
+## 6. 鉴权明确不在当前 PR
 
-### 6.1 当前 PR 要求
+根据当前范围决定，PR #32 不实现任何管理 API 鉴权要求。
 
-所有管理或控制 endpoint 必须认证：
+以下内容全部由 [#34](https://github.com/OpenInsightDev/acp-agent/issues/34) 跟踪：
 
-- `POST /api/agents`
-- `DELETE /api/agents`
-- `/api/status`
-- `/api/shutdown`
+- 本地 CLI 与 daemon 之间的控制 token。
+- `POST /api/agents` 和 `DELETE /api/agents` 的认证与授权。
+- `/api/status` 和 `/api/shutdown` 的认证与授权。
+- Bearer token 或其他 Authorization scheme。
+- token 生成、保存、轮换、吊销和 constant-time comparison。
+- 非 loopback 部署的凭据分发、TLS、限流和安全指引。
+- `401`、`403` 及认证错误响应契约。
+- 所有认证相关自动化测试。
 
-`/health` 可以保持公开，因为它只表示 HTTP liveness，不泄露注册表或 token。
+因此当前 PR 的 handoff、实现顺序和验收标准都不应再要求 token、Bearer header 或认证测试。当前 API 暂时是未鉴权的管理接口，这是已知限制，而不是 PR #32 的漏项。
 
-建议使用：
-
-```http
-Authorization: Bearer <random-token>
-```
-
-这比项目自定义 `x-acp-agent-token` 更符合常见客户端和代理约定。正式的远程认证仍由 #34 处理；本 PR 中 token 只作为本机 CLI 与 daemon 之间的 capability secret。
-
-token 要求：
-
-- 使用 CSPRNG；当前 `Uuid::new_v4()` 的随机性可以接受，但更直接的随机 token 也可以。
-- 不得出现在命令行参数中。
-- 不得写入日志。
-- 不得包含在普通状态输出或 API 错误中。
-- 必须存放在仅当前用户可读的状态文件中。
-- 比较失败时只返回通用认证错误。
-
-是否必须使用 constant-time comparison 可以留给 #34；本地 capability token 的首要风险是文件权限和未鉴权 endpoint。
-
-### 6.2 非 loopback 监听
-
-本 PR 可以继续允许 `--host 0.0.0.0` 或其他网卡地址，但管理 endpoint 仍必须认证。
-
-建议启动时输出警告：
+默认监听地址应继续保持 `127.0.0.1`，以降低未鉴权接口被意外暴露的概率。用户显式设置 `--host 0.0.0.0` 或其他非 loopback 地址时，当前 PR 可以输出风险警告，但不应在本 PR 中设计或实现凭据机制。例如：
 
 ```text
-warning: server management endpoints are reachable on a non-loopback interface
+warning: unauthenticated server management endpoints are reachable on a non-loopback interface
 ```
 
-不要打印 token。远程客户端如何安全获得凭据属于 #34。
+该警告不构成鉴权，也不替代 #34。
 
 ## 7. 状态与日志权限
 
 ### 7.1 风险
 
-当前状态文件包含 shutdown token，普通 `tokio::fs::write` 在 Unix 上通常受 umask 影响，可能产生 `0644` 文件。后台日志也可能包含 agent stderr、路径或凭据信息。
+普通 `tokio::fs::write` 在 Unix 上通常受 umask 影响，可能产生 `0644` 状态文件。后台日志可能包含 agent stderr、工作目录、可执行路径或环境诊断信息，因此即使鉴权需求已移至 #34，状态与日志仍应保持当前用户私有。
 
 ### 7.2 必须实现
 
@@ -374,7 +350,7 @@ Unix 下用 `std::os::unix::fs::OpenOptionsExt::mode(0o600)`。目录创建后�
 4. rename 到最终路径。
 5. 出错时删除临时文件。
 
-完整的 generation 和跨进程锁属于 #35，但当前 PR 至少不能留下部分 JSON，也不能公开 token。
+完整的 generation 和跨进程锁属于 #35，但当前 PR 至少不能留下部分 JSON，也不应让其他本地用户读取运行状态和日志。
 
 ## 8. 地址处理和启动失败清理
 
@@ -421,17 +397,17 @@ url.set_port(Some(port))?;
 - 子进程提前退出：`wait()` 回收并返回包含日志路径的错误。
 - readiness 超时：先 `kill()`，再 `wait()`，然后仅删除本次启动写入的状态。
 - 状态文件解析失败：在超时前继续等待短暂重试；最终按超时路径回收。
-- readiness 返回 token 不匹配：视为错误，回收本次 child，不能把端口上的其他服务当作成功。
+- readiness 返回的 server name 或协议版本不匹配：视为错误，回收本次 child，不能把端口上的其他服务当作成功。
 
 不要在返回错误前只 drop `Child`。Tokio 默认 drop child handle 不保证终止进程。
 
-### 8.3 daemon 身份
+### 8.3 daemon readiness
 
-当前 `/api/status` 使用 token 验证 daemon 身份，这个方向正确。readiness 必须同时验证：
+当前 `/api/status` 可以继续作为 readiness endpoint，但本 PR 不要求通过 token 认证它。readiness 至少应验证：
 
 - HTTP 成功。
-- token 正确。
 - 返回的 server name 与请求 name 一致。
+- 返回结构的协议版本与当前 CLI 兼容。
 
 可以返回：
 
@@ -442,8 +418,6 @@ url.set_port(Some(port))?;
   "version": "0.0.4"
 }
 ```
-
-token 不应包含在响应中。
 
 ## 9. 有界 shutdown
 
@@ -463,13 +437,12 @@ CLI 的 `server stop` 等待十秒后返回超时，但 daemon 可能继续运�
 
 流程：
 
-1. `/api/shutdown` 校验 token。
-2. handler 触发 shutdown signal 并立即返回 `202 Accepted`。
-3. Axum graceful shutdown 停止接收新连接。
-4. daemon supervisor 从收到 signal 的时刻开始计算 grace period，例如 3–5 秒。
-5. grace period 内允许普通请求结束。
-6. 超时后 drop/abort serve future，使剩余 SSE/WebSocket 连接关闭。
-7. 写入/删除状态完成后进程退出。
+1. `/api/shutdown` handler 触发 shutdown signal 并立即返回 `202 Accepted`。
+2. Axum graceful shutdown 停止接收新连接。
+3. daemon supervisor 从收到 signal 的时刻开始计算 grace period，例如 3–5 秒。
+4. grace period 内允许普通请求结束。
+5. 超时后 drop/abort serve future，使剩余 SSE/WebSocket 连接关闭。
+6. 写入/删除状态完成后进程退出。
 
 需要避免从进程启动时就开始 timeout。timeout 必须从 shutdown signal 触发时开始。
 
@@ -515,7 +488,6 @@ CLI stop 的等待时间应大于 daemon grace period，并留出状态清理余
 - 删除 `terminate_process` 的 Unix/Windows 实现。
 - 删除 `clean_stale_agents` 中所有 PID 语义；目标架构下不再有 per-agent process state。
 - 将 `ProxyEntry` 替换为持有 ACP Router 的 `RegisteredAgent`。
-- 为 POST/DELETE/status/shutdown 统一增加认证 extractor/helper。
 - 使用结构化请求和错误响应。
 - 修正 `control_url` 和启动失败回收。
 - 实现有界 shutdown。
@@ -536,13 +508,13 @@ CLI stop 的等待时间应大于 daemon grace period，并留出状态清理余
 
 - 删除 `axum-reverse-proxy`。
 - 根据 Router `oneshot` 实现决定是否保留直接 `tower` 依赖。
-- `uuid` 可继续用于控制 token。
+- 如果删除现有控制 token 后没有其他 UUID 用途，删除 `uuid` 依赖。
 - 如果使用 `CancellationToken`，直接声明 `tokio-util` 依赖，不依赖传递性依赖。
 
 `README.md`：
 
 - `/api/agents` POST 示例不再包含 target。
-- 说明管理 API 需要 bearer token；不要在文档中展示实际状态文件 token 的读取命令，避免将本地 capability 误当正式远程认证方案。
+- 明确管理 API 在当前版本中未鉴权，并链接 #34。
 - 保留默认 `/<agent-id>/acp`、health 和 readyz 路径说明。
 - 说明 unregister 对已有连接的语义。
 
@@ -560,17 +532,14 @@ CLI stop 的等待时间应大于 daemon grace period，并留出状态清理余
 - unregister 默认 name。
 - CORS 冲突参数。
 
-### 11.2 管理 API 认证
+### 11.2 管理 API 无鉴权行为
 
-每个 mutating/control endpoint 至少测试：
+当前 PR 不添加认证测试。应测试未鉴权 API 的基本契约，避免后续 #34 无法区分认证变更与业务回归：
 
-- 无 Authorization -> `401`。
-- 非 Bearer 格式 -> `401`。
-- 错误 token -> `403`。
-- 正确 token -> 按业务执行。
-- 错误响应不包含真实 token。
-
-DELETE 的认证测试尤其重要，因为当前实现允许任何人移除并终止 agent。
+- POST 无 Authorization header 时按业务执行。
+- DELETE 无 Authorization header 时按业务执行。
+- `/api/status` 和 `/api/shutdown` 无 Authorization header 时按当前契约执行。
+- README 明确这是暂时的未鉴权管理面，并链接 #34。
 
 ### 11.3 动态路由
 
@@ -614,7 +583,6 @@ DELETE 的认证测试尤其重要，因为当前实现允许任何人移除并�
 - 存在活动 WebSocket 时，daemon 在 grace period 后退出。
 - shutdown 后客户端连接被关闭。
 - CLI stop 在预期时间内完成。
-- shutdown 请求 token 错误时 daemon 继续运行。
 
 测试中的 grace period 应允许注入较短值，例如 50–200ms，避免拖慢 suite。
 
@@ -650,14 +618,13 @@ Unix-only tests：
 3. 将 `server.rs` 的 `ProxyEntry` 改为动态 ACP Router entry。
 4. 修改 register CLI，删除 `serve` 子进程、PID、端口和代理逻辑。
 5. 删除 `axum-reverse-proxy` 及相关依赖。
-6. 为所有管理 endpoint 加统一 bearer token 校验。
-7. 引入私有、原子状态文件 helper，并让测试可注入 cache root。
-8. 用 URL API 重写 listen/control address 处理。
-9. 补齐 start 失败时的 child kill + wait。
-10. 实现有界 graceful shutdown。
-11. 将现有普通 HTTP/WebSocket proxy 测试替换为真实 ACP Router 测试。
-12. 更新 README 和 PR 描述。
-13. 运行完整验证与真实 CLI smoke test。
+6. 引入私有、原子状态文件 helper，并让测试可注入 cache root。
+7. 用 URL API 重写 listen/control address 处理。
+8. 补齐 start 失败时的 child kill + wait。
+9. 实现有界 graceful shutdown。
+10. 将现有普通 HTTP/WebSocket proxy 测试替换为真实 ACP Router 测试。
+11. 更新 README 和 PR 描述，明确鉴权由 #34 跟踪。
+12. 运行完整验证与真实 CLI smoke test。
 
 每完成一个阶段都应保持 `serve` 原有行为和测试不回退。
 
@@ -669,8 +636,7 @@ PR #32 在满足以下条件后可以重新请求审查：
 - 不再保存或接受 agent PID。
 - 不再接受任意代理 target URL。
 - 不再依赖 `axum-reverse-proxy`。
-- POST/DELETE/status/shutdown 全部要求有效 token。
-- token 和日志文件在 Unix 上不可被其他用户读取。
+- 状态目录、状态文件和日志在 Unix 上不可被其他用户读取。
 - 默认 route 和所有 serve-like 参数按文档工作。
 - HTTP/SSE 和 WebSocket 均通过真实 ACP fixture 验证。
 - 活动 SSE/WebSocket 不会让 stop 无限等待。
@@ -689,13 +655,13 @@ PR #32 在满足以下条件后可以重新请求审查：
 - 多 CLI 并发启动的强串行化和文件锁：#35。
 - daemon SIGKILL 后恢复注册表：#35。
 - generation 和跨进程状态仲裁：#35。
-- 面向远程客户端的可配置 token、轮换、TLS 和限流：#34。
+- 所有管理 API 鉴权，包括本地 token、远程凭据、授权、轮换、TLS 和限流：#34。
 - server list/status/logs/registrations 用户命令：#33。
 - unregister 强制取消已有 agent 连接。
 - 注册状态跨 daemon 重启自动恢复。
 - systemd、launchd、Windows Service 或全局常驻 daemon 集成。
 
-但这些后续项不能成为保留未鉴权 endpoint、公开 token 文件、裸 PID 或无界 stop 的理由。
+当前 PR 明确允许未鉴权 endpoint；该限制由 #34 跟踪。后续 issue 仍不能成为保留裸 PID、任意 target open proxy、宽松文件权限或无界 stop 的理由，因为这些问题与鉴权无关。
 
 ## 15. 实现决策记录
 
@@ -705,7 +671,7 @@ PR #32 在满足以下条件后可以重新请求审查：
 - agent HTTP Router 嵌入 named server，不增加 per-agent serve 进程。
 - register request 传 agent ID 和 serve options，不传可执行命令、环境变量、PID 或 target URL。
 - daemon 负责 registry resolution 和 agent config 构造。
-- 管理 API 使用 bearer capability token。
+- 当前管理 API 不鉴权；全部鉴权设计和实现统一留给 #34。
 - unregister 只阻止新连接，已有连接自然结束。
 - server stop 先 graceful，短 grace period 后强制关闭剩余连接。
 - 状态目录和文件默认仅当前用户可访问。
