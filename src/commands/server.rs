@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -21,6 +23,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
     process::Command,
     sync::{RwLock, watch},
@@ -167,6 +170,107 @@ struct RegisteredAgent {
 #[derive(Debug, Clone)]
 struct ServerPaths {
     directory: PathBuf,
+}
+
+struct ForceCloseListener {
+    inner: TcpListener,
+    force_close: watch::Receiver<bool>,
+}
+
+impl axum::serve::Listener for ForceCloseListener {
+    type Io = ForceCloseIo;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, address)) => {
+                    return (ForceCloseIo::new(stream, self.force_close.clone()), address);
+                }
+                Err(error) => {
+                    eprintln!("failed to accept named server connection: {error}");
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+struct ForceCloseIo {
+    inner: tokio::net::TcpStream,
+    cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl ForceCloseIo {
+    fn new(inner: tokio::net::TcpStream, mut force_close: watch::Receiver<bool>) -> Self {
+        Self {
+            inner,
+            cancelled: Box::pin(async move {
+                wait_for_shutdown(&mut force_close).await;
+            }),
+        }
+    }
+
+    fn poll_cancelled(&mut self, context: &mut TaskContext<'_>) -> std::io::Result<()> {
+        if self.cancelled.as_mut().poll(context).is_ready() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "named server shutdown grace expired",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl AsyncRead for ForceCloseIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.poll_cancelled(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for ForceCloseIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if let Err(error) = self.poll_cancelled(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.poll_cancelled(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.poll_cancelled(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
 }
 
 impl ServerPaths {
@@ -443,6 +547,11 @@ async fn serve_with_shutdown(
     shutdown_rx: watch::Receiver<bool>,
     shutdown_grace: Duration,
 ) -> Result<()> {
+    let (force_close, force_close_rx) = watch::channel(false);
+    let listener = ForceCloseListener {
+        inner: listener,
+        force_close: force_close_rx,
+    };
     let mut server_shutdown = shutdown_rx.clone();
     let mut supervisor_shutdown = shutdown_rx;
     let server = axum::serve(listener, router)
@@ -456,7 +565,13 @@ async fn serve_with_shutdown(
         () = wait_for_shutdown(&mut supervisor_shutdown) => {
             match timeout(shutdown_grace, &mut server).await {
                 Ok(result) => result.context("named ACP server failed"),
-                Err(_) => Ok(()),
+                Err(_) => {
+                    force_close.send_replace(true);
+                    timeout(Duration::from_secs(1), &mut server)
+                        .await
+                        .context("named ACP connections did not close after forced shutdown")??;
+                    Ok(())
+                },
             }
         }
     }
@@ -1209,6 +1324,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wildcard_and_ipv6_listeners_publish_reachable_control_urls() {
+        for (index, host) in ["0.0.0.0", "::1", "::"].into_iter().enumerate() {
+            let Ok(probe) = TcpListener::bind((host, 0)).await else {
+                continue;
+            };
+            drop(probe);
+            let temporary = tempfile::tempdir().unwrap();
+            let paths = ServerPaths::new(temporary.path().join("servers")).unwrap();
+            let name = format!("address-{index}");
+            let state_path = paths.state_file(&name);
+            let task = tokio::spawn(run_with(
+                name,
+                host.into(),
+                0,
+                paths,
+                Duration::from_millis(50),
+            ));
+            let state = timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(state) = read_json::<ServerFile>(&state_path).await {
+                        break state;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(state.control_url, control_url(host, state.port).unwrap());
+            let status = reqwest::Client::new()
+                .get(format!("{}/api/status", state.control_url))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(status.status(), StatusCode::OK);
+            reqwest::Client::new()
+                .post(format!("{}/api/shutdown", state.control_url))
+                .send()
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(!state_path.exists());
+        }
+    }
+
+    #[tokio::test]
     async fn bind_failure_does_not_write_state() {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = occupied.local_addr().unwrap().port();
@@ -1367,6 +1531,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_preserves_method_headers_body_query_and_extensions() {
+        #[derive(Clone)]
+        struct Marker(&'static str);
+
+        let target = Router::new().fallback(any(|request: Request<Body>| async move {
+            let method = request.method().clone();
+            let uri = request.uri().clone();
+            let header = request
+                .headers()
+                .get("x-dispatch-test")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let marker = request.extensions().get::<Marker>().unwrap().0;
+            let body = axum::body::to_bytes(request.into_body(), 1024)
+                .await
+                .unwrap();
+            format!(
+                "{method} {} {header} {marker} {}",
+                uri.path_and_query().unwrap(),
+                String::from_utf8(body.to_vec()).unwrap()
+            )
+        }));
+        let state = test_state();
+        insert_agent(
+            &state,
+            RegisteredAgent {
+                id: "demo".into(),
+                route: "/demo".into(),
+                router: target,
+            },
+        )
+        .await
+        .unwrap();
+        let mut request = Request::builder()
+            .method("PATCH")
+            .uri("/demo/rpc?mode=test")
+            .header("x-dispatch-test", "header-ok")
+            .body(Body::from("body-ok"))
+            .unwrap();
+        request.extensions_mut().insert(Marker("extension-ok"));
+
+        let response = dispatch_agent(State(state), request).await;
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "PATCH /rpc?mode=test header-ok extension-ok body-ok"
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_duplicate_agent_ids_and_routes() {
         let state = test_state();
         insert_agent(
@@ -1390,6 +1608,11 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(duplicate_id.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(duplicate_id.into_body(), 1024)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "agent_id_conflict");
         let duplicate_route = insert_agent(
             &state,
             RegisteredAgent {
@@ -1401,6 +1624,11 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(duplicate_route.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(duplicate_route.into_body(), 1024)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "route_conflict");
     }
 
     #[tokio::test]
@@ -1440,6 +1668,21 @@ mod tests {
             .unwrap();
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
         let error: Value = malformed.json().await.unwrap();
+        assert_eq!(error["error"], "invalid_request");
+
+        let legacy_proxy_request = client
+            .post(format!("http://{address}/api/agents"))
+            .json(&serde_json::json!({
+                "id": "demo",
+                "route": "/demo",
+                "target": "http://127.0.0.1:9000",
+                "pid": 123
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(legacy_proxy_request.status(), StatusCode::BAD_REQUEST);
+        let error: Value = legacy_proxy_request.json().await.unwrap();
         assert_eq!(error["error"], "invalid_request");
 
         let invalid_options = client
@@ -1484,5 +1727,363 @@ mod tests {
         let error: Value = missing.json().await.unwrap();
         assert_eq!(error["error"], "agent_not_found");
         task.abort();
+    }
+
+    #[cfg(unix)]
+    mod acp_network {
+        use agent_client_protocol::AcpAgentConfig;
+        use async_tungstenite::tokio::connect_async;
+        use async_tungstenite::tungstenite::Message;
+        use futures::StreamExt;
+        use reqwest::header::{ACCEPT, CONTENT_TYPE};
+        use serde_json::{Value, json};
+
+        use super::*;
+
+        const CONNECTION_ID: &str = "acp-connection-id";
+        const INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#;
+        const ECHO_REQUEST: &str = r#"{"jsonrpc":"2.0","id":2,"method":"test/echo","params":{}}"#;
+
+        fn fixture_agent() -> AcpAgentConfig {
+            AcpAgentConfig::new("/bin/sh").args([
+                "-c",
+                r#"while IFS= read -r line; do
+case "$line" in
+*'"id":2'*)
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"echo":"ok"}}'
+;;
+*)
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+;;
+esac
+done"#,
+            ])
+        }
+
+        struct NamedAcpServer {
+            address: SocketAddr,
+            task: Option<tokio::task::JoinHandle<Result<()>>>,
+        }
+
+        impl NamedAcpServer {
+            async fn start(shutdown_grace: Duration) -> Self {
+                Self::start_with_agent(fixture_agent(), shutdown_grace).await
+            }
+
+            async fn start_with_agent(config: AcpAgentConfig, shutdown_grace: Duration) -> Self {
+                let (shutdown, receiver) = watch::channel(false);
+                let state = ServerState {
+                    server_name: "test".into(),
+                    agents: Arc::default(),
+                    shutdown,
+                };
+                let router = crate::commands::serve::agent_router(
+                    config,
+                    &crate::commands::serve::ServeOptions::default(),
+                )
+                .unwrap();
+                insert_agent(
+                    &state,
+                    RegisteredAgent {
+                        id: "demo".into(),
+                        route: "/demo".into(),
+                        router,
+                    },
+                )
+                .await
+                .unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let task = tokio::spawn(serve_with_shutdown(
+                    listener,
+                    server_router(state),
+                    receiver,
+                    shutdown_grace,
+                ));
+                Self {
+                    address,
+                    task: Some(task),
+                }
+            }
+
+            fn http_url(&self, path: &str) -> String {
+                format!("http://{}{path}", self.address)
+            }
+
+            fn ws_url(&self, path: &str) -> String {
+                format!("ws://{}{path}", self.address)
+            }
+
+            async fn stop(mut self) {
+                reqwest::Client::new()
+                    .post(self.http_url("/api/shutdown"))
+                    .send()
+                    .await
+                    .unwrap();
+                self.wait().await;
+            }
+
+            async fn wait(&mut self) {
+                timeout(Duration::from_secs(2), self.task.take().unwrap())
+                    .await
+                    .expect("named ACP server shutdown timed out")
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+
+        impl Drop for NamedAcpServer {
+            fn drop(&mut self) {
+                if let Some(task) = &self.task {
+                    task.abort();
+                }
+            }
+        }
+
+        async fn initialize_http(client: &reqwest::Client, endpoint: &str) -> reqwest::Response {
+            timeout(
+                Duration::from_secs(5),
+                client
+                    .post(endpoint)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(INITIALIZE_REQUEST)
+                    .send(),
+            )
+            .await
+            .expect("HTTP initialize timed out")
+            .unwrap()
+        }
+
+        async fn initialize_websocket(
+            socket: &mut async_tungstenite::WebSocketStream<
+                async_tungstenite::tokio::TokioAdapter<tokio::net::TcpStream>,
+            >,
+        ) {
+            socket
+                .send(Message::Text(INITIALIZE_REQUEST.into()))
+                .await
+                .unwrap();
+            let frame = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("WebSocket initialize timed out")
+                .unwrap()
+                .unwrap();
+            let Message::Text(text) = frame else {
+                panic!("expected text initialize response, got {frame:?}");
+            };
+            let response: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(response["result"]["protocolVersion"], json!(1));
+        }
+
+        #[tokio::test]
+        async fn named_route_serves_http_sse_lifecycle_then_unregisters() {
+            let server = NamedAcpServer::start(Duration::from_millis(50)).await;
+            let client = reqwest::Client::new();
+            let endpoint = server.http_url("/demo/acp");
+            let health = client
+                .get(server.http_url("/demo/health"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK);
+            let readyz = client
+                .get(server.http_url("/demo/readyz"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(readyz.status(), StatusCode::OK);
+
+            let initialized = initialize_http(&client, &endpoint).await;
+            assert_eq!(initialized.status(), StatusCode::OK);
+            let connection_id = initialized
+                .headers()
+                .get(CONNECTION_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let initialized: Value =
+                serde_json::from_str(&initialized.text().await.unwrap()).unwrap();
+            assert_eq!(initialized["result"]["protocolVersion"], json!(1));
+
+            let sse = client
+                .get(&endpoint)
+                .header(ACCEPT, "text/event-stream")
+                .header(CONNECTION_ID, &connection_id)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(sse.status(), StatusCode::OK);
+            let mut events = sse.bytes_stream();
+            let accepted = client
+                .post(&endpoint)
+                .header(CONTENT_TYPE, "application/json")
+                .header(CONNECTION_ID, &connection_id)
+                .body(ECHO_REQUEST)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+            let event = timeout(Duration::from_secs(5), events.next())
+                .await
+                .expect("SSE response timed out")
+                .unwrap()
+                .unwrap();
+            assert!(
+                std::str::from_utf8(&event)
+                    .unwrap()
+                    .contains(r#""echo":"ok""#)
+            );
+            drop(events);
+
+            let deleted = client
+                .delete(&endpoint)
+                .header(CONNECTION_ID, &connection_id)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+            let unregistered = client
+                .delete(server.http_url("/api/agents"))
+                .json(&json!({ "id": "demo" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unregistered.status(), StatusCode::NO_CONTENT);
+            assert_eq!(
+                client
+                    .get(server.http_url("/demo/health"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+            server.stop().await;
+        }
+
+        #[tokio::test]
+        async fn unregister_keeps_existing_websocket_and_rejects_new_requests() {
+            let server = NamedAcpServer::start(Duration::from_millis(50)).await;
+            let (mut socket, response) = connect_async(server.ws_url("/demo/acp")).await.unwrap();
+            assert!(response.headers().contains_key(CONNECTION_ID));
+            initialize_websocket(&mut socket).await;
+
+            let removed = reqwest::Client::new()
+                .delete(server.http_url("/api/agents"))
+                .json(&json!({ "id": "demo" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+            assert_eq!(
+                reqwest::get(server.http_url("/demo/health"))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+
+            socket
+                .send(Message::Text(ECHO_REQUEST.into()))
+                .await
+                .unwrap();
+            let frame = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("WebSocket echo timed out")
+                .unwrap()
+                .unwrap();
+            let Message::Text(text) = frame else {
+                panic!("expected text echo response, got {frame:?}");
+            };
+            let response: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(response["result"]["echo"], "ok");
+            socket.close(None).await.unwrap();
+            server.stop().await;
+        }
+
+        #[tokio::test]
+        async fn named_readyz_reports_agent_spawn_failure() {
+            let missing = format!("/definitely-missing-named-agent-{}", std::process::id());
+            let server = NamedAcpServer::start_with_agent(
+                AcpAgentConfig::new(missing),
+                Duration::from_millis(50),
+            )
+            .await;
+            let client = reqwest::Client::new();
+            let response = initialize_http(&client, &server.http_url("/demo/acp")).await;
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+            let readyz = timeout(Duration::from_secs(5), async {
+                loop {
+                    let response = client
+                        .get(server.http_url("/demo/readyz"))
+                        .send()
+                        .await
+                        .unwrap();
+                    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                        break response.text().await.unwrap();
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("named readyz did not report the launch failure");
+            assert!(readyz.contains("agent launches failed"));
+            server.stop().await;
+        }
+
+        #[tokio::test]
+        async fn shutdown_bounds_active_sse_and_websocket_connections() {
+            let mut server = NamedAcpServer::start(Duration::from_millis(50)).await;
+            let client = reqwest::Client::new();
+            let endpoint = server.http_url("/demo/acp");
+            let initialized = initialize_http(&client, &endpoint).await;
+            let connection_id = initialized
+                .headers()
+                .get(CONNECTION_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let sse = client
+                .get(&endpoint)
+                .header(ACCEPT, "text/event-stream")
+                .header(CONNECTION_ID, connection_id)
+                .send()
+                .await
+                .unwrap();
+            let mut events = sse.bytes_stream();
+            let (mut socket, _) = connect_async(server.ws_url("/demo/acp")).await.unwrap();
+            initialize_websocket(&mut socket).await;
+
+            let shutdown_at = tokio::time::Instant::now();
+            let response = client
+                .post(server.http_url("/api/shutdown"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            server.wait().await;
+            assert!(shutdown_at.elapsed() < Duration::from_secs(1));
+
+            let sse_end = timeout(Duration::from_secs(1), events.next())
+                .await
+                .expect("SSE connection remained open after shutdown");
+            assert!(
+                sse_end.is_none() || sse_end.as_ref().is_some_and(|result| result.is_err()),
+                "SSE produced data instead of closing after shutdown"
+            );
+            let websocket_end = timeout(Duration::from_secs(1), socket.next())
+                .await
+                .expect("WebSocket connection remained open after shutdown");
+            assert!(
+                matches!(
+                    &websocket_end,
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+                ),
+                "WebSocket produced a non-close frame after shutdown: {websocket_end:?}"
+            );
+        }
     }
 }
