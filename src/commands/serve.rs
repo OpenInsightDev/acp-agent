@@ -6,6 +6,7 @@ use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectTo, LineDir
 use agent_client_protocol_http::{AcpHttpServer, CorsOptions, ServerOptions};
 use anyhow::{Context, Result, bail};
 use axum::{
+    Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -20,6 +21,9 @@ pub struct ServeOptions {
     pub host: String,
     /// TCP port to bind. Port `0` lets the operating system choose a port.
     pub port: u16,
+    /// Optional URL prefix applied to all served endpoints (ACP, health,
+    /// readyz). Defaults to the server root when `None`.
+    pub subpath: Option<String>,
     /// Path serving ACP over HTTP/SSE and WebSocket.
     pub path: String,
     /// Cross-origin browser access policy.
@@ -38,6 +42,7 @@ impl Default for ServeOptions {
         Self {
             host: "127.0.0.1".to_string(),
             port: 0,
+            subpath: None,
             path: "/acp".to_string(),
             cors: CorsOptions::disabled(),
             health_endpoint: true,
@@ -77,11 +82,15 @@ async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<(
         .local_addr()
         .context("failed to read ACP HTTP listener address")?;
     eprintln!(
-        "Serving ACP agent at http://{address}{} (WebSocket available on the same endpoint)",
+        "Serving ACP agent at http://{address}{}{} (WebSocket available on the same endpoint)",
+        options.subpath.as_deref().unwrap_or(""),
         options.path
     );
     if options.readyz_endpoint {
-        eprintln!("Agent readiness probe at http://{address}/readyz");
+        eprintln!(
+            "Agent readiness probe at http://{address}{}/readyz",
+            options.subpath.as_deref().unwrap_or("")
+        );
     }
     serve_listener(listener, config, options, server_options).await
 }
@@ -118,6 +127,11 @@ async fn serve_listener(
     if options.readyz_endpoint {
         router = router.route("/readyz", get(readyz).with_state(health));
     }
+    // When a `--subpath` is configured, serve the entire tree (ACP endpoint,
+    // health, readyz) under that URL prefix.
+    if let Some(subpath) = options.subpath.as_deref() {
+        router = Router::new().nest(subpath, router);
+    }
 
     axum::serve(listener, router)
         .await
@@ -136,6 +150,17 @@ fn http_server_options(options: &ServeOptions) -> Result<ServerOptions> {
     }
     if options.readyz_endpoint && options.path == "/readyz" {
         bail!("ACP endpoint path conflicts with the readiness endpoint");
+    }
+    if let Some(subpath) = &options.subpath {
+        if !subpath.starts_with('/') {
+            bail!("subpath must start with '/'");
+        }
+        if subpath.len() == 1 {
+            bail!("subpath cannot be '/'");
+        }
+        if subpath.ends_with('/') {
+            bail!("subpath must not end with '/'");
+        }
     }
 
     Ok(ServerOptions {
@@ -408,6 +433,19 @@ mod tests {
         ] {
             let error = http_server_options(&ServeOptions {
                 path: path.to_string(),
+                ..ServeOptions::default()
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+
+        for (subpath, expected) in [
+            ("myapp", "must start with '/'"),
+            ("/", "cannot be '/'"),
+            ("/myapp/", "must not end with '/'"),
+        ] {
+            let error = http_server_options(&ServeOptions {
+                subpath: Some(subpath.to_string()),
                 ..ServeOptions::default()
             })
             .unwrap_err();
@@ -844,6 +882,88 @@ done"#,
                 .header(CONNECTION_ID, connection_id)
                 .send()
                 .await;
+        }
+
+        #[tokio::test]
+        async fn serves_all_endpoints_under_the_configured_subpath() {
+            let custom_options = ServeOptions {
+                subpath: Some("/myapp".to_string()),
+                ..ServeOptions::default()
+            };
+            let server = TestServer::start(custom_options).await;
+            let client = reqwest::Client::new();
+
+            // Endpoints without the subpath prefix must not be reachable.
+            let bare_health = client.get(server.http_url("/health")).send().await.unwrap();
+            assert_eq!(
+                bare_health.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "health should only be under the subpath"
+            );
+            let bare_acp = client
+                .post(server.http_url("/acp"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(INITIALIZE_REQUEST)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                bare_acp.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "ACP should only be under the subpath"
+            );
+
+            // Health and readyz are reachable under the subpath.
+            let health = client
+                .get(server.http_url("/myapp/health"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(health.status(), reqwest::StatusCode::OK);
+            assert_eq!(health.text().await.unwrap(), "ok");
+            let readyz = client
+                .get(server.http_url("/myapp/readyz"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(readyz.status(), reqwest::StatusCode::OK);
+
+            // The ACP endpoint is served under the subpath.
+            let initialized = initialize_http(&client, &server.http_url("/myapp/acp")).await;
+            assert_eq!(initialized.status(), reqwest::StatusCode::OK);
+            let connection_id = initialized
+                .headers()
+                .get(CONNECTION_ID)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            let _ = client
+                .delete(server.http_url("/myapp/acp"))
+                .header(CONNECTION_ID, connection_id)
+                .send()
+                .await;
+
+            // WebSocket is served under the same subpath prefix.
+            let (mut socket, response) = connect_async(server.ws_url("/myapp/acp")).await.unwrap();
+            assert!(
+                response.headers().contains_key(CONNECTION_ID),
+                "WebSocket handshake should succeed under the subpath"
+            );
+            socket
+                .send(Message::Text(INITIALIZE_REQUEST.into()))
+                .await
+                .unwrap();
+            let frame = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("WebSocket initialize under subpath timed out")
+                .unwrap()
+                .unwrap();
+            let Message::Text(text) = frame else {
+                panic!("expected text response, got {frame:?}");
+            };
+            let response: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(response["result"]["protocolVersion"], json!(1));
+            socket.close(None).await.unwrap();
         }
     }
 }

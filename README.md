@@ -80,6 +80,13 @@ Use `--path` to change the ACP endpoint, `--no-health` to disable the health che
 acp-agent serve codex-acp --port 8010 --path /agent --no-health
 ```
 
+Use `--subpath` to serve the whole tree (ACP endpoint, `/health`, and `/readyz`) under a URL prefix, e.g. a reverse-proxy mount point or a shared host path:
+
+```sh
+acp-agent serve codex-acp --port 8010 --subpath /myapp --path /rpc
+# ACP at http://127.0.0.1:8010/myapp/rpc, health at .../myapp/health
+```
+
 `/health` only reflects the HTTP server.
 `/readyz` reflects agent-process health: it returns `200 ready` while the most recent agent launch succeeded, and `503` plus the last failure (including the agent's stderr tail) after a launch failure.
 Agent stderr is also forwarded to the serve process's logs, so startup failures such as a missing agent executable or a failed package install are visible in `docker logs` instead of being swallowed by the connection error response.

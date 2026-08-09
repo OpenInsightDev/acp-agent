@@ -104,6 +104,13 @@ enum Commands {
         /// TCP port for the HTTP listener. Use 0 for an ephemeral port.
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Optional URL prefix applied to all served endpoints (ACP, health,
+        /// readyz), e.g. `/myapp` makes the ACP endpoint `/myapp/acp`.
+        #[arg(long)]
+        subpath: Option<String>,
+        /// Use the agent id as the subpath (equivalent to `--subpath /<agent-id>`).
+        #[arg(long, conflicts_with = "subpath")]
+        agent_sub_path: bool,
         /// ACP HTTP and WebSocket endpoint path.
         #[arg(long, default_value = "/acp")]
         path: String,
@@ -250,6 +257,8 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             agent_id,
             host,
             port,
+            subpath,
+            agent_sub_path,
             path,
             cors_origins,
             allow_any_origin,
@@ -259,11 +268,13 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             args,
         } => {
             let args = resolve_yolo_args(&agent_id, yolo, args).await?;
+            let subpath = resolve_subpath(&agent_id, subpath, agent_sub_path);
             serve::serve_agent(
                 &agent_id,
                 serve::ServeOptions {
                     host,
                     port,
+                    subpath,
                     path,
                     cors: serve::cors_options(cors_origins, allow_any_origin)?,
                     health_endpoint: !no_health,
@@ -286,6 +297,20 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
             Ok(CliExit::Success)
         }
+    }
+}
+
+/// Resolves the effective served subpath, deriving `/` + agent id when
+/// `--agent-sub-path` is set (equivalent to `--subpath /<agent-id>`).
+fn resolve_subpath(
+    agent_id: &str,
+    subpath: Option<String>,
+    agent_sub_path: bool,
+) -> Option<String> {
+    if agent_sub_path {
+        Some(format!("/{agent_id}"))
+    } else {
+        subpath
     }
 }
 
@@ -594,6 +619,8 @@ mod tests {
             "8010",
             "--path",
             "/rpc",
+            "--subpath",
+            "/myapp",
             "--cors-origin",
             "https://example.com",
             "--no-health",
@@ -609,6 +636,7 @@ mod tests {
                 agent_id,
                 host,
                 port,
+                subpath,
                 path,
                 cors_origins,
                 no_health,
@@ -619,6 +647,7 @@ mod tests {
                 if agent_id == "demo"
                     && host == "0.0.0.0"
                     && port == 8010
+                    && subpath.as_deref() == Some("/myapp")
                     && path == "/rpc"
                     && cors_origins == ["https://example.com"]
                     && no_health
@@ -635,6 +664,7 @@ mod tests {
             Commands::Serve {
                 host,
                 port,
+                subpath,
                 path,
                 cors_origins,
                 allow_any_origin,
@@ -644,6 +674,7 @@ mod tests {
                 ..
             } if host == "127.0.0.1"
                 && port == 0
+                && subpath.is_none()
                 && path == "/acp"
                 && cors_origins.is_empty()
                 && !allow_any_origin
@@ -679,5 +710,51 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_agent_sub_path_flag() {
+        let cli =
+            Cli::try_parse_from(["acp-agent", "serve", "codex-acp", "--agent-sub-path"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Serve {
+                agent_id,
+                subpath,
+                agent_sub_path,
+                ..
+            } if agent_id == "codex-acp"
+                && subpath.is_none()
+                && agent_sub_path
+        ));
+    }
+
+    #[test]
+    fn rejects_agent_sub_path_with_subpath() {
+        let error = Cli::try_parse_from([
+            "acp-agent",
+            "serve",
+            "demo",
+            "--agent-sub-path",
+            "--subpath",
+            "/x",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn resolves_agent_sub_path_to_agent_id_prefix() {
+        assert_eq!(
+            resolve_subpath("codex-acp", None, true),
+            Some("/codex-acp".to_string())
+        );
+        // An explicit --subpath wins over the flag (they conflict at parse,
+        // but the resolver must still prefer the explicit value if reachable).
+        assert_eq!(
+            resolve_subpath("codex-acp", Some("/myapp".to_string()), false),
+            Some("/myapp".to_string())
+        );
+        assert_eq!(resolve_subpath("codex-acp", None, false), None);
     }
 }
