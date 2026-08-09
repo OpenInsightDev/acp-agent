@@ -110,9 +110,9 @@ acp-agent serve codex-acp --port 8010 -- --model gpt-5
 The default port is `0`, which lets the operating system select an available port.
 Set an explicit port when another process or container needs to connect.
 
-## Named reverse-proxy servers
+## Named servers
 
-Start a background reverse proxy and register one or more agent servers below it:
+Start a background server and register one or more agents below it:
 
 ```sh
 acp-agent server start --host 127.0.0.1 --port 8010
@@ -130,17 +130,42 @@ acp-agent server unregister codex-acp --name work
 acp-agent server stop --name work
 ```
 
-By default, `server register <agent-id>` exposes the agent's ACP endpoint at
-`/<agent-id>/acp`, with its health endpoints at `/<agent-id>/health` and
-`/<agent-id>/readyz`. `--route` (also accepted as `--subpath`) changes that
-prefix. The register command accepts the same endpoint, CORS, readiness, yolo,
-and trailing agent arguments as `serve`.
+By default, `server register <agent-id>` creates the public route
+`/<agent-id>`. Its ACP endpoint is `/<agent-id>/acp`, and its health endpoints
+are `/<agent-id>/health` and `/<agent-id>/readyz`. `--route` (also accepted as
+`--subpath`) changes the public route prefix. The register command accepts the
+same serve-like endpoint and agent settings as `serve`: `--path`, repeated
+`--cors-origin`, `--allow-any-origin`, `--no-health`, `--no-readyz`, `--yolo`,
+and trailing agent arguments.
 
-The proxy exposes `POST /api/agents` to add a route and `DELETE /api/agents` to
-remove one. Both accept JSON; POST uses
-`{"id":"demo","route":"/demo","target":"http://127.0.0.1:9000"}` and DELETE
-uses `{"id":"demo"}`. HTTP/SSE and WebSocket traffic are both forwarded.
-Stopping a named server also stops agent servers started through `server register`.
+The named server exposes `POST /api/agents` to add a route and `DELETE
+/api/agents` to remove one. POST accepts the agent ID, public route, and
+serve-like settings; it does not accept a target URL or PID:
+
+```json
+{
+  "id": "demo",
+  "route": "/demo",
+  "serve": {
+    "path": "/acp",
+    "cors_origins": [],
+    "allow_any_origin": false,
+    "health_endpoint": true,
+    "readyz_endpoint": true,
+    "yolo": false,
+    "args": ["--model", "gpt-5"]
+  }
+}
+```
+
+DELETE accepts `{"id":"demo"}`. Registered routes support ACP HTTP/SSE and
+WebSocket traffic. Unregistering removes the route for new connections; existing
+connections are allowed to end naturally.
+
+These management endpoints are currently unauthenticated. Authentication,
+credential management, TLS guidance, and rate limiting are tracked in
+[#34](https://github.com/OpenInsightDev/acp-agent/issues/34). Keep the default
+loopback listener unless access from another host is intentional.
 
 ## Manage the local cache
 
