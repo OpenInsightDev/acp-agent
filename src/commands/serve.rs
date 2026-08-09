@@ -155,7 +155,10 @@ fn http_server_options(options: &ServeOptions) -> Result<ServerOptions> {
         if !subpath.starts_with('/') {
             bail!("subpath must start with '/'");
         }
-        if subpath.len() > 1 && subpath.ends_with('/') {
+        if subpath.len() == 1 {
+            bail!("subpath cannot be '/'");
+        }
+        if subpath.ends_with('/') {
             bail!("subpath must not end with '/'");
         }
     }
@@ -423,7 +426,7 @@ mod tests {
     #[test]
     fn rejects_invalid_endpoint_and_cors_configuration() {
         for (path, expected) in [
-            ("acp", "must start with '/'" ),
+            ("acp", "must start with '/'"),
             ("/", "cannot be '/'"),
             ("/health", "conflicts with the health endpoint"),
             ("/readyz", "conflicts with the readiness endpoint"),
@@ -436,7 +439,11 @@ mod tests {
             assert!(error.to_string().contains(expected), "{error:#}");
         }
 
-        for (subpath, expected) in [("myapp", "must start with '/'"), ("/myapp/", "must not end with '/'")] {
+        for (subpath, expected) in [
+            ("myapp", "must start with '/'"),
+            ("/", "cannot be '/'"),
+            ("/myapp/", "must not end with '/'"),
+        ] {
             let error = http_server_options(&ServeOptions {
                 subpath: Some(subpath.to_string()),
                 ..ServeOptions::default()
@@ -887,12 +894,12 @@ done"#,
             let client = reqwest::Client::new();
 
             // Endpoints without the subpath prefix must not be reachable.
-            let bare_health = client
-                .get(server.http_url("/health"))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(bare_health.status(), reqwest::StatusCode::NOT_FOUND, "health should only be under the subpath");
+            let bare_health = client.get(server.http_url("/health")).send().await.unwrap();
+            assert_eq!(
+                bare_health.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "health should only be under the subpath"
+            );
             let bare_acp = client
                 .post(server.http_url("/acp"))
                 .header(CONTENT_TYPE, "application/json")
@@ -900,7 +907,11 @@ done"#,
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(bare_acp.status(), reqwest::StatusCode::NOT_FOUND, "ACP should only be under the subpath");
+            assert_eq!(
+                bare_acp.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "ACP should only be under the subpath"
+            );
 
             // Health and readyz are reachable under the subpath.
             let health = client
@@ -931,6 +942,28 @@ done"#,
                 .header(CONNECTION_ID, connection_id)
                 .send()
                 .await;
+
+            // WebSocket is served under the same subpath prefix.
+            let (mut socket, response) = connect_async(server.ws_url("/myapp/acp")).await.unwrap();
+            assert!(
+                response.headers().contains_key(CONNECTION_ID),
+                "WebSocket handshake should succeed under the subpath"
+            );
+            socket
+                .send(Message::Text(INITIALIZE_REQUEST.into()))
+                .await
+                .unwrap();
+            let frame = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("WebSocket initialize under subpath timed out")
+                .unwrap()
+                .unwrap();
+            let Message::Text(text) = frame else {
+                panic!("expected text response, got {frame:?}");
+            };
+            let response: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(response["result"]["protocolVersion"], json!(1));
+            socket.close(None).await.unwrap();
         }
     }
 }

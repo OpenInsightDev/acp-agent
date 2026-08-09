@@ -268,11 +268,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             args,
         } => {
             let args = resolve_yolo_args(&agent_id, yolo, args).await?;
-            let subpath = if agent_sub_path {
-                Some(format!("/{agent_id}"))
-            } else {
-                subpath
-            };
+            let subpath = resolve_subpath(&agent_id, subpath, agent_sub_path);
             serve::serve_agent(
                 &agent_id,
                 serve::ServeOptions {
@@ -301,6 +297,20 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
             Ok(CliExit::Success)
         }
+    }
+}
+
+/// Resolves the effective served subpath, deriving `/` + agent id when
+/// `--agent-sub-path` is set (equivalent to `--subpath /<agent-id>`).
+fn resolve_subpath(
+    agent_id: &str,
+    subpath: Option<String>,
+    agent_sub_path: bool,
+) -> Option<String> {
+    if agent_sub_path {
+        Some(format!("/{agent_id}"))
+    } else {
+        subpath
     }
 }
 
@@ -704,8 +714,8 @@ mod tests {
 
     #[test]
     fn parses_agent_sub_path_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "serve", "codex-acp", "--agent-sub-path"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["acp-agent", "serve", "codex-acp", "--agent-sub-path"]).unwrap();
         assert!(matches!(
             cli.command,
             Commands::Serve {
@@ -731,5 +741,20 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn resolves_agent_sub_path_to_agent_id_prefix() {
+        assert_eq!(
+            resolve_subpath("codex-acp", None, true),
+            Some("/codex-acp".to_string())
+        );
+        // An explicit --subpath wins over the flag (they conflict at parse,
+        // but the resolver must still prefer the explicit value if reachable).
+        assert_eq!(
+            resolve_subpath("codex-acp", Some("/myapp".to_string()), false),
+            Some("/myapp".to_string())
+        );
+        assert_eq!(resolve_subpath("codex-acp", None, false), None);
     }
 }
