@@ -1,6 +1,6 @@
 # acp-agent
 
-CLI and Rust library for discovering, installing, running, and serving [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) agents.
+CLI for discovering, installing, running, and serving [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) agents.
 
 ## Install
 
