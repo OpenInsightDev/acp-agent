@@ -18,7 +18,7 @@ pub mod run;
 pub mod search;
 /// ACP HTTP agent serving command.
 pub mod serve;
-/// Named reverse-proxy server management commands.
+/// Named ACP server management commands.
 pub mod server;
 
 /// Output format for registry listing and search commands.
@@ -52,7 +52,7 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Internal foreground process for a named reverse proxy.
+    /// Internal foreground process for a named ACP server.
     #[command(name = "__server-run", hide = true)]
     ServerRun {
         #[arg(long)]
@@ -149,7 +149,7 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Manage named reverse-proxy servers and their agent routes.
+    /// Manage named ACP servers and their agent routes.
     Server {
         #[command(subcommand)]
         command: ServerCommands,
@@ -165,25 +165,25 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum ServerCommands {
-    /// Start a named reverse proxy in the background.
+    /// Start a named ACP server in the background.
     Start {
         /// Local server name used by later commands.
         #[arg(long, default_value = "default")]
         name: String,
-        /// Hostname or IP address for the reverse proxy listener.
+        /// Hostname or IP address for the named server listener.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// TCP port for the reverse proxy listener. Use 0 for an ephemeral port.
+        /// TCP port for the named server listener. Use 0 for an ephemeral port.
         #[arg(long, default_value_t = 8010)]
         port: u16,
     },
-    /// Stop a named reverse proxy and its locally managed agent servers.
+    /// Stop a named ACP server.
     Stop {
         /// Local server name.
         #[arg(long, default_value = "default")]
         name: String,
     },
-    /// Start an agent server and register its route with a named proxy.
+    /// Register an agent route with a named server.
     Register {
         agent_id: String,
         /// Target server name.
@@ -205,10 +205,10 @@ enum ServerCommands {
         /// Allow requests from every browser origin.
         #[arg(long, conflicts_with = "cors_origins")]
         allow_any_origin: bool,
-        /// Disable the proxied GET /health endpoint.
+        /// Disable the agent's GET /health endpoint.
         #[arg(long)]
         no_health: bool,
-        /// Disable the proxied GET /readyz endpoint.
+        /// Disable the agent's GET /readyz endpoint.
         #[arg(long)]
         no_readyz: bool,
         /// Activate the agent's yolo/auto-approve mode.
@@ -218,7 +218,7 @@ enum ServerCommands {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Remove an agent route and stop its locally managed server.
+    /// Remove an agent route from a named server.
     Unregister {
         agent_id: String,
         /// Target server name.

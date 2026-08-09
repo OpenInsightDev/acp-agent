@@ -165,7 +165,13 @@ connections are allowed to end naturally.
 These management endpoints are currently unauthenticated. Authentication,
 credential management, TLS guidance, and rate limiting are tracked in
 [#34](https://github.com/OpenInsightDev/acp-agent/issues/34). Keep the default
-loopback listener unless access from another host is intentional.
+loopback listener unless access from another host is intentional. An explicit
+non-loopback listener prints a warning because the management endpoints become
+reachable from other hosts.
+
+Named server state and logs live below the platform cache directory. On Unix,
+the server directory is mode `0700` and its state and log files are mode `0600`;
+Windows uses the current user's cache-directory ACL.
 
 ## Manage the local cache
 
