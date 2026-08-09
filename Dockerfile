@@ -10,10 +10,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY data ./data
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-$TARGETARCH \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-$TARGETARCH \
     # Multi-arch builds run amd64 and arm64 concurrently; keep the cargo
-    # target directory separate per architecture to avoid clobbering.
+    # caches (registry, git, target) separate per architecture so the two
+    # builds never unpack the same crate into the same path simultaneously.
     --mount=type=cache,target=/app/target,id=cargo-target-$TARGETARCH \
     cargo build --release --locked \
     && install -Dm755 target/release/acp-agent /out/acp-agent
