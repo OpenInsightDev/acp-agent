@@ -30,7 +30,25 @@ pub(crate) async fn resolve_agent_config(
     agent_id: &str,
     user_args: &[String],
 ) -> Result<AcpAgentConfig> {
-    resolve_agent(agent_id, user_args).await?.into_acp_config()
+    let registry = fetch_registry().await?;
+    let agent = registry
+        .get_agent(agent_id)
+        .with_context(|| format!("failed to resolve agent \"{agent_id}\" from registry"))?;
+    resolve_agent_config_from_registry_agent(agent, user_args).await
+}
+
+/// Resolves an already-fetched registry agent into an ACP process configuration.
+///
+/// Callers that need to distinguish an unavailable registry from an unknown
+/// agent can fetch once, select the agent, then use this resolver without a
+/// second registry request.
+pub(crate) async fn resolve_agent_config_from_registry_agent(
+    agent: &RegistryAgent,
+    user_args: &[String],
+) -> Result<AcpAgentConfig> {
+    resolve_agent_command(agent, user_args)
+        .await?
+        .into_acp_config()
 }
 
 async fn resolve_agent(agent_id: &str, user_args: &[String]) -> Result<CommandSpec> {
@@ -220,7 +238,7 @@ pub(crate) async fn run_in_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{AgentDistribution, NpxDistribution};
+    use crate::registry::{AgentDistribution, NpxDistribution, UvxDistribution};
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -249,6 +267,24 @@ mod tests {
                 }),
                 uvx: None,
             },
+        }
+    }
+
+    fn sample_uvx_agent() -> RegistryAgent {
+        RegistryAgent {
+            distribution: AgentDistribution {
+                binary: None,
+                npx: None,
+                uvx: Some(UvxDistribution {
+                    package: "acme-demo".to_string(),
+                    args: Some(vec!["--stdio".to_string()]),
+                    env: Some(Environment::from([(
+                        "DEMO_MODE".to_string(),
+                        "local".to_string(),
+                    )])),
+                }),
+            },
+            ..sample_npx_agent()
         }
     }
 
@@ -347,6 +383,26 @@ mod tests {
         assert_eq!(
             config.environment().get("AGENT_MODE"),
             Some(&"serve".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_config_from_supplied_agent_without_fetching_registry() {
+        let config = resolve_agent_config_from_registry_agent(
+            &sample_uvx_agent(),
+            &["--model".to_string(), "gpt-5".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(config.command(), Path::new("uvx"));
+        assert_eq!(
+            config.arguments(),
+            ["acme-demo", "--stdio", "--model", "gpt-5"]
+        );
+        assert_eq!(
+            config.environment().get("DEMO_MODE"),
+            Some(&"local".to_string())
         );
     }
 }

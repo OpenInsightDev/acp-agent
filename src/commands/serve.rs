@@ -52,6 +52,9 @@ impl Default for ServeOptions {
 }
 
 pub(crate) fn cors_options(origins: Vec<String>, allow_any: bool) -> Result<CorsOptions> {
+    if allow_any && !origins.is_empty() {
+        bail!("CORS origins cannot be combined with allow_any_origin");
+    }
     if allow_any {
         Ok(CorsOptions::allow_any_origin())
     } else if origins.is_empty() {
@@ -143,7 +146,8 @@ async fn serve_listener(listener: TcpListener, router: Router) -> Result<()> {
         .context("ACP HTTP server failed")
 }
 
-fn http_server_options(options: &ServeOptions) -> Result<ServerOptions> {
+/// Validates the options shared by standalone and named ACP HTTP routers.
+pub(crate) fn validate_options(options: &ServeOptions) -> Result<()> {
     if !options.path.starts_with('/') {
         bail!("ACP endpoint path must start with '/'");
     }
@@ -168,6 +172,11 @@ fn http_server_options(options: &ServeOptions) -> Result<ServerOptions> {
         }
     }
 
+    Ok(())
+}
+
+fn http_server_options(options: &ServeOptions) -> Result<ServerOptions> {
+    validate_options(options)?;
     Ok(ServerOptions {
         path: options.path.clone(),
         cors: options.cors.clone(),
@@ -459,6 +468,13 @@ mod tests {
 
         let error = cors_options(vec!["bad\norigin".to_string()], false).unwrap_err();
         assert!(error.to_string().contains("invalid HTTP header value"));
+
+        let error = cors_options(vec!["https://example.com".to_string()], true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be combined with allow_any_origin")
+        );
     }
 
     #[tokio::test]

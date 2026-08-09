@@ -117,17 +117,17 @@ struct AgentSelector {
     id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ApiError {
-    error: &'static str,
+    error: String,
     message: String,
 }
 
-fn api_error(status: StatusCode, error: &'static str, message: impl Into<String>) -> Response {
+fn api_error(status: StatusCode, error: impl Into<String>, message: impl Into<String>) -> Response {
     (
         status,
         Json(ApiError {
-            error,
+            error: error.into(),
             message: message.into(),
         }),
     )
@@ -247,6 +247,7 @@ pub async fn stop(name: &str) -> Result<String> {
 pub async fn register(agent_id: &str, options: RegisterOptions) -> Result<String> {
     validate_name(&options.name)?;
     let route = options.route.unwrap_or_else(|| format!("/{agent_id}"));
+    validate_route(&route)?;
     let state = load_live_server(&options.name).await?;
     let registration = AgentRegistrationRequest {
         id: agent_id.to_string(),
@@ -269,7 +270,10 @@ pub async fn register(agent_id: &str, options: RegisterOptions) -> Result<String
         .with_context(|| format!("failed to register with server \"{}\"", options.name))?;
     if !response.status().is_success() {
         let detail = response.text().await.unwrap_or_default();
-        bail!("server rejected agent registration: {detail}");
+        bail!(
+            "server rejected agent registration: {}",
+            api_error_detail(&detail)
+        );
     }
     Ok(format!(
         "registered agent \"{agent_id}\" at {}{route}",
@@ -291,7 +295,10 @@ pub async fn unregister(agent_id: &str, name: &str) -> Result<String> {
         .with_context(|| format!("failed to contact server \"{name}\""))?;
     if !response.status().is_success() {
         let detail = response.text().await.unwrap_or_default();
-        bail!("server rejected agent unregistration: {detail}");
+        bail!(
+            "server rejected agent unregistration: {}",
+            api_error_detail(&detail)
+        );
     }
     Ok(format!(
         "unregistered agent \"{agent_id}\" from server \"{name}\""
@@ -387,13 +394,13 @@ async fn add_agent(
             );
         }
     };
-    if registry.find_agent(&registration.id).is_none() {
+    let Some(agent) = registry.find_agent(&registration.id) else {
         return api_error(
             StatusCode::NOT_FOUND,
             "agent_not_found",
             format!("agent {} was not found in the registry", registration.id),
         );
-    }
+    };
     let args = match resolved_args(&registration.id, &registration.serve).await {
         Ok(args) => args,
         Err(error) => {
@@ -404,7 +411,7 @@ async fn add_agent(
             );
         }
     };
-    let config = match crate::runner::resolve_agent_config(&registration.id, &args).await {
+    let config = match crate::runner::resolve_agent_config_from_registry_agent(agent, &args).await {
         Ok(config) => config,
         Err(error) => {
             return api_error(
@@ -439,9 +446,16 @@ async fn add_agent(
     }
 }
 
+fn api_error_detail(body: &str) -> String {
+    match serde_json::from_str::<ApiError>(body) {
+        Ok(error) => format!("{}: {}", error.error, error.message),
+        Err(_) if body.trim().is_empty() => "server returned no error details".to_string(),
+        Err(_) => body.to_string(),
+    }
+}
+
 fn serve_options(request: &AgentServeRequest) -> Result<crate::commands::serve::ServeOptions> {
-    validate_agent_serve_request(request)?;
-    Ok(crate::commands::serve::ServeOptions {
+    let options = crate::commands::serve::ServeOptions {
         host: "127.0.0.1".to_string(),
         port: 0,
         subpath: None,
@@ -452,27 +466,9 @@ fn serve_options(request: &AgentServeRequest) -> Result<crate::commands::serve::
         )?,
         health_endpoint: request.health_endpoint,
         readyz_endpoint: request.readyz_endpoint,
-    })
-}
-
-// `ServeOptions` validation is intentionally repeated here because the
-// reusable router builder requires a resolved agent config. A daemon must
-// reject malformed API options before it fetches the registry or prepares an
-// agent executable.
-fn validate_agent_serve_request(request: &AgentServeRequest) -> Result<()> {
-    if !request.path.starts_with('/') {
-        bail!("ACP endpoint path must start with '/'");
-    }
-    if request.path.len() == 1 {
-        bail!("ACP endpoint path cannot be '/'");
-    }
-    if request.health_endpoint && request.path == "/health" {
-        bail!("ACP endpoint path conflicts with the health endpoint");
-    }
-    if request.readyz_endpoint && request.path == "/readyz" {
-        bail!("ACP endpoint path conflicts with the readiness endpoint");
-    }
-    Ok(())
+    };
+    crate::commands::serve::validate_options(&options)?;
+    Ok(options)
 }
 
 async fn resolved_args(id: &str, request: &AgentServeRequest) -> Result<Vec<String>> {
@@ -787,6 +783,21 @@ mod tests {
         assert_eq!(control_url(&state), "http://[::1]:8010");
     }
 
+    #[test]
+    fn formats_structured_and_unstructured_api_errors_for_cli_output() {
+        assert_eq!(
+            api_error_detail(
+                r#"{"error":"route_conflict","message":"route /demo is already registered"}"#
+            ),
+            "route_conflict: route /demo is already registered"
+        );
+        assert_eq!(
+            api_error_detail("upstream unavailable"),
+            "upstream unavailable"
+        );
+        assert_eq!(api_error_detail("  "), "server returned no error details");
+    }
+
     fn test_state() -> ServerState {
         let (shutdown, _) = oneshot::channel();
         ServerState {
@@ -942,6 +953,24 @@ mod tests {
             .unwrap();
         assert_eq!(invalid_options.status(), StatusCode::BAD_REQUEST);
         let error: Value = invalid_options.json().await.unwrap();
+        assert_eq!(error["error"], "invalid_options");
+
+        let conflicting_cors = client
+            .post(format!("http://{address}/api/agents"))
+            .json(&serde_json::json!({
+                "id": "demo",
+                "route": "/demo",
+                "serve": {
+                    "path": "/acp",
+                    "cors_origins": ["https://example.com"],
+                    "allow_any_origin": true
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflicting_cors.status(), StatusCode::BAD_REQUEST);
+        let error: Value = conflicting_cors.json().await.unwrap();
         assert_eq!(error["error"], "invalid_options");
 
         let missing = client
