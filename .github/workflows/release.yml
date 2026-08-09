@@ -124,18 +124,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
-      - uses: docker/build-push-action@v7
+      - name: Prepare image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: Publish binary image
+        uses: docker/build-push-action@v7
         with:
           context: .
+          target: bin
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.IMAGE }}:bin
+      - name: Publish runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: latest
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ env.IMAGE }}:latest

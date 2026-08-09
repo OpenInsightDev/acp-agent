@@ -148,7 +148,8 @@ Package-manager installs (`npm`, `deno`, `uv`) live in the global toolchain rath
 
 The image contains the `acp-agent` CLI and its supported JavaScript/Python toolchains (`deno` and `uv`).
 It does not install a specific agent during the image build.
-The final image is a small non-root runtime image, and the CLI is its entrypoint, so arguments can be passed directly after the image name.
+The runtime image uses `debian:bookworm` with common runtime libraries and no compiler toolchain.
+The CLI is its entrypoint, so arguments can be passed directly after the image name.
 
 ```sh
 docker build -t acp-agent:latest .
@@ -170,10 +171,10 @@ docker run --rm -v $HOME/.cache/acp-agent:/cache acp-agent:latest run codex-acp
 
 The same form works for every CLI command.
 `install-env` is optional in this image because Deno and uv are installed at image build time.
-The `acp-agent` binary lives at `/acp-agent` in the image, so you can vendor it into your own image with a `COPY --from=` stage (the same pattern uv offers for its binary), e.g.:
+The `:bin` image contains only `/acp-agent`, so you can vendor it into your own image with a `COPY --from=` stage (the same pattern uv offers for its binary), e.g.:
 
 ```dockerfile
-COPY --from=ghcr.io/openinsightdev/acp-agent:latest /acp-agent /usr/local/bin/acp-agent
+COPY --from=ghcr.io/openinsightdev/acp-agent:bin /acp-agent /usr/local/bin/acp-agent
 ```
 
 ```sh
@@ -191,7 +192,7 @@ docker run --rm -v acp-agent-cache:/cache acp-agent:latest run codex-acp
 No agent is preloaded into the image; the first `run` or `serve` command downloads or prepares the selected agent as needed.
 
 Binary agent installs append a human-readable line to `/cache/acp-agent/agent-install.log` (successes and failures, with timestamps and the full error chain).
-The image has no shell, so when a container fails to prepare an agent, retrieve that log from the host with:
+When a container fails to prepare an agent, retrieve that log from the host with:
 
 ```sh
 docker cp <container>:/cache/acp-agent/agent-install.log .
