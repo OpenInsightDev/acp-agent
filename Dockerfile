@@ -75,7 +75,7 @@ RUN set -eux; \
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 
-COPY --from=builder /out/acp-agent /usr/local/bin/acp-agent
+COPY --from=builder /out/acp-agent /acp-agent
 COPY --from=toolchain /opt/deno/bin/deno /usr/local/bin/deno
 COPY --from=toolchain /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=toolchain /usr/local/bin/uvx /usr/local/bin/uvx
@@ -97,5 +97,5 @@ ENV HOME=/home/nonroot \
 USER 65532:65532
 WORKDIR /workspace
 
-ENTRYPOINT ["acp-agent"]
+ENTRYPOINT ["/acp-agent"]
 CMD ["--help"]
