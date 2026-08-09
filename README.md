@@ -110,6 +110,38 @@ acp-agent serve codex-acp --port 8010 -- --model gpt-5
 The default port is `0`, which lets the operating system select an available port.
 Set an explicit port when another process or container needs to connect.
 
+## Named reverse-proxy servers
+
+Start a background reverse proxy and register one or more agent servers below it:
+
+```sh
+acp-agent server start --host 127.0.0.1 --port 8010
+acp-agent server register codex-acp
+acp-agent server register claude --route /reviewer -- --model opus
+```
+
+The server name defaults to `default`. Use `--name` on every command to manage
+another server independently:
+
+```sh
+acp-agent server start --name work --port 8020
+acp-agent server register codex-acp --name work
+acp-agent server unregister codex-acp --name work
+acp-agent server stop --name work
+```
+
+By default, `server register <agent-id>` exposes the agent's ACP endpoint at
+`/<agent-id>/acp`, with its health endpoints at `/<agent-id>/health` and
+`/<agent-id>/readyz`. `--route` (also accepted as `--subpath`) changes that
+prefix. The register command accepts the same endpoint, CORS, readiness, yolo,
+and trailing agent arguments as `serve`.
+
+The proxy exposes `POST /api/agents` to add a route and `DELETE /api/agents` to
+remove one. Both accept JSON; POST uses
+`{"id":"demo","route":"/demo","target":"http://127.0.0.1:9000"}` and DELETE
+uses `{"id":"demo"}`. HTTP/SSE and WebSocket traffic are both forwarded.
+Stopping a named server also stops agent servers started through `server register`.
+
 ## Manage the local cache
 
 Binary agents are stored in the platform cache directory (`$HOME/.cache/acp-agent` on macOS and Linux, `%LOCALAPPDATA%\acp-agent` on Windows, `/cache/acp-agent` inside the Docker image).

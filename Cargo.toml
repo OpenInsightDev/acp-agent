@@ -19,11 +19,12 @@ anyhow = "1.0.102"
 agent-client-protocol = "2.0.0"
 agent-client-protocol-http = { version = "2.0.0", features = ["server"] }
 axum = "0.8"
+axum-reverse-proxy = { version = "1.3.0", default-features = false }
 bzip2 = "0.6.1"
 clap = { version = "4.6.0", features = ["derive"] }
 dirs = "6.0.0"
 flate2 = "1.1.9"
-reqwest = "0.13.2"
+reqwest = { version = "0.13.2", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11.0"
@@ -38,6 +39,8 @@ tokio = { version = "1.52.0", features = [
   "time",
 ] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1", features = ["v4"] }
 zip = "8.4.0"
 
 [dev-dependencies]
