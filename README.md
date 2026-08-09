@@ -173,7 +173,7 @@ The same form works for every CLI command.
 The `acp-agent` binary lives at `/acp-agent` in the image, so you can vendor it into your own image with a `COPY --from=` stage (the same pattern uv offers for its binary), e.g.:
 
 ```dockerfile
-COPY --from=ghcr.io/openinsightdev/acp-agent:latest /usr/local/bin/acp-agent /usr/local/bin/acp-agent
+COPY --from=ghcr.io/openinsightdev/acp-agent:latest /acp-agent /usr/local/bin/acp-agent
 ```
 
 ```sh
