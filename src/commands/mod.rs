@@ -249,7 +249,7 @@ enum ServerCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Tail a named server's log with control tokens and credentials redacted.
+    /// Tail a named server's log.
     Logs {
         /// Local server name.
         #[arg(long, default_value = "default")]

@@ -160,9 +160,9 @@ acp-agent server register claude --route /reviewer -- --model opus
 |             | `--json`                      | off         | Emit the server record as structured JSON.                               |
 | `registrations`| `--name <name>`             | `default`   | List registered agent IDs, route prefixes, and readiness.                |
 |             | `--json`                      | off         | Emit registration records as structured JSON.                            |
-| `logs`      | `--name <name>`               | `default`   | Tail a named server's log with credentials redacted.                     |
+| `logs`      | `--name <name>`               | `default`   | Tail a named server's log.                                                |
 |             | `--lines <n>`                 | `50`        | Number of log lines to tail.                                             |
-|             | `--json`                      | off         | Emit `{name, lines}` with the redacted tail.                             |
+|             | `--json`                      | off         | Emit `{name, lines}` with the tail.                                      |
 
 The server name defaults to `default`.
 Use `--name` on every command to manage another server independently:
@@ -191,7 +191,7 @@ acp-agent server logs --name work --lines 20
 ```
 
 `server registrations` probes each route's `/readyz` endpoint and reports `ready`, `not_ready` (with the failure detail), `disabled` (no readyz endpoint), or `unknown`.
-`server logs` masks credential values (`token=`, `Authorization: Bearer`, `DB_PASSWORD=`, …) while keeping the surrounding line intact; the redaction is applied to the output, the raw log file is left untouched.
+`server logs` tails the daemon's log file.
 Add `--json` to any of these commands for automation-friendly output with deterministic field ordering:
 
 ```sh

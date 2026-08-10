@@ -724,10 +724,9 @@ pub async fn registrations<W: Write>(writer: &mut W, name: &str, json: bool) -> 
     Ok(())
 }
 
-/// Tails a named server's log with control tokens and credentials redacted.
+/// Tails a named server's log.
 ///
-/// The tail is bounded by `lines`; secrets are masked at read time so raw
-/// credentials never reach the terminal or automation output.
+/// The tail is bounded by `lines`.
 pub async fn logs<W: Write>(writer: &mut W, name: &str, lines: usize, json: bool) -> Result<()> {
     validate_name(name)?;
     let log_path = ServerPaths::discover()?.log_file(name);
@@ -742,19 +741,16 @@ pub async fn logs<W: Write>(writer: &mut W, name: &str, lines: usize, json: bool
             return Err(error).with_context(|| format!("failed to read {}", log_path.display()));
         }
     };
-    let redacted: Vec<String> = tail_lines(&content, lines)
-        .into_iter()
-        .map(redact_line)
-        .collect();
+    let tail = tail_lines(&content, lines);
     if json {
         serde_json::to_writer_pretty(
             &mut *writer,
-            &serde_json::json!({ "name": name, "lines": redacted }),
+            &serde_json::json!({ "name": name, "lines": tail }),
         )
         .context("failed to serialize log tail")?;
         writeln!(writer)?;
     } else {
-        for line in redacted {
+        for line in tail {
             writeln!(writer, "{line}")?;
         }
     }
@@ -896,90 +892,6 @@ fn write_status<W: Write>(writer: &mut W, record: &ServerRecord, json: bool) -> 
 
 fn strip_json_suffix(name: &str) -> Option<&str> {
     name.strip_suffix(".json").filter(|name| !name.is_empty())
-}
-
-/// Masks secrets in a log line while preserving the surrounding context.
-///
-/// Values following common credential markers (`token=`, `api_key:`,
-/// `Authorization: Bearer`, …) are replaced with a fixed `[REDACTED]`
-/// placeholder. Only the value is masked, so the line stays useful for
-/// diagnosis; the marker itself is matched case-insensitively.
-fn redact_line(line: &str) -> String {
-    const MARKERS: &[&str] = &[
-        "authorization:",
-        "x-api-key:",
-        "x-auth-token:",
-        "api-key:",
-        "apikey:",
-        "api_key:",
-        "api_key=",
-        "api-key=",
-        "access_token:",
-        "access_token=",
-        "refresh_token:",
-        "refresh_token=",
-        "client_secret:",
-        "client_secret=",
-        "private_key:",
-        "private_key=",
-        "token=",
-        "token:",
-        "secret=",
-        "secret:",
-        "password=",
-        "password:",
-        "passwd=",
-        "passwd:",
-        "pwd=",
-        "bearer ",
-    ];
-
-    let lower = line.to_ascii_lowercase();
-    let mut output = String::with_capacity(line.len() + 32);
-    let mut cursor = 0;
-    let mut index = 0;
-    while index < line.len() {
-        let Some((position, marker_len)) = find_marker(&lower, index, MARKERS) else {
-            break;
-        };
-        let header_style = line.as_bytes()[position + marker_len - 1] == b':';
-        // Keep the marker (`token=`) and mask only the value, so the line
-        // stays diagnosable while the credential is gone.
-        let mut value_start = position + marker_len;
-        while value_start < line.len() && line.as_bytes()[value_start].is_ascii_whitespace() {
-            value_start += 1;
-        }
-        let mut value_end = value_start;
-        while value_end < line.len() {
-            let byte = line.as_bytes()[value_end];
-            // Header-style values (`Bearer <token>`) may contain spaces;
-            // assignment-style values stop at the first space.
-            if matches!(byte, b',' | b'}' | b')' | b']')
-                || (!header_style && byte.is_ascii_whitespace())
-            {
-                break;
-            }
-            value_end += 1;
-        }
-        output.push_str(&line[cursor..value_start]);
-        output.push_str("[REDACTED]");
-        cursor = value_end;
-        index = value_end;
-    }
-    output.push_str(&line[cursor..]);
-    output
-}
-
-fn find_marker(haystack: &str, start: usize, markers: &[&str]) -> Option<(usize, usize)> {
-    let haystack = &haystack[start..];
-    markers
-        .iter()
-        .filter_map(|marker| {
-            haystack
-                .find(marker)
-                .map(|position| (start + position, marker.len()))
-        })
-        .min_by_key(|(position, _)| *position)
 }
 
 /// Returns the last `max_lines` lines of `content`, dropping a trailing
@@ -1683,37 +1595,6 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-
-    #[test]
-    fn redacts_credential_values_and_keeps_context() {
-        assert_eq!(
-            redact_line("Authorization: Bearer abc.def.ghi"),
-            "Authorization: [REDACTED]"
-        );
-        assert_eq!(
-            redact_line("error: invalid token=sk-12345 for agent"),
-            "error: invalid token=[REDACTED] for agent"
-        );
-        assert_eq!(redact_line("DB_PASSWORD=hunter2"), "DB_PASSWORD=[REDACTED]");
-        assert_eq!(
-            redact_line("api_key=abc123, retrying"),
-            "api_key=[REDACTED], retrying"
-        );
-        assert_eq!(redact_line("token: \"secret-value\""), "token: [REDACTED]");
-        // Case-insensitive markers; unrelated text stays untouched.
-        assert_eq!(
-            redact_line("x-api-key: sk-live-42"),
-            "x-api-key: [REDACTED]"
-        );
-        assert_eq!(
-            redact_line("connection refused, no secrets here"),
-            "connection refused, no secrets here"
-        );
-        assert_eq!(
-            redact_line("password must be at least 8 chars"),
-            "password must be at least 8 chars"
-        );
-    }
 
     #[test]
     fn tails_only_the_last_lines() {
