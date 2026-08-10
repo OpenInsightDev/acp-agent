@@ -1,6 +1,6 @@
 # acp-agent
 
-CLI and Rust library for discovering, installing, running, and serving [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) agents.
+CLI for discovering, installing, running, and serving [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) agents.
 
 ## Install
 
@@ -232,7 +232,12 @@ docker run --rm -v $HOME/.cache/acp-agent:/cache acp-agent:latest run codex-acp
 ```
 
 The same form works for every CLI command.
-`install-env` is optional in this image because Deno and uv are installed at image build time:
+`install-env` is optional in this image because Deno and uv are installed at image build time.
+The `acp-agent` binary lives at `/acp-agent` in the image, so you can vendor it into your own image with a `COPY --from=` stage (the same pattern uv offers for its binary), e.g.:
+
+```dockerfile
+COPY --from=ghcr.io/openinsightdev/acp-agent:latest /acp-agent /usr/local/bin/acp-agent
+```
 
 ```sh
 docker run --rm acp-agent:latest list

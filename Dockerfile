@@ -10,12 +10,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY data ./data
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    # Multi-arch builds run amd64 and arm64 concurrently; keep the cargo
-    # target directory separate per architecture to avoid clobbering.
-    --mount=type=cache,target=/app/target,id=cargo-target-$TARGETARCH \
-    cargo build --release --locked \
+RUN cargo build --release --locked \
     && install -Dm755 target/release/acp-agent /out/acp-agent
 
 FROM debian:bookworm-slim AS toolchain
@@ -75,7 +70,7 @@ RUN set -eux; \
 
 FROM gcr.io/distroless/cc-debian12:nonroot
 
-COPY --from=builder /out/acp-agent /usr/local/bin/acp-agent
+COPY --from=builder /out/acp-agent /acp-agent
 COPY --from=toolchain /opt/deno/bin/deno /usr/local/bin/deno
 COPY --from=toolchain /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=toolchain /usr/local/bin/uvx /usr/local/bin/uvx
@@ -97,5 +92,5 @@ ENV HOME=/home/nonroot \
 USER 65532:65532
 WORKDIR /workspace
 
-ENTRYPOINT ["acp-agent"]
+ENTRYPOINT ["/acp-agent"]
 CMD ["--help"]
