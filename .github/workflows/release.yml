@@ -139,3 +139,13 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # Publish bin image (scratch stage, binary only)
+      - name: Publish bin image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          target: bin
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/${{ github.repository }}:bin
