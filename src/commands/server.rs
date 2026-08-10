@@ -591,11 +591,16 @@ async fn list_with_paths<W: Write>(writer: &mut W, paths: &ServerPaths, json: bo
         let Some(name) = strip_json_suffix(&file_name) else {
             continue;
         };
-        let Ok(state) = read_json::<ServerFile>(&paths.state_file(name)).await else {
-            continue;
-        };
+        let state = read_json::<ServerFile>(&paths.state_file(name))
+            .await
+            .with_context(|| format!("failed to inspect server state for {name:?}"))?;
         if state.name != name {
-            continue;
+            bail!(
+                "server state file {} contains server {:?}, expected {:?}",
+                paths.state_file(name).display(),
+                state.name,
+                name
+            );
         }
         records.push(server_record(name, &state).await);
     }
@@ -652,9 +657,11 @@ async fn status_with_paths<W: Write>(
 ) -> Result<()> {
     validate_name(name)?;
     let state_path = paths.state_file(name);
-    let record = match read_json::<ServerFile>(&state_path).await {
-        Ok(state) if state.name == name => server_record(name, &state).await,
-        _ => ServerRecord {
+    let exists = tokio::fs::try_exists(&state_path)
+        .await
+        .with_context(|| format!("failed to inspect server state for {name:?}"))?;
+    let record = if !exists {
+        ServerRecord {
             name: name.to_string(),
             state: ServerRunState::Stopped.as_str().to_string(),
             listen_host: None,
@@ -662,7 +669,20 @@ async fn status_with_paths<W: Write>(
             address: None,
             pid: None,
             version: None,
-        },
+        }
+    } else {
+        let state = read_json::<ServerFile>(&state_path)
+            .await
+            .with_context(|| format!("failed to inspect server state for {name:?}"))?;
+        if state.name != name {
+            bail!(
+                "server state file {} contains server {:?}, expected {:?}",
+                state_path.display(),
+                state.name,
+                name
+            );
+        }
+        server_record(name, &state).await
     };
     write_status(writer, &record, json)?;
     Ok(())
@@ -1752,6 +1772,25 @@ mod tests {
         assert_eq!(status["name"], "missing");
         assert_eq!(status["state"], "stopped");
         assert!(status["pid"].is_null());
+    }
+
+    #[tokio::test]
+    async fn reports_corrupt_state_instead_of_stopped_or_omitting_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ServerPaths::new(temporary.path().join("servers")).unwrap();
+        std::fs::write(paths.state_file("broken"), b"{not json").unwrap();
+
+        let mut status_output = Vec::new();
+        let error = status_with_paths(&mut status_output, &paths, "broken", true)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("failed to inspect server state"));
+
+        let mut list_output = Vec::new();
+        let error = list_with_paths(&mut list_output, &paths, true)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("failed to inspect server state"));
     }
 
     #[test]
