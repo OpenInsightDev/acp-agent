@@ -24,7 +24,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, ReadBuf},
     net::TcpListener,
     process::Command,
     sync::{RwLock, watch},
@@ -37,6 +37,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVER_STATE_DIR_ENV: &str = "ACP_AGENT_SERVER_STATE_DIR";
+const MAX_LOG_TAIL_BYTES: usize = 1024 * 1024;
 #[cfg(test)]
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -730,7 +731,7 @@ pub async fn registrations<W: Write>(writer: &mut W, name: &str, json: bool) -> 
 pub async fn logs<W: Write>(writer: &mut W, name: &str, lines: usize, json: bool) -> Result<()> {
     validate_name(name)?;
     let log_path = ServerPaths::discover()?.log_file(name);
-    let content = match tokio::fs::read_to_string(&log_path).await {
+    let content = match read_log_tail(&log_path, lines).await {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             bail!(
@@ -755,6 +756,56 @@ pub async fn logs<W: Write>(writer: &mut W, name: &str, lines: usize, json: bool
         }
     }
     Ok(())
+}
+
+/// Reads only enough data from the end of a log to produce its requested
+/// tail. The returned buffer can be larger than `lines` physical lines when a
+/// chunk boundary falls in the middle of a line, but it never loads the whole
+/// file just to serve a small tail.
+async fn read_log_tail(path: &Path, lines: usize) -> std::io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    if lines == 0 {
+        return Ok(String::new());
+    }
+    let length = file.metadata().await?.len();
+    if length == 0 {
+        return Ok(String::new());
+    }
+
+    const CHUNK_SIZE: usize = 8192;
+    let mut position = length;
+    let mut chunks = Vec::new();
+    let mut newline_count = 0usize;
+    let mut bytes_read = 0usize;
+    let required_newlines = lines.saturating_add(1);
+    while position > 0 && newline_count < required_newlines {
+        let remaining = MAX_LOG_TAIL_BYTES - bytes_read;
+        if remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "log tail exceeds the {} byte read limit before finding {lines} lines",
+                    MAX_LOG_TAIL_BYTES
+                ),
+            ));
+        }
+        let amount = position.min(CHUNK_SIZE.min(remaining) as u64) as usize;
+        position -= amount as u64;
+        file.seek(std::io::SeekFrom::Start(position)).await?;
+        let mut chunk = vec![0; amount];
+        file.read_exact(&mut chunk).await?;
+        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
+        bytes_read += amount;
+        chunks.push(chunk);
+    }
+    chunks.reverse();
+    let capacity = chunks.iter().map(Vec::len).sum();
+    let mut bytes = Vec::with_capacity(capacity);
+    for chunk in chunks {
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 /// Builds the stable JSON record for a server with a readable state file.
@@ -1602,6 +1653,35 @@ mod tests {
         assert_eq!(tail_lines("a\n", 5), vec!["a"]);
         assert_eq!(tail_lines("", 5), Vec::<&str>::new());
         assert_eq!(tail_lines("a\nb\n", 0), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn reads_only_the_requested_log_tail() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("server.log");
+        let content = format!("first\n{}second\nthird\nfourth\n", "x".repeat(9000));
+        tokio::fs::write(&path, content).await.unwrap();
+
+        let content = read_log_tail(&path, 2).await.unwrap();
+        assert_eq!(tail_lines(&content, 2), vec!["third", "fourth"]);
+        assert!(!content.contains("first"));
+        assert!(read_log_tail(&path, 0).await.unwrap().is_empty());
+        assert_eq!(
+            read_log_tail(&temporary.path().join("missing.log"), 0)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let oversized = temporary.path().join("oversized.log");
+        tokio::fs::write(&oversized, vec![b'x'; MAX_LOG_TAIL_BYTES + 1])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_log_tail(&oversized, 1).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]
