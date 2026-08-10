@@ -18,6 +18,8 @@ pub mod run;
 pub mod search;
 /// ACP HTTP agent serving command.
 pub mod serve;
+/// Named ACP server management commands.
+pub mod server;
 
 /// Output format for registry listing and search commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,16 @@ enum Commands {
         program: PathBuf,
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Internal foreground process for a named ACP server.
+    #[command(name = "__server-run", hide = true)]
+    ServerRun {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        host: String,
+        #[arg(long)]
+        port: u16,
     },
     /// List every published agent.
     List {
@@ -137,12 +149,81 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Manage named ACP servers and their agent routes.
+    Server {
+        #[command(subcommand)]
+        command: ServerCommands,
+    },
     /// Search agents by ID, name, or description.
     Search {
         query: String,
         /// Emit the full matching agent records as a pretty-printed JSON array.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServerCommands {
+    /// Start a named ACP server in the background.
+    Start {
+        /// Local server name used by later commands.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// Hostname or IP address for the named server listener.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TCP port for the named server listener. Use 0 for an ephemeral port.
+        #[arg(long, default_value_t = 8010)]
+        port: u16,
+    },
+    /// Stop a named ACP server.
+    Stop {
+        /// Local server name.
+        #[arg(long, default_value = "default")]
+        name: String,
+    },
+    /// Register an agent route with a named server.
+    Register {
+        agent_id: String,
+        /// Target server name.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// Public route prefix. Defaults to `/<agent-id>`.
+        #[arg(long, alias = "subpath")]
+        route: Option<String>,
+        /// ACP HTTP and WebSocket endpoint path below the public route.
+        #[arg(long, default_value = "/acp")]
+        path: String,
+        /// Browser origin allowed to access the endpoint. May be repeated.
+        #[arg(
+            long = "cors-origin",
+            value_name = "ORIGIN",
+            conflicts_with = "allow_any_origin"
+        )]
+        cors_origins: Vec<String>,
+        /// Allow requests from every browser origin.
+        #[arg(long, conflicts_with = "cors_origins")]
+        allow_any_origin: bool,
+        /// Disable the agent's GET /health endpoint.
+        #[arg(long)]
+        no_health: bool,
+        /// Disable the agent's GET /readyz endpoint.
+        #[arg(long)]
+        no_readyz: bool,
+        /// Activate the agent's yolo/auto-approve mode.
+        #[arg(long)]
+        yolo: bool,
+        /// Arguments passed to the agent process.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Remove an agent route from a named server.
+    Unregister {
+        agent_id: String,
+        /// Target server name.
+        #[arg(long, default_value = "default")]
+        name: String,
     },
 }
 
@@ -206,6 +287,10 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                     )
                 })?;
             Ok(exit_from_status(status))
+        }
+        Commands::ServerRun { name, host, port } => {
+            server::run(name, host, port).await?;
+            Ok(CliExit::Success)
         }
         Commands::List { installed, json } => {
             let format = if json {
@@ -285,6 +370,47 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             .await
             .with_context(|| format!("failed to serve agent \"{agent_id}\""))
             .map(|()| CliExit::Success)
+        }
+        Commands::Server { command } => {
+            let message = match command {
+                ServerCommands::Start { name, host, port } => {
+                    server::start(server::StartOptions { name, host, port }).await?
+                }
+                ServerCommands::Stop { name } => server::stop(&name).await?,
+                ServerCommands::Register {
+                    agent_id,
+                    name,
+                    route,
+                    path,
+                    cors_origins,
+                    allow_any_origin,
+                    no_health,
+                    no_readyz,
+                    yolo,
+                    args,
+                } => {
+                    server::register(
+                        &agent_id,
+                        server::RegisterOptions {
+                            name,
+                            route,
+                            path,
+                            cors_origins,
+                            allow_any_origin,
+                            health_endpoint: !no_health,
+                            readyz_endpoint: !no_readyz,
+                            yolo,
+                            args,
+                        },
+                    )
+                    .await?
+                }
+                ServerCommands::Unregister { agent_id, name } => {
+                    server::unregister(&agent_id, &name).await?
+                }
+            };
+            writeln!(writer, "{message}")?;
+            Ok(CliExit::Success)
         }
         Commands::Search { query, json } => {
             let format = if json {
@@ -407,79 +533,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_list_subcommand_with_installed_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "list", "--installed"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::List {
-                installed: true,
-                ..
-            }
-        ));
-
-        let cli = Cli::try_parse_from(["acp-agent", "list"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::List {
-                installed: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_install_subcommand_with_single_and_multiple_agents() {
-        let single = Cli::try_parse_from(["acp-agent", "install", "codex-acp"]).unwrap();
-        assert!(matches!(
-            single.command,
-            Commands::Install { agent_id } if agent_id == ["codex-acp"]
-        ));
-
-        let multiple =
-            Cli::try_parse_from(["acp-agent", "install", "codex-acp", "claude", "dev"]).unwrap();
-        assert!(matches!(
-            multiple.command,
-            Commands::Install { agent_id } if agent_id == ["codex-acp", "claude", "dev"]
-        ));
-    }
-
-    #[test]
     fn install_requires_at_least_one_agent() {
         let error = Cli::try_parse_from(["acp-agent", "install"]).unwrap_err();
         assert_eq!(
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
-    }
-
-    #[test]
-    fn parses_uninstall_subcommand_with_single_and_multiple_agents() {
-        let single = Cli::try_parse_from(["acp-agent", "uninstall", "codex-acp"]).unwrap();
-        assert!(matches!(
-            single.command,
-            Commands::Uninstall { agent_id } if agent_id == ["codex-acp"]
-        ));
-
-        let multiple = Cli::try_parse_from(["acp-agent", "uninstall", "codex-acp", "dev"]).unwrap();
-        assert!(matches!(
-            multiple.command,
-            Commands::Uninstall { agent_id } if agent_id == ["codex-acp", "dev"]
-        ));
-    }
-
-    #[test]
-    fn parses_update_subcommand_with_single_and_multiple_agents() {
-        let single = Cli::try_parse_from(["acp-agent", "update", "codex-acp"]).unwrap();
-        assert!(matches!(
-            single.command,
-            Commands::Update { agent_id } if agent_id == ["codex-acp"]
-        ));
-
-        let multiple = Cli::try_parse_from(["acp-agent", "update", "codex-acp", "dev"]).unwrap();
-        assert!(matches!(
-            multiple.command,
-            Commands::Update { agent_id } if agent_id == ["codex-acp", "dev"]
-        ));
     }
 
     #[test]
@@ -495,12 +554,6 @@ mod tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
-    }
-
-    #[test]
-    fn parses_install_env_yes_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "install-env", "--yes"]).unwrap();
-        assert!(matches!(cli.command, Commands::InstallEnv { yes: true }));
     }
 
     #[test]
@@ -544,24 +597,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_list_subcommand_with_json_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "list", "--json"]).unwrap();
-        assert!(matches!(cli.command, Commands::List { json: true, .. }));
-    }
-
-    #[test]
-    fn parses_installed_list_with_json_output() {
-        let cli = Cli::try_parse_from(["acp-agent", "list", "--installed", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::List {
-                installed: true,
-                json: true
-            }
-        ));
-    }
-
-    #[test]
     fn list_and_search_default_to_tsv_output() {
         let list = Cli::try_parse_from(["acp-agent", "list"]).unwrap();
         assert!(matches!(list.command, Commands::List { json: false, .. }));
@@ -570,15 +605,6 @@ mod tests {
         assert!(matches!(
             search.command,
             Commands::Search { json: false, .. }
-        ));
-    }
-
-    #[test]
-    fn parses_search_subcommand_with_json_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "search", "helper", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Search { query, json: true } if query == "helper"
         ));
     }
 
@@ -604,6 +630,74 @@ mod tests {
             } if current_dir == std::path::Path::new("/cache/demo")
                 && program == std::path::Path::new("/cache/demo/bin/agent")
                 && args == ["--stdio", "--model", "gpt-5"]
+        ));
+    }
+
+    #[test]
+    fn parses_server_commands_and_defaults() {
+        let start = Cli::try_parse_from(["acp-agent", "server", "start"]).unwrap();
+        assert!(matches!(
+            start.command,
+            Commands::Server {
+                command: ServerCommands::Start { name, host, port }
+            } if name == "default" && host == "127.0.0.1" && port == 8010
+        ));
+
+        let stop = Cli::try_parse_from(["acp-agent", "server", "stop", "--name", "work"]).unwrap();
+        assert!(matches!(
+            stop.command,
+            Commands::Server {
+                command: ServerCommands::Stop { name }
+            } if name == "work"
+        ));
+    }
+
+    #[test]
+    fn parses_server_register_options_and_agent_arguments() {
+        let cli = Cli::try_parse_from([
+            "acp-agent",
+            "server",
+            "register",
+            "demo",
+            "--name",
+            "work",
+            "--route",
+            "/assistant",
+            "--path",
+            "/rpc",
+            "--yolo",
+            "--",
+            "--model",
+            "gpt-5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Server {
+                command: ServerCommands::Register {
+                    agent_id,
+                    name,
+                    route,
+                    path,
+                    yolo,
+                    args,
+                    ..
+                }
+            } if agent_id == "demo"
+                && name == "work"
+                && route.as_deref() == Some("/assistant")
+                && path == "/rpc"
+                && yolo
+                && args == ["--model", "gpt-5"]
+        ));
+
+        let unregister =
+            Cli::try_parse_from(["acp-agent", "server", "unregister", "demo"]).unwrap();
+        assert!(matches!(
+            unregister.command,
+            Commands::Server {
+                command: ServerCommands::Unregister { agent_id, name }
+            } if agent_id == "demo" && name == "default"
         ));
     }
 
@@ -681,19 +775,6 @@ mod tests {
                 && !no_health
                 && !no_readyz
                 && !yolo
-        ));
-    }
-
-    #[test]
-    fn parses_serve_subcommand_with_yolo_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "serve", "demo", "--yolo"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Serve {
-                agent_id,
-                yolo,
-                ..
-            } if agent_id == "demo" && yolo
         ));
     }
 

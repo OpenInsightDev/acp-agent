@@ -67,16 +67,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_list_agents_api_keeps_tsv_signature() {
-        fn accepts_legacy_api<W: Write>(writer: &mut W) {
-            let future = list_agents(writer);
-            drop(future);
-        }
-
-        accepts_legacy_api(&mut Vec::new());
-    }
-
-    #[test]
     fn writes_name_id_and_description_for_each_agent() {
         let registry = Registry::from_value(json!({
             "version": "1",

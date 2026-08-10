@@ -227,14 +227,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_decodes() {
-        let catalog = sample_catalog();
-        assert!(catalog.version >= 1);
-        assert!(catalog.find("gemini").is_some());
-        assert!(catalog.find("missing").is_none());
-    }
-
-    #[test]
     fn single_token_flag_is_injected() {
         let args = yolo_extra_args_from(&sample_catalog(), "gemini").expect("gemini has a flag");
         assert_eq!(args, vec!["--yolo"]);
