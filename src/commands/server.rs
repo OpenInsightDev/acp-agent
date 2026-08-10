@@ -101,7 +101,65 @@ struct ServerStatus {
     version: String,
 }
 
-/// Wire DTO for `POST /api/agents`; do not expose `ServeOptions` directly.
+/// Wire DTO for `GET /api/registrations`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RegistrationInfo {
+    id: String,
+    route: String,
+    path: String,
+    health_endpoint: bool,
+    readyz_endpoint: bool,
+}
+
+/// Lifecycle state of a named server as reported by the inspection commands.
+///
+/// `Running` means the daemon answered its control endpoint; `Starting` means
+/// a state record exists and the recorded process is alive but has not
+/// answered yet; `Stale` means the record exists but the recorded process is
+/// gone (a crash or unclean shutdown left the state file behind); `Stopped`
+/// means there is no state record at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerRunState {
+    Running,
+    Starting,
+    Stale,
+    Stopped,
+}
+
+impl ServerRunState {
+    fn as_str(self) -> &'static str {
+        match self {
+            ServerRunState::Running => "running",
+            ServerRunState::Starting => "starting",
+            ServerRunState::Stale => "stale",
+            ServerRunState::Stopped => "stopped",
+        }
+    }
+}
+
+/// Stable JSON record for one named server (`server list` / `server status`).
+///
+/// Field order is significant: it defines the deterministic JSON output.
+#[derive(Debug, Clone, Serialize)]
+struct ServerRecord {
+    name: String,
+    state: String,
+    listen_host: Option<String>,
+    port: Option<u16>,
+    address: Option<String>,
+    pid: Option<u32>,
+    version: Option<String>,
+}
+
+/// Stable JSON record for one agent registration (`server registrations`).
+#[derive(Debug, Clone, Serialize)]
+struct RegistrationRecord {
+    id: String,
+    route: String,
+    readiness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentRegistrationRequest {
@@ -167,6 +225,27 @@ struct RegisteredAgent {
     id: String,
     route: String,
     router: Router,
+    /// ACP endpoint path below the public route.
+    path: String,
+    /// Whether the agent router exposes `/health`.
+    health_endpoint: bool,
+    /// Whether the agent router exposes `/readyz`.
+    readyz_endpoint: bool,
+}
+
+impl RegisteredAgent {
+    /// Builds a registration with the serve-like defaults used by tests.
+    #[cfg(test)]
+    fn new(id: String, route: String, router: Router) -> Self {
+        Self {
+            id,
+            route,
+            router,
+            path: "/acp".to_string(),
+            health_endpoint: true,
+            readyz_endpoint: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -487,6 +566,436 @@ pub async fn unregister(agent_id: &str, name: &str) -> Result<String> {
     ))
 }
 
+/// Lists named servers recorded in the state directory and their states.
+///
+/// Servers are sorted by name; each record reports the configured host, the
+/// actual bound address, the daemon PID/version, and a lifecycle state.
+pub async fn list<W: Write>(writer: &mut W, json: bool) -> Result<()> {
+    let paths = ServerPaths::discover()?;
+    list_with_paths(writer, &paths, json).await
+}
+
+async fn list_with_paths<W: Write>(writer: &mut W, paths: &ServerPaths, json: bool) -> Result<()> {
+    let mut records = Vec::new();
+    let mut entries = tokio::fs::read_dir(&paths.directory)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read server state directory {}",
+                paths.directory.display()
+            )
+        })?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = strip_json_suffix(&file_name) else {
+            continue;
+        };
+        let Ok(state) = read_json::<ServerFile>(&paths.state_file(name)).await else {
+            continue;
+        };
+        if state.name != name {
+            continue;
+        }
+        records.push(server_record(name, &state).await);
+    }
+    records.sort_by(|left, right| left.name.cmp(&right.name));
+
+    if json {
+        serde_json::to_writer_pretty(&mut *writer, &records)
+            .context("failed to serialize server list")?;
+        writeln!(writer)?;
+    } else if records.is_empty() {
+        writeln!(writer, "no named servers found")?;
+    } else {
+        writeln!(
+            writer,
+            "{:<20} {:<9} {:<8} {:<6} {:<10} ADDRESS",
+            "NAME", "STATE", "PORT", "PID", "VERSION"
+        )?;
+        for record in &records {
+            writeln!(
+                writer,
+                "{:<20} {:<9} {:<8} {:<6} {:<10} {}",
+                record.name,
+                record.state,
+                record
+                    .port
+                    .map_or_else(|| "-".to_string(), |port| port.to_string()),
+                record
+                    .pid
+                    .map_or_else(|| "-".to_string(), |pid| pid.to_string()),
+                record.version.as_deref().unwrap_or("-"),
+                record.address.as_deref().unwrap_or("-"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Reports the state of a single named server.
+///
+/// Unlike `register`/`unregister`/`registrations`, a missing or stale record
+/// is not an error: `status` is the diagnostic command, so `stopped`, `stale`
+/// and `starting` are all reported as states (with exit code 0).
+pub async fn status<W: Write>(writer: &mut W, name: &str, json: bool) -> Result<()> {
+    validate_name(name)?;
+    let paths = ServerPaths::discover()?;
+    status_with_paths(writer, &paths, name, json).await
+}
+
+async fn status_with_paths<W: Write>(
+    writer: &mut W,
+    paths: &ServerPaths,
+    name: &str,
+    json: bool,
+) -> Result<()> {
+    validate_name(name)?;
+    let state_path = paths.state_file(name);
+    let record = match read_json::<ServerFile>(&state_path).await {
+        Ok(state) if state.name == name => server_record(name, &state).await,
+        _ => ServerRecord {
+            name: name.to_string(),
+            state: ServerRunState::Stopped.as_str().to_string(),
+            listen_host: None,
+            port: None,
+            address: None,
+            pid: None,
+            version: None,
+        },
+    };
+    write_status(writer, &record, json)?;
+    Ok(())
+}
+
+/// Lists the agent routes registered with a named server and probes each
+/// route's readiness endpoint.
+pub async fn registrations<W: Write>(writer: &mut W, name: &str, json: bool) -> Result<()> {
+    validate_name(name)?;
+    let state = load_live_server(name).await?;
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/registrations", state.control_url))
+        .send()
+        .await
+        .with_context(|| format!("failed to contact server \"{name}\""))?;
+    if !response.status().is_success() {
+        bail!("server \"{name}\" rejected the registrations request");
+    }
+    let registrations: Vec<RegistrationInfo> = response
+        .json()
+        .await
+        .context("failed to parse the registrations response")?;
+    let mut records = Vec::with_capacity(registrations.len());
+    for registration in registrations {
+        let (readiness, detail) = probe_registration_readiness(&state, &registration).await;
+        records.push(RegistrationRecord {
+            id: registration.id,
+            route: registration.route,
+            readiness,
+            detail,
+        });
+    }
+    records.sort_by(|left, right| {
+        left.route
+            .cmp(&right.route)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    if json {
+        serde_json::to_writer_pretty(&mut *writer, &records)
+            .context("failed to serialize registrations")?;
+        writeln!(writer)?;
+    } else if records.is_empty() {
+        writeln!(writer, "server \"{name}\" has no registered agents")?;
+    } else {
+        writeln!(writer, "{:<24} {:<28} READINESS", "AGENT", "ROUTE")?;
+        for record in &records {
+            let readiness = if let Some(detail) = &record.detail {
+                format!("{}: {}", record.readiness, detail)
+            } else {
+                record.readiness.clone()
+            };
+            writeln!(
+                writer,
+                "{:<24} {:<28} {}",
+                record.id, record.route, readiness
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Tails a named server's log with control tokens and credentials redacted.
+///
+/// The tail is bounded by `lines`; secrets are masked at read time so raw
+/// credentials never reach the terminal or automation output.
+pub async fn logs<W: Write>(writer: &mut W, name: &str, lines: usize, json: bool) -> Result<()> {
+    validate_name(name)?;
+    let log_path = ServerPaths::discover()?.log_file(name);
+    let content = match tokio::fs::read_to_string(&log_path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "server \"{name}\" has no log file; start it with `acp-agent server start --name {name}`"
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", log_path.display()));
+        }
+    };
+    let redacted: Vec<String> = tail_lines(&content, lines)
+        .into_iter()
+        .map(redact_line)
+        .collect();
+    if json {
+        serde_json::to_writer_pretty(
+            &mut *writer,
+            &serde_json::json!({ "name": name, "lines": redacted }),
+        )
+        .context("failed to serialize log tail")?;
+        writeln!(writer)?;
+    } else {
+        for line in redacted {
+            writeln!(writer, "{line}")?;
+        }
+    }
+    Ok(())
+}
+
+/// Builds the stable JSON record for a server with a readable state file.
+async fn server_record(name: &str, state: &ServerFile) -> ServerRecord {
+    let run_state = observed_state(state).await;
+    ServerRecord {
+        name: name.to_string(),
+        state: run_state.as_str().to_string(),
+        listen_host: Some(state.listen_host.clone()),
+        port: Some(state.port),
+        address: public_url(&state.listen_host, state.port).ok(),
+        pid: Some(state.pid),
+        version: Some(state.version.clone()),
+    }
+}
+
+/// Classifies a server's lifecycle from its state file alone.
+async fn observed_state(state: &ServerFile) -> ServerRunState {
+    if server_is_alive(state).await {
+        return ServerRunState::Running;
+    }
+    if process_alive(state.pid) {
+        return ServerRunState::Starting;
+    }
+    ServerRunState::Stale
+}
+
+/// Whether a process with `pid` exists, without signaling it.
+///
+/// On Unix this is `kill(pid, 0)`; `EPERM` means the process exists but is
+/// owned by another user, which still counts as alive. On Windows the
+/// `tasklist` filter is used as a fallback.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 never delivers a signal; `pid` comes from a state file
+    // written by this tool, and negative values cannot occur for u32.
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+        })
+        .unwrap_or(false)
+}
+
+/// Probes a registration's `/readyz` endpoint for readiness.
+///
+/// Returns `(readiness, detail)`: `ready` on 200, `not_ready` on 503 (with
+/// the failure detail), `disabled` when the route has no readyz endpoint, and
+/// `unknown` when the probe itself fails.
+async fn probe_registration_readiness(
+    state: &ServerFile,
+    registration: &RegistrationInfo,
+) -> (String, Option<String>) {
+    if !registration.readyz_endpoint {
+        return ("disabled".to_string(), None);
+    }
+    let url = format!("{}{}/readyz", state.control_url, registration.route);
+    let Ok(response) = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_millis(1500))
+        .send()
+        .await
+    else {
+        return (
+            "unknown".to_string(),
+            Some("readiness probe failed".to_string()),
+        );
+    };
+    match response.status() {
+        StatusCode::OK => ("ready".to_string(), None),
+        StatusCode::SERVICE_UNAVAILABLE => {
+            let detail = response.text().await.unwrap_or_default();
+            let detail = detail.trim().to_string();
+            ("not_ready".to_string(), Some(detail))
+        }
+        StatusCode::NOT_FOUND => ("disabled".to_string(), None),
+        _ => (
+            "unknown".to_string(),
+            Some(format!("unexpected probe status {}", response.status())),
+        ),
+    }
+}
+
+fn write_status<W: Write>(writer: &mut W, record: &ServerRecord, json: bool) -> Result<()> {
+    if json {
+        serde_json::to_writer_pretty(&mut *writer, record)
+            .context("failed to serialize server status")?;
+        writeln!(writer)?;
+        return Ok(());
+    }
+    writeln!(writer, "name:    {}", record.name)?;
+    writeln!(writer, "state:   {}", record.state)?;
+    if let Some(host) = &record.listen_host {
+        writeln!(writer, "host:    {host}")?;
+    }
+    if let Some(port) = record.port {
+        writeln!(writer, "port:    {port}")?;
+    }
+    if let Some(address) = &record.address {
+        writeln!(writer, "address: {address}")?;
+    }
+    if let Some(pid) = record.pid {
+        writeln!(writer, "pid:     {pid}")?;
+    }
+    if let Some(version) = &record.version {
+        writeln!(writer, "version: {version}")?;
+    }
+    match record.state.as_str() {
+        "starting" => writeln!(
+            writer,
+            "note: the server is starting; retry this command shortly"
+        )?,
+        "stale" => writeln!(
+            writer,
+            "note: state exists but the daemon is not responding; start it again with `acp-agent server start --name {}`",
+            record.name
+        )?,
+        "stopped" => writeln!(
+            writer,
+            "note: no state file found; start it with `acp-agent server start --name {}`",
+            record.name
+        )?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn strip_json_suffix(name: &str) -> Option<&str> {
+    name.strip_suffix(".json").filter(|name| !name.is_empty())
+}
+
+/// Masks secrets in a log line while preserving the surrounding context.
+///
+/// Values following common credential markers (`token=`, `api_key:`,
+/// `Authorization: Bearer`, …) are replaced with a fixed `[REDACTED]`
+/// placeholder. Only the value is masked, so the line stays useful for
+/// diagnosis; the marker itself is matched case-insensitively.
+fn redact_line(line: &str) -> String {
+    const MARKERS: &[&str] = &[
+        "authorization:",
+        "x-api-key:",
+        "x-auth-token:",
+        "api-key:",
+        "apikey:",
+        "api_key:",
+        "api_key=",
+        "api-key=",
+        "access_token:",
+        "access_token=",
+        "refresh_token:",
+        "refresh_token=",
+        "client_secret:",
+        "client_secret=",
+        "private_key:",
+        "private_key=",
+        "token=",
+        "token:",
+        "secret=",
+        "secret:",
+        "password=",
+        "password:",
+        "passwd=",
+        "passwd:",
+        "pwd=",
+        "bearer ",
+    ];
+
+    let lower = line.to_ascii_lowercase();
+    let mut output = String::with_capacity(line.len() + 32);
+    let mut cursor = 0;
+    let mut index = 0;
+    while index < line.len() {
+        let Some((position, marker_len)) = find_marker(&lower, index, MARKERS) else {
+            break;
+        };
+        let header_style = line.as_bytes()[position + marker_len - 1] == b':';
+        // Keep the marker (`token=`) and mask only the value, so the line
+        // stays diagnosable while the credential is gone.
+        let mut value_start = position + marker_len;
+        while value_start < line.len() && line.as_bytes()[value_start].is_ascii_whitespace() {
+            value_start += 1;
+        }
+        let mut value_end = value_start;
+        while value_end < line.len() {
+            let byte = line.as_bytes()[value_end];
+            // Header-style values (`Bearer <token>`) may contain spaces;
+            // assignment-style values stop at the first space.
+            if matches!(byte, b',' | b'}' | b')' | b']')
+                || (!header_style && byte.is_ascii_whitespace())
+            {
+                break;
+            }
+            value_end += 1;
+        }
+        output.push_str(&line[cursor..value_start]);
+        output.push_str("[REDACTED]");
+        cursor = value_end;
+        index = value_end;
+    }
+    output.push_str(&line[cursor..]);
+    output
+}
+
+fn find_marker(haystack: &str, start: usize, markers: &[&str]) -> Option<(usize, usize)> {
+    let haystack = &haystack[start..];
+    markers
+        .iter()
+        .filter_map(|marker| {
+            haystack
+                .find(marker)
+                .map(|position| (start + position, marker.len()))
+        })
+        .min_by_key(|(position, _)| *position)
+}
+
+/// Returns the last `max_lines` lines of `content`, dropping a trailing
+/// newline so an empty file yields no lines.
+fn tail_lines(content: &str, max_lines: usize) -> Vec<&str> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].to_vec()
+}
+
 /// Runs the foreground process behind the hidden `__server-run` command.
 pub async fn run(name: String, host: String, port: u16) -> Result<()> {
     validate_name(&name)?;
@@ -585,6 +1094,7 @@ fn server_router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/api/status", get(server_status))
+        .route("/api/registrations", get(server_registrations))
         .route("/api/agents", post(add_agent).delete(remove_agent))
         .route("/api/shutdown", post(shutdown))
         .fallback(dispatch_agent)
@@ -597,6 +1107,34 @@ async fn server_status(State(state): State<ServerState>) -> Json<ServerStatus> {
         pid: std::process::id(),
         version: SERVER_PROTOCOL_VERSION.to_string(),
     })
+}
+
+/// `GET /api/registrations`: lists the currently registered agent routes.
+///
+/// Registrations are sorted by route (then id) so responses are
+/// deterministic for automation. Readiness is intentionally *not* reported
+/// here: probing the agent's `/readyz` happens on the CLI side so the list
+/// stays cheap and consistent.
+async fn server_registrations(State(state): State<ServerState>) -> Json<Vec<RegistrationInfo>> {
+    let mut registrations: Vec<_> = {
+        let agents = state.agents.read().await;
+        agents
+            .values()
+            .map(|agent| RegistrationInfo {
+                id: agent.id.clone(),
+                route: agent.route.clone(),
+                path: agent.path.clone(),
+                health_endpoint: agent.health_endpoint,
+                readyz_endpoint: agent.readyz_endpoint,
+            })
+            .collect()
+    };
+    registrations.sort_by(|left, right| {
+        left.route
+            .cmp(&right.route)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Json(registrations)
 }
 
 async fn add_agent(
@@ -681,6 +1219,9 @@ async fn add_agent(
         id: registration.id,
         route: registration.route,
         router,
+        path: registration.serve.path,
+        health_endpoint: registration.serve.health_endpoint,
+        readyz_endpoint: registration.serve.readyz_endpoint,
     };
 
     match insert_agent(&state, entry).await {
@@ -1144,6 +1685,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn redacts_credential_values_and_keeps_context() {
+        assert_eq!(
+            redact_line("Authorization: Bearer abc.def.ghi"),
+            "Authorization: [REDACTED]"
+        );
+        assert_eq!(
+            redact_line("error: invalid token=sk-12345 for agent"),
+            "error: invalid token=[REDACTED] for agent"
+        );
+        assert_eq!(redact_line("DB_PASSWORD=hunter2"), "DB_PASSWORD=[REDACTED]");
+        assert_eq!(
+            redact_line("api_key=abc123, retrying"),
+            "api_key=[REDACTED], retrying"
+        );
+        assert_eq!(redact_line("token: \"secret-value\""), "token: [REDACTED]");
+        // Case-insensitive markers; unrelated text stays untouched.
+        assert_eq!(
+            redact_line("x-api-key: sk-live-42"),
+            "x-api-key: [REDACTED]"
+        );
+        assert_eq!(
+            redact_line("connection refused, no secrets here"),
+            "connection refused, no secrets here"
+        );
+        assert_eq!(
+            redact_line("password must be at least 8 chars"),
+            "password must be at least 8 chars"
+        );
+    }
+
+    #[test]
+    fn tails_only_the_last_lines() {
+        assert_eq!(tail_lines("a\nb\nc\n", 2), vec!["b", "c"]);
+        assert_eq!(tail_lines("a\n", 5), vec!["a"]);
+        assert_eq!(tail_lines("", 5), Vec::<&str>::new());
+        assert_eq!(tail_lines("a\nb\n", 0), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn distinguishes_starting_from_stale_state() {
+        let dead_endpoint = ServerFile {
+            name: "test".into(),
+            listen_host: "127.0.0.1".into(),
+            port: 1,
+            control_url: "http://127.0.0.1:1".into(),
+            pid: std::process::id(),
+            version: SERVER_PROTOCOL_VERSION.into(),
+        };
+        // The recorded PID (this test process) is alive but the control
+        // endpoint does not answer: the server is still starting.
+        assert_eq!(
+            observed_state(&dead_endpoint).await,
+            ServerRunState::Starting
+        );
+
+        // A recorded PID that no longer exists: the daemon died and left a
+        // stale state record behind.
+        let stale = ServerFile {
+            pid: 999_999_999,
+            ..dead_endpoint
+        };
+        assert_eq!(observed_state(&stale).await, ServerRunState::Stale);
+    }
+
+    #[tokio::test]
+    async fn status_reports_stopped_for_missing_state_and_json_is_deterministic() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ServerPaths::new(temporary.path().join("servers")).unwrap();
+
+        // Seed one stale record plus one non-state file to ignore.
+        write_private_json_atomic(
+            &paths.state_file("work"),
+            &ServerFile {
+                name: "work".into(),
+                listen_host: "127.0.0.1".into(),
+                port: 8020,
+                control_url: "http://127.0.0.1:8020".into(),
+                pid: 999_999_998,
+                version: SERVER_PROTOCOL_VERSION.into(),
+            },
+        )
+        .unwrap();
+        std::fs::write(paths.log_file("work"), b"ignored\n").unwrap();
+
+        let mut output = Vec::new();
+        list_with_paths(&mut output, &paths, true).await.unwrap();
+        let records: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(records.as_array().unwrap().len(), 1);
+        assert_eq!(records[0]["name"], "work");
+        assert_eq!(records[0]["state"], "stale");
+        assert_eq!(records[0]["port"], 8020);
+        // Deterministic field order for automation.
+        let serialized = String::from_utf8(output).unwrap();
+        let name_pos = serialized.find("\"name\"").unwrap();
+        let state_pos = serialized.find("\"state\"").unwrap();
+        let host_pos = serialized.find("\"listen_host\"").unwrap();
+        assert!(name_pos < state_pos && state_pos < host_pos);
+
+        let mut status_out = Vec::new();
+        status_with_paths(&mut status_out, &paths, "missing", true)
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_slice(&status_out).unwrap();
+        assert_eq!(status["name"], "missing");
+        assert_eq!(status["state"], "stopped");
+        assert!(status["pid"].is_null());
+    }
+
+    #[test]
     fn validates_names_and_routes() {
         assert!(validate_name("default").is_ok());
         assert!(validate_name("team.one").is_ok());
@@ -1567,21 +2217,17 @@ mod tests {
         let state = test_state();
         insert_agent(
             &state,
-            RegisteredAgent {
-                id: "root".into(),
-                route: "/agent".into(),
-                router: echo_router(),
-            },
+            RegisteredAgent::new("root".into(), "/agent".into(), echo_router()),
         )
         .await
         .unwrap();
         insert_agent(
             &state,
-            RegisteredAgent {
-                id: "nested".into(),
-                route: "/agent/child".into(),
-                router: Router::new().fallback(any(|| async { "nested" })),
-            },
+            RegisteredAgent::new(
+                "nested".into(),
+                "/agent/child".into(),
+                Router::new().fallback(any(|| async { "nested" })),
+            ),
         )
         .await
         .unwrap();
@@ -1640,11 +2286,7 @@ mod tests {
         let state = test_state();
         insert_agent(
             &state,
-            RegisteredAgent {
-                id: "demo".into(),
-                route: "/demo".into(),
-                router: target,
-            },
+            RegisteredAgent::new("demo".into(), "/demo".into(), target),
         )
         .await
         .unwrap();
@@ -1671,21 +2313,13 @@ mod tests {
         let state = test_state();
         insert_agent(
             &state,
-            RegisteredAgent {
-                id: "demo".into(),
-                route: "/demo".into(),
-                router: echo_router(),
-            },
+            RegisteredAgent::new("demo".into(), "/demo".into(), echo_router()),
         )
         .await
         .unwrap();
         let duplicate_id = insert_agent(
             &state,
-            RegisteredAgent {
-                id: "demo".into(),
-                route: "/other".into(),
-                router: echo_router(),
-            },
+            RegisteredAgent::new("demo".into(), "/other".into(), echo_router()),
         )
         .await
         .unwrap_err();
@@ -1697,11 +2331,7 @@ mod tests {
         assert_eq!(error["error"], "agent_id_conflict");
         let duplicate_route = insert_agent(
             &state,
-            RegisteredAgent {
-                id: "other".into(),
-                route: "/demo".into(),
-                router: echo_router(),
-            },
+            RegisteredAgent::new("other".into(), "/demo".into(), echo_router()),
         )
         .await
         .unwrap_err();
@@ -1811,6 +2441,72 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn registrations_endpoint_reports_routes_and_flags() {
+        let state = test_state();
+        insert_agent(
+            &state,
+            RegisteredAgent {
+                id: "demo".into(),
+                route: "/demo".into(),
+                router: echo_router(),
+                path: "/rpc".into(),
+                health_endpoint: false,
+                readyz_endpoint: false,
+            },
+        )
+        .await
+        .unwrap();
+        insert_agent(
+            &state,
+            RegisteredAgent::new("zulu".into(), "/zulu".into(), echo_router()),
+        )
+        .await
+        .unwrap();
+        let (address, task) = spawn_axum(server_router(state)).await;
+        let response = reqwest::get(format!("http://{address}/api/registrations"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let registrations: Value = response.json().await.unwrap();
+        assert_eq!(registrations.as_array().unwrap().len(), 2);
+        assert_eq!(registrations[0]["route"], "/demo");
+        assert_eq!(registrations[0]["id"], "demo");
+        assert_eq!(registrations[0]["path"], "/rpc");
+        assert_eq!(registrations[0]["health_endpoint"], false);
+        assert_eq!(registrations[0]["readyz_endpoint"], false);
+        assert_eq!(registrations[1]["route"], "/zulu");
+        assert_eq!(registrations[1]["readyz_endpoint"], true);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_distinguishes_ready_and_disabled() {
+        let (address, task) = spawn_axum(server_router(test_state())).await;
+        let state = ServerFile {
+            name: "test".into(),
+            listen_host: "127.0.0.1".into(),
+            port: address.port(),
+            control_url: format!("http://{address}"),
+            pid: 1,
+            version: SERVER_PROTOCOL_VERSION.into(),
+        };
+        let (readiness, detail) = probe_registration_readiness(
+            &state,
+            &RegistrationInfo {
+                id: "demo".into(),
+                route: "/demo".into(),
+                path: "/acp".into(),
+                health_endpoint: true,
+                readyz_endpoint: false,
+            },
+        )
+        .await;
+        assert_eq!(readiness, "disabled");
+        assert!(detail.is_none());
+        task.abort();
+    }
+
     #[cfg(unix)]
     mod acp_network {
         use agent_client_protocol::AcpAgentConfig;
@@ -1866,11 +2562,7 @@ done"#,
                 .unwrap();
                 insert_agent(
                     &state,
-                    RegisteredAgent {
-                        id: "demo".into(),
-                        route: "/demo".into(),
-                        router,
-                    },
+                    RegisteredAgent::new("demo".into(), "/demo".into(), router),
                 )
                 .await
                 .unwrap();

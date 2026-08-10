@@ -154,6 +154,15 @@ acp-agent server register claude --route /reviewer -- --model opus
 |             | serve-like settings            | —           | [`--path`](#serve-parameters), repeated [`--cors-origin`](#serve-parameters), [`--allow-any-origin`](#serve-parameters), [`--no-health`](#serve-parameters), [`--no-readyz`](#serve-parameters), [`--yolo`](#serve-parameters), and trailing [`-- <args>`](#serve-parameters), as in the [serve parameter table](#serve-parameters). |
 | `unregister`| `<agent-id>`                  | _(required)_ | Agent to remove from the server.                                        |
 |             | `--name <name>`               | `default`   | Target server name.                                                      |
+| `list`      | —                             | —           | List every recorded named server and its lifecycle state.                |
+|             | `--json`                      | off         | Emit server records as structured JSON (deterministic field order).      |
+| `status`    | `--name <name>`               | `default`   | Show one server's state, configured and actual address, PID, and version.|
+|             | `--json`                      | off         | Emit the server record as structured JSON.                               |
+| `registrations`| `--name <name>`             | `default`   | List registered agent IDs, route prefixes, and readiness.                |
+|             | `--json`                      | off         | Emit registration records as structured JSON.                            |
+| `logs`      | `--name <name>`               | `default`   | Tail a named server's log with credentials redacted.                     |
+|             | `--lines <n>`                 | `50`        | Number of log lines to tail.                                             |
+|             | `--json`                      | off         | Emit `{name, lines}` with the redacted tail.                             |
 
 The server name defaults to `default`.
 Use `--name` on every command to manage another server independently:
@@ -163,6 +172,32 @@ acp-agent server start --name work --port 8020
 acp-agent server register codex-acp --name work
 acp-agent server unregister codex-acp --name work
 acp-agent server stop --name work
+```
+
+### Inspection
+
+`server list` reports every recorded server. Each server has one of four states:
+
+- `running` — the daemon answered its control endpoint.
+- `starting` — the state file exists and the recorded process is alive, but it has not answered yet.
+- `stale` — the state file exists but the recorded process is gone (crash or unclean shutdown); starting the server again replaces it.
+- `stopped` — no state file exists (`status` only).
+
+```sh
+acp-agent server list
+acp-agent server status --name work
+acp-agent server registrations --name work
+acp-agent server logs --name work --lines 20
+```
+
+`server registrations` probes each route's `/readyz` endpoint and reports `ready`, `not_ready` (with the failure detail), `disabled` (no readyz endpoint), or `unknown`.
+`server logs` masks credential values (`token=`, `Authorization: Bearer`, `DB_PASSWORD=`, …) while keeping the surrounding line intact; the redaction is applied to the output, the raw log file is left untouched.
+Add `--json` to any of these commands for automation-friendly output with deterministic field ordering:
+
+```sh
+acp-agent server list --json | jq '.[] | select(.state == "stale") | .name'
+acp-agent server registrations --name work --json | jq '.[] | select(.readiness != "ready")'
+acp-agent server logs --name work --json | jq '.lines'
 ```
 
 ### Routes
