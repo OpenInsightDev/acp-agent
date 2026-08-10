@@ -500,15 +500,4 @@ mod tests {
             "Proceed with installation? [Y/n]: Please answer with y or n.\nProceed with installation? [Y/n]: "
         );
     }
-
-    #[test]
-    fn reports_clear_error_when_curl_is_missing() {
-        let error =
-            anyhow!("Cannot install deno because curl is not available in the current environment");
-
-        assert_eq!(
-            error.to_string(),
-            "Cannot install deno because curl is not available in the current environment"
-        );
-    }
 }

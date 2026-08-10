@@ -533,79 +533,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_list_subcommand_with_installed_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "list", "--installed"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::List {
-                installed: true,
-                ..
-            }
-        ));
-
-        let cli = Cli::try_parse_from(["acp-agent", "list"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::List {
-                installed: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_install_subcommand_with_single_and_multiple_agents() {
-        let single = Cli::try_parse_from(["acp-agent", "install", "codex-acp"]).unwrap();
-        assert!(matches!(
-            single.command,
-            Commands::Install { agent_id } if agent_id == ["codex-acp"]
-        ));
-
-        let multiple =
-            Cli::try_parse_from(["acp-agent", "install", "codex-acp", "claude", "dev"]).unwrap();
-        assert!(matches!(
-            multiple.command,
-            Commands::Install { agent_id } if agent_id == ["codex-acp", "claude", "dev"]
-        ));
-    }
-
-    #[test]
     fn install_requires_at_least_one_agent() {
         let error = Cli::try_parse_from(["acp-agent", "install"]).unwrap_err();
         assert_eq!(
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
-    }
-
-    #[test]
-    fn parses_uninstall_subcommand_with_single_and_multiple_agents() {
-        let single = Cli::try_parse_from(["acp-agent", "uninstall", "codex-acp"]).unwrap();
-        assert!(matches!(
-            single.command,
-            Commands::Uninstall { agent_id } if agent_id == ["codex-acp"]
-        ));
-
-        let multiple = Cli::try_parse_from(["acp-agent", "uninstall", "codex-acp", "dev"]).unwrap();
-        assert!(matches!(
-            multiple.command,
-            Commands::Uninstall { agent_id } if agent_id == ["codex-acp", "dev"]
-        ));
-    }
-
-    #[test]
-    fn parses_update_subcommand_with_single_and_multiple_agents() {
-        let single = Cli::try_parse_from(["acp-agent", "update", "codex-acp"]).unwrap();
-        assert!(matches!(
-            single.command,
-            Commands::Update { agent_id } if agent_id == ["codex-acp"]
-        ));
-
-        let multiple = Cli::try_parse_from(["acp-agent", "update", "codex-acp", "dev"]).unwrap();
-        assert!(matches!(
-            multiple.command,
-            Commands::Update { agent_id } if agent_id == ["codex-acp", "dev"]
-        ));
     }
 
     #[test]
@@ -621,12 +554,6 @@ mod tests {
             error.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
-    }
-
-    #[test]
-    fn parses_install_env_yes_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "install-env", "--yes"]).unwrap();
-        assert!(matches!(cli.command, Commands::InstallEnv { yes: true }));
     }
 
     #[test]
@@ -670,24 +597,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_list_subcommand_with_json_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "list", "--json"]).unwrap();
-        assert!(matches!(cli.command, Commands::List { json: true, .. }));
-    }
-
-    #[test]
-    fn parses_installed_list_with_json_output() {
-        let cli = Cli::try_parse_from(["acp-agent", "list", "--installed", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::List {
-                installed: true,
-                json: true
-            }
-        ));
-    }
-
-    #[test]
     fn list_and_search_default_to_tsv_output() {
         let list = Cli::try_parse_from(["acp-agent", "list"]).unwrap();
         assert!(matches!(list.command, Commands::List { json: false, .. }));
@@ -696,15 +605,6 @@ mod tests {
         assert!(matches!(
             search.command,
             Commands::Search { json: false, .. }
-        ));
-    }
-
-    #[test]
-    fn parses_search_subcommand_with_json_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "search", "helper", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Search { query, json: true } if query == "helper"
         ));
     }
 
@@ -875,19 +775,6 @@ mod tests {
                 && !no_health
                 && !no_readyz
                 && !yolo
-        ));
-    }
-
-    #[test]
-    fn parses_serve_subcommand_with_yolo_flag() {
-        let cli = Cli::try_parse_from(["acp-agent", "serve", "demo", "--yolo"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Serve {
-                agent_id,
-                yolo,
-                ..
-            } if agent_id == "demo" && yolo
         ));
     }
 

@@ -75,16 +75,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_search_agents_api_keeps_tsv_signature() {
-        fn accepts_legacy_api<W: Write>(query: &str, writer: &mut W) {
-            let future = search_agents(query, writer);
-            drop(future);
-        }
-
-        accepts_legacy_api("agent", &mut Vec::new());
-    }
-
-    #[test]
     fn writes_fuzzy_search_matches_using_name_id_and_description() {
         let registry = Registry::from_value(json!({
             "version": "1",

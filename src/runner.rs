@@ -178,7 +178,9 @@ fn package_command_spec(
 ) -> CommandSpec {
     let mut args: Vec<String> = runner_args.iter().map(|arg| (*arg).to_string()).collect();
     args.push(package.to_string());
-    args.extend(default_args.into_iter().flatten().cloned());
+    if let Some(default_args) = default_args {
+        args.extend_from_slice(default_args);
+    }
     args.extend_from_slice(user_args);
 
     CommandSpec {
@@ -195,13 +197,7 @@ fn binary_command_spec(
     target: &BinaryTarget,
     user_args: &[String],
 ) -> CommandSpec {
-    let mut args: Vec<String> = target
-        .args
-        .as_deref()
-        .into_iter()
-        .flatten()
-        .cloned()
-        .collect();
+    let mut args = target.args.clone().unwrap_or_default();
     args.extend_from_slice(user_args);
 
     CommandSpec {
