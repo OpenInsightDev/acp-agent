@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
@@ -36,6 +37,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const SERVER_PROTOCOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SERVER_STATE_DIR_ENV: &str = "ACP_AGENT_SERVER_STATE_DIR";
+#[cfg(test)]
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Options accepted by `server start`.
@@ -344,6 +346,7 @@ async fn start_with(
         .stderr(Stdio::from(stderr));
     detach_process(&mut command);
     let mut child = command.spawn().context("failed to start server process")?;
+    let child_pid = child.id().context("failed to identify server process")?;
 
     let ready = async {
         loop {
@@ -359,6 +362,7 @@ async fn start_with(
             if let Ok(state) = read_json::<ServerFile>(&path).await
                 && state.name == options.name
                 && state.version == SERVER_PROTOCOL_VERSION
+                && state.pid == child_pid
                 && server_is_alive(&state).await
             {
                 return Ok(state);
@@ -369,13 +373,13 @@ async fn start_with(
     let state = match timeout(start_timeout, ready).await {
         Ok(Ok(state)) => state,
         Ok(Err(error)) => {
-            cleanup_failed_start(&mut child, &path)
+            cleanup_failed_start(&mut child, &path, child_pid)
                 .await
                 .with_context(|| format!("failed to clean up after startup error: {error:#}"))?;
             return Err(error);
         }
         Err(_) => {
-            cleanup_failed_start(&mut child, &path)
+            cleanup_failed_start(&mut child, &path, child_pid)
                 .await
                 .context("failed to clean up after server startup timeout")?;
             bail!(
@@ -525,7 +529,7 @@ async fn run_with(
         version: SERVER_PROTOCOL_VERSION.to_string(),
     };
     let state_path = paths.state_file(&name);
-    write_private_json_atomic(&state_path, &file)?;
+    write_private_json_exclusive(&state_path, &file, &name)?;
     eprintln!(
         "Serving named ACP server \"{name}\" at {}",
         public_url(&file.listen_host, file.port)?
@@ -851,11 +855,10 @@ async fn server_is_alive(state: &ServerFile) -> bool {
     if !response.status().is_success() {
         return false;
     }
-    response.json::<ServerStatus>().await.is_ok_and(|status| {
-        status.name == state.name
-            && status.version == state.version
-            && status.version == SERVER_PROTOCOL_VERSION
-    })
+    response
+        .json::<ServerStatus>()
+        .await
+        .is_ok_and(|status| status.name == state.name && status.version == state.version)
 }
 
 fn route_matches(route: &str, path: &str) -> bool {
@@ -943,6 +946,7 @@ async fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+#[cfg(test)]
 fn write_private_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value).context("failed to serialize server state")?;
     let parent = path
@@ -998,6 +1002,46 @@ fn write_private_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> 
     result
 }
 
+fn write_private_json_exclusive(
+    path: &Path,
+    value: &impl Serialize,
+    server_name: &str,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value).context("failed to serialize server state")?;
+    let parent = path
+        .parent()
+        .context("server state path has no parent directory")?;
+    ensure_private_directory(parent)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("server \"{server_name}\" is already starting or running")
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create server state {}", path.display()));
+        }
+    };
+    let result = (|| -> Result<()> {
+        file.write_all(&bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
 fn control_url(listen_host: &str, port: u16) -> Result<String> {
     let host = match listen_host {
         "0.0.0.0" => "127.0.0.1",
@@ -1048,12 +1092,23 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn cleanup_failed_start(child: &mut tokio::process::Child, state_path: &Path) -> Result<()> {
+async fn cleanup_failed_start(
+    child: &mut tokio::process::Child,
+    state_path: &Path,
+    child_pid: u32,
+) -> Result<()> {
     let _ = child.start_kill();
     child
         .wait()
         .await
         .context("failed to wait for server process during cleanup")?;
+    let remove_state = match read_json::<ServerFile>(state_path).await {
+        Ok(state) => state.pid == child_pid,
+        Err(_) => true,
+    };
+    if !remove_state {
+        return Ok(());
+    }
     match tokio::fs::remove_file(state_path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1420,7 +1475,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_requires_matching_name_and_version() {
+    async fn readiness_requires_status_to_match_the_state_file() {
         let (address, task) = spawn_axum(server_router(test_state())).await;
         let mut state = ServerFile {
             name: "test".into(),
@@ -1436,6 +1491,33 @@ mod tests {
         state.name = "test".into();
         state.version = "incompatible".into();
         assert!(!server_is_alive(&state).await);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_accepts_a_running_server_from_an_older_release() {
+        let version = "0.0.4";
+        let router = Router::new().route(
+            "/api/status",
+            get(move || async move {
+                Json(ServerStatus {
+                    name: "test".into(),
+                    pid: 1,
+                    version: version.into(),
+                })
+            }),
+        );
+        let (address, task) = spawn_axum(router).await;
+        let state = ServerFile {
+            name: "test".into(),
+            listen_host: "127.0.0.1".into(),
+            port: address.port(),
+            control_url: format!("http://{address}"),
+            pid: 1,
+            version: version.into(),
+        };
+
+        assert!(server_is_alive(&state).await);
         task.abort();
     }
 
