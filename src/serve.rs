@@ -257,7 +257,6 @@ struct LaunchState {
     protocol_responded: AtomicBool,
     initialize_requested: AtomicBool,
     stderr_tail: Mutex<String>,
-    outcome_recorded: AtomicBool,
 }
 
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
@@ -385,6 +384,8 @@ impl ObservedAgent {
 
 // Records once from the connection result or, on cancellation, from the
 // signals collected before the future was dropped.
+// `complete` consumes the guard and `Drop` covers the cancellation path, so
+// exactly-once recording is guaranteed by ownership without shared state.
 struct LaunchGuard {
     state: Arc<LaunchState>,
     health: AgentHealth,
@@ -395,29 +396,19 @@ impl LaunchGuard {
     fn complete(mut self, result: &agent_client_protocol::Result<()>) {
         self.completed = true;
         match result {
-            Ok(()) => self.record(Outcome::Success),
-            Err(error) => self.record(Outcome::Failure(error.to_string())),
-        }
-    }
-
-    fn record(&self, outcome: Outcome) {
-        if self.state.outcome_recorded.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        match outcome {
-            Outcome::Success => self.health.record_ok(),
-            Outcome::Failure(detail) => self.health.record_failure(detail),
+            Ok(()) => self.health.record_ok(),
+            Err(error) => self.health.record_failure(error.to_string()),
         }
     }
 }
 
 impl Drop for LaunchGuard {
     fn drop(&mut self) {
-        if self.completed || self.state.outcome_recorded.load(Ordering::SeqCst) {
+        if self.completed {
             return;
         }
         if self.state.protocol_responded.load(Ordering::SeqCst) {
-            self.record(Outcome::Success);
+            self.health.record_ok();
         } else if self.state.initialize_requested.load(Ordering::SeqCst) {
             let tail = self
                 .state
@@ -430,14 +421,9 @@ impl Drop for LaunchGuard {
             } else {
                 format!("agent connection ended before completing initialize; stderr tail:\n{tail}")
             };
-            self.record(Outcome::Failure(detail));
+            self.health.record_failure(detail);
         }
     }
-}
-
-enum Outcome {
-    Success,
-    Failure(String),
 }
 
 impl ConnectTo<Client> for ObservedAgent {
@@ -612,6 +598,91 @@ mod tests {
                 .to_string()
                 .contains("ACP endpoint path must start with '/'")
         );
+    }
+
+    #[test]
+    fn launch_guard_records_success_once_from_connection_result() {
+        let state = Arc::new(LaunchState::default());
+        state.protocol_responded.store(true, Ordering::SeqCst);
+        let health = AgentHealth::default();
+        let guard = LaunchGuard {
+            state: state.clone(),
+            health: health.clone(),
+            completed: false,
+        };
+
+        guard.complete(&Ok(()));
+        // The consumed guard is dropped at the end of this scope; it must not
+        // record a second outcome.
+
+        let recorded = health.state.lock().unwrap();
+        assert_eq!(recorded.attempts, 1);
+        assert_eq!(recorded.failures, 0);
+        assert!(!recorded.last_attempt_failed);
+    }
+
+    #[test]
+    fn launch_guard_drop_records_success_after_protocol_response() {
+        let state = Arc::new(LaunchState::default());
+        state.protocol_responded.store(true, Ordering::SeqCst);
+        let health = AgentHealth::default();
+        {
+            let _guard = LaunchGuard {
+                state: state.clone(),
+                health: health.clone(),
+                completed: false,
+            };
+        }
+
+        let recorded = health.state.lock().unwrap();
+        assert_eq!(recorded.attempts, 1);
+        assert_eq!(recorded.failures, 0);
+        assert!(!recorded.last_attempt_failed);
+    }
+
+    #[test]
+    fn launch_guard_drop_records_failure_with_stderr_tail_after_initialize() {
+        let state = Arc::new(LaunchState::default());
+        state.initialize_requested.store(true, Ordering::SeqCst);
+        state.push_stderr("error: boom");
+        let health = AgentHealth::default();
+        {
+            let _guard = LaunchGuard {
+                state: state.clone(),
+                health: health.clone(),
+                completed: false,
+            };
+        }
+
+        let recorded = health.state.lock().unwrap();
+        assert_eq!(recorded.attempts, 1);
+        assert_eq!(recorded.failures, 1);
+        assert!(recorded.last_attempt_failed);
+        assert!(
+            recorded
+                .last_failure
+                .as_ref()
+                .unwrap()
+                .detail
+                .contains("error: boom")
+        );
+    }
+
+    #[test]
+    fn launch_guard_drop_without_signals_records_nothing() {
+        let state = Arc::new(LaunchState::default());
+        let health = AgentHealth::default();
+        {
+            let _guard = LaunchGuard {
+                state: state.clone(),
+                health: health.clone(),
+                completed: false,
+            };
+        }
+
+        let recorded = health.state.lock().unwrap();
+        assert_eq!(recorded.attempts, 0);
+        assert_eq!(recorded.failures, 0);
     }
 
     #[cfg(unix)]
