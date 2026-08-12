@@ -386,7 +386,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 return Ok(CliExit::Success);
             }
             environment::write_installation_plan(writer, &plan)?;
-            if !yes && !environment::confirm_installation(writer)? {
+            if !yes && !environment::confirm_installation(writer).await? {
                 environment::write_cancelled(writer)?;
                 return Ok(CliExit::Success);
             }

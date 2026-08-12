@@ -1,6 +1,7 @@
-use std::io::{self, BufRead, Write};
+use std::io::Write;
 
 use anyhow::Result;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::installer::environment::{
     EnvironmentReport, InstallationPlan, InstallationResult, ToolAvailability,
@@ -35,9 +36,12 @@ pub(super) fn write_installation_plan<W: Write>(
     Ok(())
 }
 
-pub(super) fn confirm_installation<W: Write>(writer: &mut W) -> Result<bool> {
-    let stdin = io::stdin();
-    prompt_for_installation(&mut stdin.lock(), writer)
+/// Asks the user to confirm installation and returns their decision.
+///
+/// Reads stdin through `tokio::io::stdin`, which performs the blocking read
+/// on a dedicated blocking thread, so no Tokio worker waits on user input.
+pub(super) async fn confirm_installation<W: Write>(writer: &mut W) -> Result<bool> {
+    prompt_for_installation(&mut tokio::io::BufReader::new(tokio::io::stdin()), writer).await
 }
 
 pub(super) fn write_cancelled<W: Write>(writer: &mut W) -> Result<()> {
@@ -94,13 +98,16 @@ fn write_tool_group<W: Write>(writer: &mut W, tools: &[ToolAvailability]) -> Res
     Ok(())
 }
 
-fn prompt_for_installation<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> Result<bool> {
+async fn prompt_for_installation<R: AsyncBufRead + Unpin, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<bool> {
     loop {
         write!(writer, "Proceed with installation? [Y/n]: ")?;
         writer.flush()?;
 
         let mut input = String::new();
-        if reader.read_line(&mut input)? == 0 {
+        if reader.read_line(&mut input).await? == 0 {
             return Ok(true);
         }
 
@@ -114,29 +121,81 @@ fn prompt_for_installation<R: BufRead, W: Write>(reader: &mut R, writer: &mut W)
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
-    #[test]
-    fn prompts_default_to_yes_on_empty_input() {
+    use super::*;
+    use tokio::io::AsyncRead;
+
+    #[tokio::test]
+    async fn prompts_default_to_yes_on_empty_input() {
         let mut input = io::Cursor::new("\n");
         let mut output = Vec::new();
 
-        assert!(prompt_for_installation(&mut input, &mut output).unwrap());
+        assert!(prompt_for_installation(&mut input, &mut output)
+            .await
+            .unwrap());
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Proceed with installation? [Y/n]: "
         );
     }
 
-    #[test]
-    fn prompts_accept_no_after_retry() {
+    #[tokio::test]
+    async fn prompts_accept_no_after_retry() {
         let mut input = io::Cursor::new("maybe\nn\n");
         let mut output = Vec::new();
 
-        assert!(!prompt_for_installation(&mut input, &mut output).unwrap());
+        assert!(!prompt_for_installation(&mut input, &mut output)
+            .await
+            .unwrap());
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Proceed with installation? [Y/n]: Please answer with y or n.\nProceed with installation? [Y/n]: "
         );
+    }
+
+    /// A reader that never produces input, like a terminal waiting on the user.
+    struct PendingInput;
+
+    impl AsyncRead for PendingInput {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncBufRead for PendingInput {
+        fn poll_fill_buf(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+            Poll::Pending
+        }
+
+        fn consume(self: Pin<&mut Self>, _amt: usize) {}
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn pending_confirmation_does_not_starve_runtime_workers() {
+        let prompt = tokio::spawn(async {
+            let mut input = PendingInput;
+            let mut output = Vec::new();
+            prompt_for_installation(&mut input, &mut output).await
+        });
+
+        let timer = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+
+        // A blocking stdin read on the only worker would starve the timer task.
+        tokio::time::timeout(Duration::from_secs(1), timer)
+            .await
+            .expect("prompt must not block the async worker")
+            .expect("timer task must complete");
+
+        prompt.abort();
     }
 }
