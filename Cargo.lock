@@ -16,6 +16,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

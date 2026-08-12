@@ -225,6 +225,42 @@ enum ServerCommands {
         #[arg(long, default_value = "default")]
         name: String,
     },
+    /// List named servers and their process states.
+    List {
+        /// Emit server records as structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the state of a named server.
+    Status {
+        /// Local server name.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// Emit the server record as structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the agent routes registered with a named server.
+    Registrations {
+        /// Local server name.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// Emit registration records as structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tail a named server's log.
+    Logs {
+        /// Local server name.
+        #[arg(long, default_value = "default")]
+        name: String,
+        /// Number of log lines to tail.
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+        /// Emit the log lines as structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Process outcome returned by a CLI command.
@@ -371,47 +407,79 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             .with_context(|| format!("failed to serve agent \"{agent_id}\""))
             .map(|()| CliExit::Success)
         }
-        Commands::Server { command } => {
-            let message = match command {
-                ServerCommands::Start { name, host, port } => {
-                    server::start(server::StartOptions { name, host, port }).await?
-                }
-                ServerCommands::Stop { name } => server::stop(&name).await?,
-                ServerCommands::Register {
-                    agent_id,
-                    name,
-                    route,
-                    path,
-                    cors_origins,
-                    allow_any_origin,
-                    no_health,
-                    no_readyz,
-                    yolo,
-                    args,
-                } => {
-                    server::register(
-                        &agent_id,
-                        server::RegisterOptions {
-                            name,
-                            route,
-                            path,
-                            cors_origins,
-                            allow_any_origin,
-                            health_endpoint: !no_health,
-                            readyz_endpoint: !no_readyz,
-                            yolo,
-                            args,
-                        },
-                    )
-                    .await?
-                }
-                ServerCommands::Unregister { agent_id, name } => {
-                    server::unregister(&agent_id, &name).await?
-                }
-            };
-            writeln!(writer, "{message}")?;
-            Ok(CliExit::Success)
-        }
+        Commands::Server { command } => match command {
+            ServerCommands::Start { name, host, port } => {
+                let message = server::start(server::StartOptions { name, host, port }).await?;
+                writeln!(writer, "{message}")?;
+                Ok(CliExit::Success)
+            }
+            ServerCommands::Stop { name } => {
+                let message = server::stop(&name).await?;
+                writeln!(writer, "{message}")?;
+                Ok(CliExit::Success)
+            }
+            ServerCommands::Register {
+                agent_id,
+                name,
+                route,
+                path,
+                cors_origins,
+                allow_any_origin,
+                no_health,
+                no_readyz,
+                yolo,
+                args,
+            } => {
+                let message = server::register(
+                    &agent_id,
+                    server::RegisterOptions {
+                        name,
+                        route,
+                        path,
+                        cors_origins,
+                        allow_any_origin,
+                        health_endpoint: !no_health,
+                        readyz_endpoint: !no_readyz,
+                        yolo,
+                        args,
+                    },
+                )
+                .await?;
+                writeln!(writer, "{message}")?;
+                Ok(CliExit::Success)
+            }
+            ServerCommands::Unregister { agent_id, name } => {
+                let message = server::unregister(&agent_id, &name).await?;
+                writeln!(writer, "{message}")?;
+                Ok(CliExit::Success)
+            }
+            ServerCommands::List { json } => {
+                server::list(writer, json)
+                    .await
+                    .context("failed to list named servers")?;
+                Ok(CliExit::Success)
+            }
+            ServerCommands::Status { name, json } => {
+                server::status(writer, &name, json)
+                    .await
+                    .with_context(|| format!("failed to inspect server \"{name}\""))?;
+                Ok(CliExit::Success)
+            }
+            ServerCommands::Registrations { name, json } => {
+                server::registrations(writer, &name, json)
+                    .await
+                    .with_context(|| {
+                        format!("failed to list registrations for server \"{name}\"")
+                    })?;
+                Ok(CliExit::Success)
+            }
+            ServerCommands::Logs { name, lines, json } => {
+                server::logs(writer, &name, lines, json)
+                    .await
+                    .with_context(|| format!("failed to read logs for server \"{name}\""))?;
+                Ok(CliExit::Success)
+            }
+        },
         Commands::Search { query, json } => {
             let format = if json {
                 AgentOutputFormat::Json
@@ -698,6 +766,69 @@ mod tests {
             Commands::Server {
                 command: ServerCommands::Unregister { agent_id, name }
             } if agent_id == "demo" && name == "default"
+        ));
+    }
+
+    #[test]
+    fn parses_server_inspection_commands_and_defaults() {
+        let list = Cli::try_parse_from(["acp-agent", "server", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Commands::Server {
+                command: ServerCommands::List { json: false }
+            }
+        ));
+        let list = Cli::try_parse_from(["acp-agent", "server", "list", "--json"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Commands::Server {
+                command: ServerCommands::List { json: true }
+            }
+        ));
+
+        let status = Cli::try_parse_from(["acp-agent", "server", "status"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Commands::Server {
+                command: ServerCommands::Status { name, json: false }
+            } if name == "default"
+        ));
+        let status =
+            Cli::try_parse_from(["acp-agent", "server", "status", "--name", "work", "--json"])
+                .unwrap();
+        assert!(matches!(
+            status.command,
+            Commands::Server {
+                command: ServerCommands::Status { name, json: true }
+            } if name == "work"
+        ));
+
+        let registrations =
+            Cli::try_parse_from(["acp-agent", "server", "registrations", "--name", "work"])
+                .unwrap();
+        assert!(matches!(
+            registrations.command,
+            Commands::Server {
+                command: ServerCommands::Registrations { name, json: false }
+            } if name == "work"
+        ));
+
+        let logs = Cli::try_parse_from([
+            "acp-agent",
+            "server",
+            "logs",
+            "--name",
+            "work",
+            "--lines",
+            "100",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            logs.command,
+            Commands::Server {
+                command: ServerCommands::Logs { name, lines, json: true }
+            } if name == "work" && lines == 100
         ));
     }
 
