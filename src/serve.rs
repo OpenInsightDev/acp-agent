@@ -1,8 +1,8 @@
 //! ACP HTTP/SSE and WebSocket serving for a single registry agent.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectTo, LineDirection, Role};
 use agent_client_protocol_http::{AcpHttpServer, CorsOptions, ServerOptions};
@@ -15,6 +15,7 @@ use axum::{
     routing::get,
 };
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 
 /// ACP HTTP router configuration shared by standalone and named servers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,19 +124,30 @@ async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<(
 // Named servers reuse this unprefixed router so both serving modes keep the
 // same transport, CORS, health, and readiness behavior.
 pub(crate) fn agent_router(config: AcpAgentConfig, options: &AgentRouterOptions) -> Result<Router> {
+    agent_router_with_stderr(config, options, AgentStderr::spawn())
+}
+
+fn agent_router_with_stderr(
+    config: AcpAgentConfig,
+    options: &AgentRouterOptions,
+    stderr: AgentStderr,
+) -> Result<Router> {
     let server_options = http_server_options(options)?;
     let health = AgentHealth::default();
-    // Wrap each agent so its stderr lands in this process's logs and its
-    // launch outcome feeds `GET /readyz` (see [`LaunchGuard`] for why the
-    // per-connection `LaunchState` must survive library teardown).
+    // Wrap each agent so its stderr lands in this process's logs (through the
+    // non-blocking [`AgentStderr`] sink) and its launch outcome feeds
+    // `GET /readyz` (see [`LaunchGuard`] for why the per-connection
+    // `LaunchState` must survive library teardown).
     let agent_factory = {
         let config = config.clone();
         let health = health.clone();
+        let stderr = stderr.clone();
         move || {
             let state = Arc::new(LaunchState::default());
             let callback_state = state.clone();
+            let stderr = stderr.clone();
             let agent = AcpAgent::new(config.clone()).with_debug(move |line, direction| {
-                forward_agent_line(line, direction, &callback_state)
+                forward_agent_line(line, direction, &callback_state, &stderr)
             });
             ObservedAgent::new(agent, health.clone(), state)
         }
@@ -265,11 +277,71 @@ impl LaunchState {
     }
 }
 
-fn forward_agent_line(line: &str, direction: LineDirection, state: &LaunchState) {
+/// Bounded, non-blocking sink for agent stderr lines.
+///
+/// The agent library invokes its debug callback from Tokio worker tasks, so
+/// writing to stderr there would perform blocking I/O on a worker thread and
+/// contend on the global stderr lock for every line.
+/// Lines are queued in a bounded channel and written by one dedicated task
+/// instead, keeping worker threads free regardless of log volume.
+#[derive(Clone)]
+struct AgentStderr {
+    tx: mpsc::Sender<String>,
+    dropped: Arc<AtomicU64>,
+}
+
+/// Maximum queued stderr lines per server; excess lines are dropped.
+const STDERR_CHANNEL_CAPACITY: usize = 1024;
+
+impl AgentStderr {
+    fn spawn() -> Self {
+        Self::spawn_with(|line| eprintln!("[agent stderr] {line}"))
+    }
+
+    fn spawn_with(write: impl Fn(String) + Send + 'static) -> Self {
+        let (tx, mut rx) = mpsc::channel(STDERR_CHANNEL_CAPACITY);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer_dropped = dropped.clone();
+        tokio::spawn(async move {
+            let mut reported_drops = 0u64;
+            let mut last_report = Instant::now();
+            while let Some(line) = rx.recv().await {
+                write(line);
+                // Rate-limited drop metric: at most one warning per second so
+                // operators see overflow without the warning itself flooding.
+                let total_drops = writer_dropped.load(Ordering::Relaxed);
+                if total_drops > reported_drops && last_report.elapsed() >= Duration::from_secs(1)
+                {
+                    reported_drops = total_drops;
+                    last_report = Instant::now();
+                    eprintln!("[agent stderr] dropped {total_drops} lines: stderr channel full");
+                }
+            }
+        });
+        Self { tx, dropped }
+    }
+
+    /// Queues one line for the writer task without blocking.
+    ///
+    /// A full queue drops the line and counts it instead of blocking, keeping
+    /// worker-thread latency bounded by [`STDERR_CHANNEL_CAPACITY`].
+    fn push(&self, line: &str) {
+        if self.tx.try_send(line.to_string()).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn forward_agent_line(
+    line: &str,
+    direction: LineDirection,
+    state: &LaunchState,
+    stderr: &AgentStderr,
+) {
     match direction {
         LineDirection::Stderr => {
-            eprintln!("[agent stderr] {line}");
             state.push_stderr(line);
+            stderr.push(line);
         }
         LineDirection::Stdout => {
             if is_jsonrpc_response(line) {
@@ -525,8 +597,8 @@ mod tests {
         assert_eq!(nested_health.status(), StatusCode::NOT_FOUND);
     }
 
-    #[test]
-    fn agent_router_validates_router_options() {
+    #[tokio::test]
+    async fn agent_router_validates_router_options() {
         let options = AgentRouterOptions {
             path: "acp".to_string(),
             ..AgentRouterOptions::default()
@@ -545,7 +617,7 @@ mod tests {
     #[cfg(unix)]
     mod network {
         use std::net::SocketAddr;
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         use async_tungstenite::tokio::connect_async;
         use async_tungstenite::tungstenite::{Message, client::IntoClientRequest};
@@ -590,11 +662,19 @@ done"#,
             }
 
             async fn start_with_agent(options: ServeOptions, config: AcpAgentConfig) -> Self {
+                Self::start_with_stderr_sink(options, config, AgentStderr::spawn()).await
+            }
+
+            async fn start_with_stderr_sink(
+                options: ServeOptions,
+                config: AcpAgentConfig,
+                stderr: AgentStderr,
+            ) -> Self {
                 let listener = TcpListener::bind((options.host.as_str(), options.port))
                     .await
                     .unwrap();
                 let address = listener.local_addr().unwrap();
-                let mut router = agent_router(config, &options.router).unwrap();
+                let mut router = agent_router_with_stderr(config, &options.router, stderr).unwrap();
                 if let Some(subpath) = options.subpath.as_deref() {
                     validate_subpath(subpath).unwrap();
                     router = Router::new().nest(subpath, router);
@@ -889,6 +969,63 @@ done"#,
             })
             .await
             .expect("readyz should report the agent launch failure")
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn health_stays_responsive_while_agent_floods_stderr() {
+            let stderr = AgentStderr::spawn_with(|_| std::thread::sleep(Duration::from_millis(5)));
+            let server = TestServer::start_with_stderr_sink(
+                ServeOptions::default(),
+                AcpAgentConfig::new("/bin/sh").args([
+                    "-c",
+                    r#"while IFS= read -r line; do
+i=0
+while [ $i -lt 5000 ]; do echo "stderr noise $i" >&2; i=$((i+1)); done
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+done"#,
+                ]),
+                stderr.clone(),
+            )
+            .await;
+            let client = reqwest::Client::new();
+
+            // The WebSocket handshake spawns the agent; the initialize request
+            // makes it flood 5000 stderr lines into the bounded sink.
+            let (mut socket, _) = connect_async(server.ws_url("/acp")).await.unwrap();
+            socket
+                .send(Message::Text(INITIALIZE_REQUEST.into()))
+                .await
+                .unwrap();
+            let frame = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("initialize timed out")
+                .unwrap()
+                .unwrap();
+            let Message::Text(_) = frame else {
+                panic!("expected text response, got {frame:?}");
+            };
+
+            // The 5ms-per-line sink takes ~25s to drain the flood, so the
+            // channel stays full; health must remain responsive throughout.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut saw_drops = false;
+            while Instant::now() < deadline {
+                let response = timeout(
+                    Duration::from_millis(500),
+                    client.get(server.http_url("/health")).send(),
+                )
+                .await
+                .expect("health request stalled behind agent stderr")
+                .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                if stderr.dropped.load(Ordering::Relaxed) > 0 {
+                    saw_drops = true;
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+            assert!(saw_drops, "agent stderr never overflowed the channel");
+            socket.close(None).await.unwrap();
         }
 
         #[tokio::test]
