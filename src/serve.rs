@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use agent_client_protocol::{AcpAgent, AcpAgentConfig, Client, ConnectTo, LineDirection, Role};
+use agent_client_protocol::{
+    AcpAgent, AcpAgentConfig, Channel, Client, ConnectTo, LineDirection, RawJsonRpcMessage, Role,
+    schema::v1::{RequestId, Response as JsonRpcResponse},
+};
 use agent_client_protocol_http::{AcpHttpServer, CorsOptions, ServerOptions};
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -276,15 +279,17 @@ impl AgentHealth {
     }
 }
 
-// The transport may cancel the connection future before it returns. Signals
-// from the debug callback plus the drop guard preserve the launch outcome.
+// The transport may cancel the connection future before it returns. The frame
+// observer records initialize outcomes immediately; the drop guard preserves
+// failures that happen before a response is observed.
 #[derive(Default)]
 struct LaunchState {
     /// Monotonic launch order assigned at factory creation; health updates
     /// from an older generation cannot overwrite a newer launch's outcome.
     generation: u64,
-    protocol_responded: AtomicBool,
+    outcome_recorded: AtomicBool,
     initialize_requested: AtomicBool,
+    initialize_id: Mutex<Option<RequestId>>,
     stderr_tail: Mutex<String>,
 }
 
@@ -309,6 +314,28 @@ impl LaunchState {
                 tail.drain(..=newline);
             }
         }
+    }
+
+    fn initialize_requested(&self, id: RequestId) {
+        self.initialize_requested.store(true, Ordering::SeqCst);
+        *self
+            .initialize_id
+            .lock()
+            .expect("initialize id mutex poisoned") = Some(id);
+    }
+
+    fn initialize_id_matches(&self, id: &RequestId) -> bool {
+        self.initialize_id
+            .lock()
+            .expect("initialize id mutex poisoned")
+            .as_ref()
+            == Some(id)
+    }
+
+    fn try_record_outcome(&self) -> bool {
+        self.outcome_recorded
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 }
 
@@ -345,8 +372,7 @@ impl AgentStderr {
                 // Rate-limited drop metric: at most one warning per second so
                 // operators see overflow without the warning itself flooding.
                 let total_drops = writer_dropped.load(Ordering::Relaxed);
-                if total_drops > reported_drops && last_report.elapsed() >= Duration::from_secs(1)
-                {
+                if total_drops > reported_drops && last_report.elapsed() >= Duration::from_secs(1) {
                     reported_drops = total_drops;
                     last_report = Instant::now();
                     eprintln!("[agent stderr] dropped {total_drops} lines: stderr channel full");
@@ -378,28 +404,8 @@ fn forward_agent_line(
             state.push_stderr(line);
             stderr.push(line);
         }
-        LineDirection::Stdout => {
-            if is_jsonrpc_response(line) {
-                state.protocol_responded.store(true, Ordering::SeqCst);
-            }
-        }
-        LineDirection::Stdin => {
-            if line.contains("\"method\":\"initialize\"") {
-                state.initialize_requested.store(true, Ordering::SeqCst);
-            }
-        }
+        LineDirection::Stdout | LineDirection::Stdin => {}
     }
-}
-
-fn is_jsonrpc_response(line: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|value| {
-            value
-                .as_object()
-                .map(|object| object.contains_key("result") || object.contains_key("error"))
-        })
-        .unwrap_or(false)
 }
 
 struct ObservedAgent {
@@ -431,10 +437,26 @@ struct LaunchGuard {
 impl LaunchGuard {
     fn complete(mut self, result: &agent_client_protocol::Result<()>) {
         self.completed = true;
+        if self.state.outcome_recorded.load(Ordering::SeqCst) {
+            return;
+        }
         let generation = self.state.generation;
         match result {
-            Ok(()) => self.health.record_ok(generation),
-            Err(error) => self.health.record_failure(generation, error.to_string()),
+            Ok(()) => {
+                let detail = if self.state.initialize_requested.load(Ordering::SeqCst) {
+                    "agent connection ended before completing initialize".to_string()
+                } else {
+                    "agent connection ended without sending initialize".to_string()
+                };
+                if self.state.try_record_outcome() {
+                    self.health.record_failure(generation, detail);
+                }
+            }
+            Err(error) => {
+                if self.state.try_record_outcome() {
+                    self.health.record_failure(generation, error.to_string());
+                }
+            }
         }
     }
 }
@@ -445,9 +467,7 @@ impl Drop for LaunchGuard {
             return;
         }
         let generation = self.state.generation;
-        if self.state.protocol_responded.load(Ordering::SeqCst) {
-            self.health.record_ok(generation);
-        } else if self.state.initialize_requested.load(Ordering::SeqCst) {
+        if self.state.initialize_requested.load(Ordering::SeqCst) {
             let tail = self
                 .state
                 .stderr_tail
@@ -459,7 +479,14 @@ impl Drop for LaunchGuard {
             } else {
                 format!("agent connection ended before completing initialize; stderr tail:\n{tail}")
             };
-            self.health.record_failure(generation, detail);
+            if self.state.try_record_outcome() {
+                self.health.record_failure(generation, detail);
+            }
+        } else if self.state.try_record_outcome() {
+            self.health.record_failure(
+                generation,
+                "agent connection ended without sending initialize".to_string(),
+            );
         }
     }
 }
@@ -474,7 +501,50 @@ impl ConnectTo<Client> for ObservedAgent {
             health: self.health.clone(),
             completed: false,
         };
-        let result = <AcpAgent as ConnectTo<Client>>::connect_to(self.inner, client).await;
+        let (agent_channel, agent_future) =
+            <AcpAgent as ConnectTo<Client>>::into_channel_and_future(self.inner);
+        let (client_channel, client_future) = client.into_channel_and_future();
+        let state_for_requests = self.state.clone();
+        let state_for_responses = self.state.clone();
+        let health_for_responses = self.health.clone();
+        let generation = self.state.generation;
+        let bridge = Channel::bridge_with_inspection(
+            agent_channel,
+            client_channel,
+            move |message| {
+                if let RawJsonRpcMessage::Response(response) = message {
+                    let id = match response {
+                        JsonRpcResponse::Result { id, .. } | JsonRpcResponse::Error { id, .. } => {
+                            id
+                        }
+                    };
+                    if state_for_responses.initialize_id_matches(id)
+                        && state_for_responses.try_record_outcome()
+                    {
+                        match response {
+                            JsonRpcResponse::Result { .. } => {
+                                health_for_responses.record_ok(generation);
+                            }
+                            JsonRpcResponse::Error { .. } => {
+                                let detail = serde_json::to_string(message)
+                                    .unwrap_or_else(|_| "initialize failed".to_string());
+                                health_for_responses.record_failure(generation, detail);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            },
+            move |message| {
+                if let RawJsonRpcMessage::Request(request) = message
+                    && request.method.as_ref() == "initialize"
+                {
+                    state_for_requests.initialize_requested(request.id.clone());
+                }
+                Ok(())
+            },
+        );
+        let result = futures::try_join!(agent_future, client_future, bridge).map(|_| ());
         guard.complete(&result);
         result
     }
@@ -639,9 +709,8 @@ mod tests {
     }
 
     #[test]
-    fn launch_guard_records_success_once_from_connection_result() {
+    fn launch_guard_records_failure_for_clean_connection_exit() {
         let state = Arc::new(LaunchState::new(1));
-        state.protocol_responded.store(true, Ordering::SeqCst);
         let health = AgentHealth::default();
         let guard = LaunchGuard {
             state: state.clone(),
@@ -655,15 +724,16 @@ mod tests {
 
         let recorded = health.state.lock().unwrap();
         assert_eq!(recorded.attempts, 1);
-        assert_eq!(recorded.failures, 0);
-        assert!(!recorded.last_attempt_failed);
+        assert_eq!(recorded.failures, 1);
+        assert!(recorded.last_attempt_failed);
     }
 
     #[test]
     fn launch_guard_drop_records_success_after_protocol_response() {
         let state = Arc::new(LaunchState::new(1));
-        state.protocol_responded.store(true, Ordering::SeqCst);
         let health = AgentHealth::default();
+        state.outcome_recorded.store(true, Ordering::SeqCst);
+        health.record_ok(1);
         {
             let _guard = LaunchGuard {
                 state: state.clone(),
@@ -707,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_guard_drop_without_signals_records_nothing() {
+    fn launch_guard_drop_without_signals_records_failure() {
         let state = Arc::new(LaunchState::new(1));
         let health = AgentHealth::default();
         {
@@ -719,8 +789,9 @@ mod tests {
         }
 
         let recorded = health.state.lock().unwrap();
-        assert_eq!(recorded.attempts, 0);
-        assert_eq!(recorded.failures, 0);
+        assert_eq!(recorded.attempts, 1);
+        assert_eq!(recorded.failures, 1);
+        assert!(recorded.last_attempt_failed);
     }
 
     #[test]
