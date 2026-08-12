@@ -1,7 +1,6 @@
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -31,14 +30,6 @@ const INSTALL_LOG_MAX_BYTES: u64 = 1024 * 1024;
 /// When the cap is hit, the log is rewritten to keep only this tail.
 const INSTALL_LOG_TAIL_BYTES: u64 = 256 * 1024;
 
-/// Serializes appends to the shared install log.
-///
-/// Concurrent installs (multiple agents at once) write to one log file, and
-/// the truncation path rewrites the whole file. Without a lock, two racing
-/// appends could interleave or silently drop lines, so every append (and its
-/// potential truncate-and-rewrite) runs under this mutex.
-static INSTALL_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
 /// A validated binary distribution stored in the local cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedBinary {
@@ -64,7 +55,7 @@ pub async fn cache_binary_target(
         Ok(root_dir) => cache_binary_target_in(&root_dir, agent, platform, target).await,
         Err(error) => Err(error),
     };
-    record_install_log(agent, platform, &result);
+    record_install_log(agent, platform, &result).await;
     result
 }
 
@@ -86,7 +77,7 @@ pub(crate) async fn refresh_binary_target_in(
     target: &BinaryTarget,
 ) -> Result<CachedBinary> {
     let result = cache_binary_target_in_mode(root_dir, agent, platform, target, true).await;
-    record_install_log_in(root_dir, agent, platform, &result);
+    record_install_log_in(root_dir, agent, platform, &result).await;
     result
 }
 
@@ -234,15 +225,21 @@ async fn promote_staged_cache(
 ///
 /// Successes are logged too (cache hits included): a `ready` line is the only
 /// way to confirm from outside the shell-less container which agent versions
-/// are present in `/cache`; failures carry the full error chain.
-fn record_install_log(agent: &RegistryAgent, platform: Platform, result: &Result<CachedBinary>) {
+/// are present in `/cache`; failures carry the full error chain. The blocking
+/// file I/O runs on a blocking thread so a slow cache volume never stalls a
+/// Tokio worker.
+async fn record_install_log(
+    agent: &RegistryAgent,
+    platform: Platform,
+    result: &Result<CachedBinary>,
+) {
     let Ok(root_dir) = cache_root_dir() else {
         return;
     };
-    record_install_log_in(&root_dir, agent, platform, result);
+    record_install_log_in(&root_dir, agent, platform, result).await;
 }
 
-fn record_install_log_in(
+async fn record_install_log_in(
     root_dir: &Path,
     agent: &RegistryAgent,
     platform: Platform,
@@ -262,10 +259,9 @@ fn record_install_log_in(
             agent.id, agent.version, platform
         ),
     };
-    append_install_log(
-        &root_dir.join(INSTALL_LOG_FILE_NAME),
-        &format!("[{}] {outcome}\n", utc_timestamp()),
-    );
+    let line = format!("[{}] {outcome}\n", utc_timestamp());
+    let log_path = root_dir.join(INSTALL_LOG_FILE_NAME);
+    let _ = tokio::task::spawn_blocking(move || append_install_log(&log_path, &line)).await;
 }
 
 fn append_install_log(path: &Path, line: &str) {
@@ -280,12 +276,21 @@ fn append_install_log(path: &Path, line: &str) {
 fn append_install_log_inner(path: &Path, line: &str) -> std::io::Result<()> {
     use std::io::Write;
 
-    let lock = INSTALL_LOG_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Writers serialize on a dedicated lock file that is never renamed, so the
+    // exclusive lock stays valid even though the atomic truncation below
+    // replaces the log file with a new inode.
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(install_log_lock_path(path))?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock.write()?;
+
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -298,9 +303,21 @@ fn append_install_log_inner(path: &Path, line: &str) -> std::io::Result<()> {
     file.write_all(line.as_bytes())
 }
 
+/// Dedicated cross-process lock file guarding [`append_install_log_inner`].
+///
+/// A sibling of the log file (never the log file itself) so that the lock
+/// stays associated with one stable inode across atomic log rotation.
+fn install_log_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
 /// Keeps only the most recent tail so the append-only log stays bounded in a
 /// long-lived cache volume; the leading partial line is dropped so retained
-/// lines stay complete.
+/// lines stay complete. The rewrite lands in a temporary sibling file that is
+/// renamed into place while the caller holds the cross-process lock, so a
+/// concurrent reader observes either the old or the new log, never a torn one.
 fn truncate_install_log(path: &Path) -> std::io::Result<()> {
     let bytes = std::fs::read(path)?;
     let mut kept = bytes
@@ -318,7 +335,10 @@ fn truncate_install_log(path: &Path) -> std::io::Result<()> {
     )
     .into_bytes();
     rewritten.append(&mut kept);
-    std::fs::write(path, rewritten)
+
+    let temp_path = path.with_extension("log.tmp");
+    std::fs::write(&temp_path, rewritten)?;
+    std::fs::rename(&temp_path, path)
 }
 
 /// UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` form.

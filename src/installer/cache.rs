@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 
 use crate::registry::Platform;
@@ -92,20 +93,47 @@ pub(crate) fn platform_cache_key(platform: Platform) -> &'static str {
     }
 }
 
+/// Builds a filesystem-safe path component for a registry ID or version.
+///
+/// Values that are already safe (`demo`, `1.2.3`, `a_b`) pass through
+/// unchanged so existing cache paths stay stable. Whenever sanitization is
+/// lossy (`a/b`, `a:b`, dot-only values), a stable digest of the original
+/// value is appended so distinct logical IDs can never resolve to the same
+/// directory. The digest is derived from the original value, not from the
+/// lossy form, so `a/b` and `a_b` remain distinct even though both sanitize
+/// to the same prefix.
 pub(crate) fn safe_path_component(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
+    let mut lossy = value.is_empty();
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
             sanitized.push(ch);
         } else {
+            lossy = true;
             sanitized.push('_');
         }
     }
 
-    match sanitized.trim_matches('.') {
+    let trimmed = match sanitized.trim_matches('.') {
         "" => "_".to_string(),
         trimmed => trimmed.to_string(),
+    };
+
+    if lossy || trimmed != value {
+        format!("{trimmed}-{}", stable_path_digest(value))
+    } else {
+        trimmed
     }
+}
+
+/// Short stable digest used to disambiguate lossy path components.
+fn stable_path_digest(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let mut hex = String::with_capacity(12);
+    for byte in digest.iter().take(6) {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 /// A binary distribution discovered in the local agent cache.
@@ -263,7 +291,7 @@ mod tests {
             Path::new("/tmp/cache")
                 .join("acp-agent")
                 .join("agents")
-                .join("demo_agent")
+                .join("demo_agent-0b26afc5211b")
                 .join("linux-x86_64")
         );
         assert_eq!(
@@ -271,16 +299,53 @@ mod tests {
             Path::new("/tmp/cache")
                 .join("acp-agent")
                 .join("agents")
-                .join("demo_agent")
+                .join("demo_agent-0b26afc5211b")
                 .join("linux-x86_64")
                 .join("1.2.3")
         );
     }
 
     #[test]
-    fn sanitizes_non_filename_characters() {
-        assert_eq!(safe_path_component("demo/agent:beta"), "demo_agent_beta");
-        assert_eq!(safe_path_component("..."), "_");
+    fn keeps_clean_path_components_unchanged() {
+        assert_eq!(safe_path_component("demo"), "demo");
+        assert_eq!(safe_path_component("1.2.3"), "1.2.3");
+        assert_eq!(safe_path_component("demo_agent"), "demo_agent");
+        assert_eq!(safe_path_component("a.b-c_d"), "a.b-c_d");
+    }
+
+    #[test]
+    fn disambiguates_lossy_path_components_with_a_stable_digest() {
+        assert_eq!(
+            safe_path_component("demo/agent:beta"),
+            "demo_agent_beta-c1a81a1eef70"
+        );
+        assert_eq!(safe_path_component("..."), "_-ab5df625bc76");
+        assert_eq!(safe_path_component("."), "_-cdb4ee2aea69");
+        // The digest is deterministic for the same input.
+        assert_eq!(safe_path_component("demo/agent"), "demo_agent-0b26afc5211b");
+        assert_eq!(safe_path_component("demo/agent"), "demo_agent-0b26afc5211b");
+    }
+
+    #[test]
+    fn distinct_logical_ids_never_resolve_to_the_same_directory() {
+        let mut components = [
+            safe_path_component("a/b"),
+            safe_path_component("a:b"),
+            safe_path_component("a?b"),
+            safe_path_component("a_b"),
+            safe_path_component("."),
+            safe_path_component("_"),
+            safe_path_component(""),
+        ]
+        .to_vec();
+        components.sort_unstable();
+        components.dedup();
+
+        assert_eq!(
+            components.len(),
+            7,
+            "distinct logical IDs and versions must map to distinct directories"
+        );
     }
 
     #[tokio::test]
@@ -413,15 +478,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn removal_uses_exact_metadata_identity_when_paths_collide() {
+    async fn removal_is_keyed_by_exact_metadata_identity_not_path() {
         let temp_dir = tempdir().unwrap();
         let cache_root = temp_dir.path().join("cache").join("acp-agent");
-        let colliding = binary_cache_paths(&cache_root, "_", "1.0.0", Platform::LinuxX86_64);
-        write_cache_entry(&colliding, "_", "1.0.0", Platform::LinuxX86_64).await;
+        let underscore = binary_cache_paths(&cache_root, "_", "1.0.0", Platform::LinuxX86_64);
+        let dot = binary_cache_paths(&cache_root, ".", "1.0.0", Platform::LinuxX86_64);
+        write_cache_entry(&underscore, "_", "1.0.0", Platform::LinuxX86_64).await;
+        write_cache_entry(&dot, ".", "1.0.0", Platform::LinuxX86_64).await;
 
-        assert!(!remove_cached_agent(&cache_root, ".").await.unwrap());
-        assert!(colliding.cache_dir.exists());
-        assert!(remove_cached_agent(&cache_root, "_").await.unwrap());
+        assert!(!remove_cached_agent(&cache_root, "absent").await.unwrap());
+        assert!(underscore.cache_dir.exists());
+        assert!(dot.cache_dir.exists());
+        assert!(remove_cached_agent(&cache_root, ".").await.unwrap());
+        assert!(!dot.cache_dir.exists());
+        assert!(underscore.cache_dir.exists());
     }
 
     #[tokio::test]

@@ -318,6 +318,11 @@ pub(crate) fn program_available(program: &str) -> Result<bool> {
     Ok(resolve_program(program)?.is_some())
 }
 
+/// Resolves `program` against the preferred directories followed by `PATH`.
+///
+/// Resolution delegates to `which`, so a candidate must be an executable
+/// regular file on Unix and Windows resolution follows the active `PATHEXT`
+/// instead of a hard-coded extension list.
 fn resolve_program_with_directories(
     program: &str,
     preferred_directories: &[PathBuf],
@@ -326,27 +331,16 @@ fn resolve_program_with_directories(
     if let Some(path_value) = env::var_os("PATH") {
         directories.extend(env::split_paths(&path_value));
     }
-
-    for directory in directories {
-        for extension in executable_extensions() {
-            let candidate = directory.join(format!("{program}{extension}"));
-            if candidate.is_file() {
-                return Ok(Some(candidate));
-            }
-        }
+    if directories.is_empty() {
+        return Ok(None);
     }
-
-    Ok(None)
-}
-
-#[cfg(windows)]
-fn executable_extensions() -> &'static [&'static str] {
-    &["", ".exe", ".cmd", ".bat", ".ps1"]
-}
-
-#[cfg(not(windows))]
-fn executable_extensions() -> &'static [&'static str] {
-    &[""]
+    let path_list =
+        env::join_paths(directories).context("failed to join tool search directories")?;
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match which::which_in(program, Some(path_list), cwd) {
+        Ok(path) => Ok(Some(path)),
+        Err(_) => Ok(None),
+    }
 }
 
 fn display_status(status: ExitStatus) -> String {
@@ -368,6 +362,11 @@ fn display_status(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that temporarily mutate the process-wide `PATH` (and on
+    /// Windows `PATHEXT`) environment variable, which would otherwise race
+    /// when the test binary runs them in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn report(js_available: &[&str], python_available: &[&str]) -> EnvironmentReport {
         EnvironmentReport {
@@ -501,10 +500,15 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    // The guard intentionally spans the await below: it serializes tests that
+    // mutate the process-wide `PATH`, which the test runtime would otherwise
+    // run in parallel. No other task can hold it concurrently, so no deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn verify_installation_derives_path_and_on_path_from_one_resolution() {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::tempdir;
 
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = tempdir().unwrap();
         let bin = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -538,5 +542,99 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.path, deno);
         assert!(result.on_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_resolution_rejects_non_executable_regular_files() {
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = tempdir().unwrap();
+        let bin = temp_dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", &bin);
+        }
+        let without_exec_bit = resolve_program("tool");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let with_exec_bit = resolve_program("tool");
+        match previous_path {
+            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert!(
+            without_exec_bit.unwrap().is_none(),
+            "a non-executable regular file must not be treated as available"
+        );
+        assert_eq!(with_exec_bit.unwrap().unwrap(), tool);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_path_entries_resolve_to_the_first_executable_match() {
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = tempdir().unwrap();
+        let first = temp_dir.path().join("first");
+        let second = temp_dir.path().join("second");
+        for dir in [&first, &second] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for (dir, content) in [(&first, "first"), (&second, "second")] {
+            let tool = dir.join("tool");
+            std::fs::write(&tool, content).unwrap();
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{}", first.display(), second.display()));
+        }
+        let resolved = resolve_program("tool").unwrap().unwrap();
+        match previous_path {
+            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(resolved, first.join("tool"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolution_finds_executable_extension() {
+        use tempfile::tempdir;
+
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = tempdir().unwrap();
+        let bin = temp_dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("tool.exe"), b"tool").unwrap();
+
+        // The real `PATHEXT` is left untouched so `which` initializes its
+        // per-process extension cache from the actual value; `.EXE` is always
+        // present on Windows. A hard-coded extension list would also pass this
+        // test, so it guards the delegation itself rather than PATHEXT parsing,
+        // which `which` owns.
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", &bin);
+        }
+        let resolved = resolve_program("tool");
+        match previous_path {
+            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(resolved.unwrap().unwrap(), bin.join("tool.exe"));
     }
 }
