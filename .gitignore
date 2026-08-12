@@ -2,3 +2,5 @@
 /references
 
 .env
+
+.DS_Store
