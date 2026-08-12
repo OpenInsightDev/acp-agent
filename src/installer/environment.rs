@@ -1,4 +1,5 @@
 use std::env;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
@@ -55,6 +56,34 @@ pub fn plan_installation(report: &EnvironmentReport) -> InstallationPlan {
     InstallationPlan { targets }
 }
 
+/// One installer command as a single structured specification.
+///
+/// The confirmation display and the executed `Command` are both derived from
+/// this specification, so the two can never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallerCommand {
+    /// Program that executes the installer script.
+    program: &'static str,
+    /// Fixed arguments, with the installer script as the last element.
+    args: &'static [&'static str],
+}
+
+impl InstallerCommand {
+    /// Human-readable command line shown before execution.
+    fn display(self) -> String {
+        let (script, prefix) = self
+            .args
+            .split_last()
+            .expect("every installer command has a script");
+        let mut rendered = self.program.to_string();
+        for arg in prefix {
+            rendered.push(' ');
+            rendered.push_str(arg);
+        }
+        format!("{rendered} \"{}\"", *script)
+    }
+}
+
 /// A supported local toolchain installer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallTarget {
@@ -79,49 +108,38 @@ impl InstallTarget {
     }
 
     /// Official installer command shown before execution.
-    pub fn official_command_display(self) -> &'static str {
-        if cfg!(windows) {
-            match self {
-                Self::Deno => r#"powershell -c "irm https://deno.land/install.ps1 | iex""#,
-                Self::Uv => {
-                    r#"powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex""#
-                }
-            }
-        } else {
-            match self {
-                Self::Deno => "curl -fsSL https://deno.land/install.sh | sh",
-                Self::Uv => "curl -LsSf https://astral.sh/uv/install.sh | sh",
-            }
-        }
+    pub fn official_command_display(self) -> String {
+        self.installer_command().display()
     }
 
-    fn shell_command(self) -> (&'static str, Vec<&'static str>) {
+    /// Structured installer command for this target.
+    fn installer_command(self) -> InstallerCommand {
         if cfg!(windows) {
             match self {
-                Self::Deno => (
-                    "powershell",
-                    vec!["-c", r#"irm https://deno.land/install.ps1 | iex"#],
-                ),
-                Self::Uv => (
-                    "powershell",
-                    vec![
+                Self::Deno => InstallerCommand {
+                    program: "powershell",
+                    args: &["-c", r#"irm https://deno.land/install.ps1 | iex"#],
+                },
+                Self::Uv => InstallerCommand {
+                    program: "powershell",
+                    args: &[
                         "-ExecutionPolicy",
                         "ByPass",
                         "-c",
                         r#"irm https://astral.sh/uv/install.ps1 | iex"#,
                     ],
-                ),
+                },
             }
         } else {
             match self {
-                Self::Deno => (
-                    "sh",
-                    vec!["-c", "curl -fsSL https://deno.land/install.sh | sh"],
-                ),
-                Self::Uv => (
-                    "sh",
-                    vec!["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
-                ),
+                Self::Deno => InstallerCommand {
+                    program: "sh",
+                    args: &["-c", "curl -fsSL https://deno.land/install.sh | sh"],
+                },
+                Self::Uv => InstallerCommand {
+                    program: "sh",
+                    args: &["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
+                },
             }
         }
     }
@@ -177,17 +195,27 @@ fn detect_tools(programs: &[&'static str]) -> Result<Vec<ToolAvailability>> {
 }
 
 /// Runs and verifies every target in an installation plan.
+///
+/// Targets run sequentially in plan order so the installers never modify user
+/// directories or shell profiles concurrently, and the first failure aborts
+/// the remaining targets with an explicit error.
 pub async fn install_plan(plan: &InstallationPlan) -> Result<Vec<InstallationResult>> {
-    match plan.targets.as_slice() {
-        [] => Ok(Vec::new()),
-        [target] => Ok(vec![install_and_verify(*target).await?]),
-        [first, second] => {
-            let (first_result, second_result) =
-                tokio::join!(install_and_verify(*first), install_and_verify(*second));
-            Ok(vec![first_result?, second_result?])
-        }
-        _ => unreachable!("install-env only supports deno and uv"),
+    install_plan_with(plan, install_and_verify).await
+}
+
+async fn install_plan_with<F, Fut>(
+    plan: &InstallationPlan,
+    install: F,
+) -> Result<Vec<InstallationResult>>
+where
+    F: Fn(InstallTarget) -> Fut,
+    Fut: Future<Output = Result<InstallationResult>>,
+{
+    let mut results = Vec::with_capacity(plan.targets.len());
+    for target in &plan.targets {
+        results.push(install(*target).await?);
     }
+    Ok(results)
 }
 
 async fn install_and_verify(target: InstallTarget) -> Result<InstallationResult> {
@@ -197,9 +225,9 @@ async fn install_and_verify(target: InstallTarget) -> Result<InstallationResult>
 
 async fn run_installer(target: InstallTarget) -> Result<()> {
     ensure_installer_prerequisites(target)?;
-    let (program, args) = target.shell_command();
-    let output = Command::new(program)
-        .args(args)
+    let command = target.installer_command();
+    let output = Command::new(command.program)
+        .args(command.args)
         .output()
         .await
         .with_context(|| format!("failed to run installer for {}", target.label()))?;
@@ -228,26 +256,28 @@ fn ensure_installer_prerequisites(target: InstallTarget) -> Result<()> {
 }
 
 async fn verify_installation(target: InstallTarget) -> Result<InstallationResult> {
-    let on_path = resolve_program(target.program())?.is_some();
     let home = dirs::home_dir().ok_or_else(|| anyhow!("unable to determine the home directory"))?;
-    let path = if let Some(path) = resolve_program(target.program())? {
-        path
-    } else {
-        resolve_program_with_directories(target.program(), &target.known_bin_directories(&home))?
-            .ok_or_else(|| {
-                anyhow!(
-                    "verification failed for {}: {} was not found after installation",
-                    target.label(),
-                    target.program()
-                )
-            })?
+    let on_path = resolve_program(target.program())?;
+    let on_path_available = on_path.is_some();
+    let path = match on_path {
+        Some(path) => path,
+        None => {
+            resolve_program_with_directories(target.program(), &target.known_bin_directories(&home))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "verification failed for {}: {} was not found after installation",
+                        target.label(),
+                        target.program()
+                    )
+                })?
+        }
     };
 
     verify_program_version(&path, target.label()).await?;
     Ok(InstallationResult {
         target,
         path,
-        on_path,
+        on_path: on_path_available,
     })
 }
 
@@ -381,5 +411,132 @@ mod tests {
         let plan = plan_installation(&report(&["deno"], &["uv"]));
 
         assert!(plan.targets.is_empty());
+    }
+
+    #[test]
+    fn installer_command_display_is_derived_from_the_same_specification() {
+        for target in [InstallTarget::Deno, InstallTarget::Uv] {
+            let command = target.installer_command();
+            let display = command.display();
+            let (script, prefix) = command
+                .args
+                .split_last()
+                .expect("every installer command has a script");
+
+            assert!(display.starts_with(command.program), "{display}");
+            for arg in prefix {
+                assert!(display.contains(arg), "{display} missing {arg}");
+            }
+            assert!(
+                display.ends_with(&format!("\"{}\"", *script)),
+                "{display} must quote the script"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn installs_targets_sequentially_in_plan_order() {
+        use std::sync::{Arc, Mutex};
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let plan = InstallationPlan {
+            targets: vec![InstallTarget::Deno, InstallTarget::Uv],
+        };
+
+        let results = install_plan_with(&plan, |target| {
+            let executed = Arc::clone(&executed);
+            async move {
+                executed.lock().unwrap().push(target);
+                Ok(InstallationResult {
+                    target,
+                    path: PathBuf::from(format!("/tmp/{}", target.label())),
+                    on_path: false,
+                })
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![InstallTarget::Deno, InstallTarget::Uv]
+        );
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn installs_targets_stop_at_the_first_failure() {
+        use std::sync::{Arc, Mutex};
+
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let plan = InstallationPlan {
+            targets: vec![InstallTarget::Deno, InstallTarget::Uv],
+        };
+
+        let error = install_plan_with(&plan, |target| {
+            let executed = Arc::clone(&executed);
+            async move {
+                executed.lock().unwrap().push(target);
+                if target == InstallTarget::Deno {
+                    Err(anyhow!("deno installer failed"))
+                } else {
+                    Ok(InstallationResult {
+                        target,
+                        path: PathBuf::from("/tmp/uv"),
+                        on_path: false,
+                    })
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "deno installer failed");
+        assert_eq!(
+            *executed.lock().unwrap(),
+            vec![InstallTarget::Deno],
+            "later targets must not run after the first installer fails"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verify_installation_derives_path_and_on_path_from_one_resolution() {
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().unwrap();
+        let bin = temp_dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let deno = bin.join("deno");
+        std::fs::write(&deno, "#!/bin/sh\necho deno 2.0.0\n").unwrap();
+        std::fs::set_permissions(&deno, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Prepend the fake bin dir to PATH so the single resolution finds deno
+        // both on PATH and in the preferred directories; the test restores the
+        // previous value before returning.
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    previous_path
+                        .clone()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ),
+            );
+        }
+        let result = verify_installation(InstallTarget::Deno).await;
+        match previous_path {
+            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        let result = result.unwrap();
+        assert_eq!(result.path, deno);
+        assert!(result.on_path);
     }
 }
