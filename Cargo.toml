@@ -40,7 +40,8 @@ tokio = { version = "1.52.0", features = [
 ] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }
-zip = "8.4.0"
+# Registry ZIP assets use standard deflate; keep the codec/encryption surface minimal.
+zip = { version = "8.4.0", default-features = false, features = ["deflate-flate2"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

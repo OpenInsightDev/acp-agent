@@ -497,33 +497,12 @@ fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
         .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
     let mut archive = ZipArchive::new(file)
         .with_context(|| format!("failed to read ZIP archive {}", archive_path.display()))?;
-
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .with_context(|| format!("failed to read ZIP entry {index}"))?;
-        let enclosed = entry
-            .enclosed_name()
-            .ok_or_else(|| anyhow!("archive contains unsafe path: {}", entry.name()))?;
-        let output_path = destination.join(enclosed);
-
-        if entry.name().ends_with('/') {
-            std::fs::create_dir_all(&output_path)
-                .with_context(|| format!("failed to create {}", output_path.display()))?;
-            continue;
-        }
-
-        if let Some(parent) = output_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-
-        let mut output = File::create(&output_path)
-            .with_context(|| format!("failed to create {}", output_path.display()))?;
-        io::copy(&mut entry, &mut output)
-            .with_context(|| format!("failed to extract {}", output_path.display()))?;
-    }
-
+    archive.extract(destination).with_context(|| {
+        format!(
+            "failed to extract ZIP archive into {}",
+            destination.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1023,5 +1002,199 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(11_017), (2000, 3, 1));
         assert_eq!(civil_from_days(20_668), (2026, 8, 3));
+    }
+
+    // --- ZIP extraction ---
+
+    /// Writes a ZIP archive whose entries are built through the provided
+    /// closure, using the crate's own writer.
+    fn build_zip_archive(archive_path: &Path, write: impl FnOnce(&mut zip::ZipWriter<File>)) {
+        let file = File::create(archive_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        write(&mut writer);
+        writer.finish().unwrap();
+    }
+
+    /// Hand-builds a single-entry stored (uncompressed) ZIP so tests can use
+    /// entry names the writer would sanitize away, such as `../` traversal.
+    fn build_raw_zip(archive_path: &Path, entry_name: &str, payload: &[u8]) {
+        use std::io::Write;
+
+        let crc = crc32_ieee(payload);
+        let name = entry_name.as_bytes();
+
+        let mut bytes = Vec::new();
+        // Local file header.
+        bytes.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        bytes.extend_from_slice(&0x21u16.to_le_bytes()); // mod date (1980-01-01)
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(payload);
+
+        let mut central = Vec::new();
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&0x031eu16.to_le_bytes()); // version made by (unix)
+        central.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        central.extend_from_slice(&0u16.to_le_bytes()); // flags
+        central.extend_from_slice(&0u16.to_le_bytes()); // method
+        central.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        central.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        central.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        central.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        central.extend_from_slice(&0u16.to_le_bytes()); // internal attributes
+        central.extend_from_slice(&(0o100644u32 << 16).to_le_bytes()); // external attrs
+        central.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        central.extend_from_slice(name);
+
+        let mut eocd = Vec::new();
+        eocd.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        eocd.extend_from_slice(&0u16.to_le_bytes()); // cd disk
+        eocd.extend_from_slice(&1u16.to_le_bytes()); // entries on this disk
+        eocd.extend_from_slice(&1u16.to_le_bytes()); // total entries
+        eocd.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        eocd.extend_from_slice(&(bytes.len() as u32).to_le_bytes()); // cd offset
+        eocd.extend_from_slice(&0u16.to_le_bytes()); // comment length
+
+        bytes.extend_from_slice(&central);
+        bytes.extend_from_slice(&eocd);
+
+        let mut file = File::create(archive_path).unwrap();
+        file.write_all(&bytes).unwrap();
+    }
+
+    /// Standard CRC-32 (IEEE 802.3) for hand-built ZIP fixtures.
+    fn crc32_ieee(data: &[u8]) -> u32 {
+        let mut table = [0u32; 256];
+        for (index, entry) in table.iter_mut().enumerate() {
+            let mut value = index as u32;
+            for _ in 0..8 {
+                value = if value & 1 != 0 {
+                    0xedb8_8320 ^ (value >> 1)
+                } else {
+                    value >> 1
+                };
+            }
+            *entry = value;
+        }
+        let mut crc = 0xffff_ffffu32;
+        for &byte in data {
+            crc = table[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
+        }
+        !crc
+    }
+
+    #[test]
+    fn zip_extracts_directory_entries_and_files() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let temp_dir = tempdir().unwrap();
+        let archive_path = temp_dir.path().join("fixture.zip");
+        build_zip_archive(&archive_path, |writer| {
+            writer
+                .add_directory("pkg/", SimpleFileOptions::default())
+                .unwrap();
+            writer
+                .start_file("pkg/bin/tool", SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"#!/bin/sh\n").unwrap();
+        });
+
+        let destination = temp_dir.path().join("out");
+        extract_zip(&archive_path, &destination).unwrap();
+
+        assert!(destination.join("pkg/bin").is_dir());
+        assert!(destination.join("pkg/bin/tool").is_file());
+        assert_eq!(
+            std::fs::read(destination.join("pkg/bin/tool")).unwrap(),
+            b"#!/bin/sh\n"
+        );
+    }
+
+    #[test]
+    fn zip_rejects_path_traversal_entries() {
+        let temp_dir = tempdir().unwrap();
+        let archive_path = temp_dir.path().join("escape.zip");
+        build_raw_zip(&archive_path, "../escape.txt", b"evil");
+
+        let destination = temp_dir.path().join("out");
+        assert!(extract_zip(&archive_path, &destination).is_err());
+        assert!(!destination.join("escape.txt").exists());
+        assert!(!temp_dir.path().join("escape.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_extracts_symlinks_as_symlinks() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let temp_dir = tempdir().unwrap();
+        let archive_path = temp_dir.path().join("fixture.zip");
+        build_zip_archive(&archive_path, |writer| {
+            writer
+                .start_file("pkg/target", SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"payload").unwrap();
+            writer
+                .add_symlink("pkg/link", "target", SimpleFileOptions::default())
+                .unwrap();
+        });
+
+        let destination = temp_dir.path().join("out");
+        extract_zip(&archive_path, &destination).unwrap();
+
+        let link = destination.join("pkg/link");
+        let link_metadata = std::fs::symlink_metadata(&link).unwrap();
+        assert!(link_metadata.file_type().is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), PathBuf::from("target"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_preserves_unix_permissions_and_executable_helpers() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use zip::write::SimpleFileOptions;
+
+        let temp_dir = tempdir().unwrap();
+        let archive_path = temp_dir.path().join("fixture.zip");
+        build_zip_archive(&archive_path, |writer| {
+            writer
+                .start_file(
+                    "pkg/run.sh",
+                    SimpleFileOptions::default().unix_permissions(0o755),
+                )
+                .unwrap();
+            writer.write_all(b"#!/bin/sh\n").unwrap();
+            writer
+                .start_file(
+                    "pkg/README",
+                    SimpleFileOptions::default().unix_permissions(0o644),
+                )
+                .unwrap();
+            writer.write_all(b"readme").unwrap();
+        });
+
+        let destination = temp_dir.path().join("out");
+        extract_zip(&archive_path, &destination).unwrap();
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&destination.join("pkg/run.sh")), 0o755);
+        assert_eq!(mode(&destination.join("pkg/README")), 0o644);
     }
 }
