@@ -143,7 +143,7 @@ fn agent_router_with_stderr(
         let health = health.clone();
         let stderr = stderr.clone();
         move || {
-            let state = Arc::new(LaunchState::default());
+            let state = Arc::new(LaunchState::new(health.next_generation()));
             let callback_state = state.clone();
             let stderr = stderr.clone();
             let agent = AcpAgent::new(config.clone()).with_debug(move |line, direction| {
@@ -210,19 +210,34 @@ fn http_server_options(options: &AgentRouterOptions) -> Result<ServerOptions> {
     })
 }
 
-// A later successful launch clears a transient readiness failure while the
-// previous failure detail remains available for diagnostics.
-#[derive(Clone, Default)]
+// Readiness reflects the outcome of the most recent launch, not the most
+// recent completion: each launch receives a monotonic generation, and an
+// outcome recorded by an older generation is counted but never overwrites
+// the readiness of a newer launch.
+#[derive(Clone)]
 struct AgentHealth {
     state: Arc<Mutex<AgentHealthState>>,
+    next_generation: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
 struct AgentHealthState {
     attempts: u64,
     failures: u64,
+    /// Generation of the launch whose outcome is reflected in
+    /// `last_attempt_failed` and `last_failure`.
+    outcome_generation: u64,
     last_attempt_failed: bool,
     last_failure: Option<AgentFailure>,
+}
+
+impl Default for AgentHealth {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(AgentHealthState::default())),
+            next_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -232,21 +247,32 @@ struct AgentFailure {
 }
 
 impl AgentHealth {
-    fn record_ok(&self) {
-        let mut state = self.state.lock().expect("agent health mutex poisoned");
-        state.attempts += 1;
-        state.last_attempt_failed = false;
+    /// Allocates the monotonic generation for one agent launch.
+    fn next_generation(&self) -> u64 {
+        self.next_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    fn record_failure(&self, detail: String) {
+    fn record_ok(&self, generation: u64) {
+        let mut state = self.state.lock().expect("agent health mutex poisoned");
+        state.attempts += 1;
+        if generation > state.outcome_generation {
+            state.outcome_generation = generation;
+            state.last_attempt_failed = false;
+        }
+    }
+
+    fn record_failure(&self, generation: u64, detail: String) {
         let mut state = self.state.lock().expect("agent health mutex poisoned");
         state.attempts += 1;
         state.failures += 1;
-        state.last_attempt_failed = true;
-        state.last_failure = Some(AgentFailure {
-            at: SystemTime::now(),
-            detail,
-        });
+        if generation > state.outcome_generation {
+            state.outcome_generation = generation;
+            state.last_attempt_failed = true;
+            state.last_failure = Some(AgentFailure {
+                at: SystemTime::now(),
+                detail,
+            });
+        }
     }
 }
 
@@ -254,6 +280,9 @@ impl AgentHealth {
 // from the debug callback plus the drop guard preserve the launch outcome.
 #[derive(Default)]
 struct LaunchState {
+    /// Monotonic launch order assigned at factory creation; health updates
+    /// from an older generation cannot overwrite a newer launch's outcome.
+    generation: u64,
     protocol_responded: AtomicBool,
     initialize_requested: AtomicBool,
     stderr_tail: Mutex<String>,
@@ -262,6 +291,13 @@ struct LaunchState {
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 
 impl LaunchState {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            ..Self::default()
+        }
+    }
+
     fn push_stderr(&self, line: &str) {
         let mut tail = self.stderr_tail.lock().expect("stderr tail mutex poisoned");
         tail.push_str(line);
@@ -395,9 +431,10 @@ struct LaunchGuard {
 impl LaunchGuard {
     fn complete(mut self, result: &agent_client_protocol::Result<()>) {
         self.completed = true;
+        let generation = self.state.generation;
         match result {
-            Ok(()) => self.health.record_ok(),
-            Err(error) => self.health.record_failure(error.to_string()),
+            Ok(()) => self.health.record_ok(generation),
+            Err(error) => self.health.record_failure(generation, error.to_string()),
         }
     }
 }
@@ -407,8 +444,9 @@ impl Drop for LaunchGuard {
         if self.completed {
             return;
         }
+        let generation = self.state.generation;
         if self.state.protocol_responded.load(Ordering::SeqCst) {
-            self.health.record_ok();
+            self.health.record_ok(generation);
         } else if self.state.initialize_requested.load(Ordering::SeqCst) {
             let tail = self
                 .state
@@ -421,7 +459,7 @@ impl Drop for LaunchGuard {
             } else {
                 format!("agent connection ended before completing initialize; stderr tail:\n{tail}")
             };
-            self.health.record_failure(detail);
+            self.health.record_failure(generation, detail);
         }
     }
 }
@@ -602,7 +640,7 @@ mod tests {
 
     #[test]
     fn launch_guard_records_success_once_from_connection_result() {
-        let state = Arc::new(LaunchState::default());
+        let state = Arc::new(LaunchState::new(1));
         state.protocol_responded.store(true, Ordering::SeqCst);
         let health = AgentHealth::default();
         let guard = LaunchGuard {
@@ -623,7 +661,7 @@ mod tests {
 
     #[test]
     fn launch_guard_drop_records_success_after_protocol_response() {
-        let state = Arc::new(LaunchState::default());
+        let state = Arc::new(LaunchState::new(1));
         state.protocol_responded.store(true, Ordering::SeqCst);
         let health = AgentHealth::default();
         {
@@ -642,7 +680,7 @@ mod tests {
 
     #[test]
     fn launch_guard_drop_records_failure_with_stderr_tail_after_initialize() {
-        let state = Arc::new(LaunchState::default());
+        let state = Arc::new(LaunchState::new(1));
         state.initialize_requested.store(true, Ordering::SeqCst);
         state.push_stderr("error: boom");
         let health = AgentHealth::default();
@@ -670,7 +708,7 @@ mod tests {
 
     #[test]
     fn launch_guard_drop_without_signals_records_nothing() {
-        let state = Arc::new(LaunchState::default());
+        let state = Arc::new(LaunchState::new(1));
         let health = AgentHealth::default();
         {
             let _guard = LaunchGuard {
@@ -683,6 +721,57 @@ mod tests {
         let recorded = health.state.lock().unwrap();
         assert_eq!(recorded.attempts, 0);
         assert_eq!(recorded.failures, 0);
+    }
+
+    #[test]
+    fn stale_launch_outcome_does_not_overwrite_newer_generation() {
+        let health = AgentHealth::default();
+        // Launch 1 and launch 2 started concurrently; launch 2 (newer) failed
+        // first, then launch 1's connection closed later reporting success.
+        health.record_failure(2, "launch 2 failed".to_string());
+        health.record_ok(1);
+
+        let recorded = health.state.lock().unwrap();
+        assert_eq!(recorded.attempts, 2);
+        assert_eq!(recorded.failures, 1);
+        assert!(recorded.last_attempt_failed);
+        assert!(
+            recorded
+                .last_failure
+                .as_ref()
+                .unwrap()
+                .detail
+                .contains("launch 2 failed")
+        );
+    }
+
+    #[test]
+    fn newer_launch_outcome_overwrites_older_generation() {
+        let health = AgentHealth::default();
+        health.record_failure(1, "launch 1 failed".to_string());
+        health.record_ok(2);
+
+        let recorded = health.state.lock().unwrap();
+        assert_eq!(recorded.attempts, 2);
+        assert_eq!(recorded.failures, 1);
+        assert!(!recorded.last_attempt_failed);
+        // The older failure detail stays available for diagnostics.
+        assert!(
+            recorded
+                .last_failure
+                .as_ref()
+                .unwrap()
+                .detail
+                .contains("launch 1 failed")
+        );
+    }
+
+    #[test]
+    fn generations_are_monotonic_across_launches() {
+        let health = AgentHealth::default();
+        assert_eq!(health.next_generation(), 1);
+        assert_eq!(health.next_generation(), 2);
+        assert_eq!(health.next_generation(), 3);
     }
 
     #[cfg(unix)]
