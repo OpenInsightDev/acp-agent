@@ -1,4 +1,3 @@
-use std::fmt::Display;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -6,20 +5,9 @@ use std::process::ExitStatus;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-/// Local cache management commands (`list --installed`, `uninstall`, `update`).
-pub mod cache;
-/// Agent installation command.
-pub mod install;
-/// Registry listing output helpers.
-pub mod list;
-/// Local agent execution command.
-pub mod run;
-/// Registry search output helpers.
-pub mod search;
-/// ACP HTTP agent serving command.
-pub mod serve;
-/// Named ACP server management commands.
-pub mod server;
+mod agents;
+mod environment;
+mod server;
 
 /// Output format for registry listing and search commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,26 +260,22 @@ pub enum CliExit {
     Code(i32),
 }
 
-/// Reports the outcome of a multi-agent operation with all-or-nothing
-/// semantics, matching the convention of npm and other package managers.
-///
-/// Success is only reported (and `CliExit::Success` returned) when every
-/// requested agent succeeded. If any agent failed, the failures are printed
-/// and a non-zero exit is returned; the command never reports overall success
-/// when part of the batch failed.
-fn report_batch_outcome<W, T>(
+// Batch output is all-or-nothing: partial success must not look like a
+// successful command or print misleading success lines.
+fn report_batch_outcome<W, T, F>(
     writer: &mut W,
     outcomes: &[(String, anyhow::Result<T>)],
     action: &str,
+    render: F,
 ) -> anyhow::Result<CliExit>
 where
     W: Write,
-    T: Display,
+    F: Fn(&T) -> String,
 {
     if outcomes.iter().all(|(_, result)| result.is_ok()) {
         for (_, result) in outcomes {
             if let Ok(outcome) = result {
-                writeln!(writer, "{outcome}")?;
+                writeln!(writer, "{}", render(outcome))?;
             }
         }
         return Ok(CliExit::Success);
@@ -325,7 +309,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             Ok(exit_from_status(status))
         }
         Commands::ServerRun { name, host, port } => {
-            server::run(name, host, port).await?;
+            crate::server::run(name, host, port).await?;
             Ok(CliExit::Success)
         }
         Commands::List { installed, json } => {
@@ -335,32 +319,82 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 AgentOutputFormat::Tsv
             };
             if installed {
-                cache::list_installed_with_format(writer, format)
+                let installed = crate::installer::agents::installed_agents()
                     .await
                     .context("failed to list installed agents")?;
+                agents::write_installed_agents(writer, installed, format)
+                    .context("failed to list installed agents")?;
             } else {
-                list::list_agents_with_format(writer, format)
+                let registry = crate::registry::fetch_registry()
                     .await
                     .context("failed to list registry agents")?;
+                agents::write_registry_agents(
+                    writer,
+                    registry.list_agents().iter().collect(),
+                    format,
+                )
+                .context("failed to list registry agents")?;
             }
             Ok(CliExit::Success)
         }
         Commands::Install { agent_id } => {
-            let outcomes = install::install_agents(&agent_id).await;
-            report_batch_outcome(writer, &outcomes, "install")
+            let outcomes = crate::installer::agents::install_agents(&agent_id).await;
+            for (_, outcome) in &outcomes {
+                if let Ok(outcome) = outcome {
+                    for warning in agents::install_warnings(outcome) {
+                        eprintln!("{warning}");
+                    }
+                }
+            }
+            report_batch_outcome(writer, &outcomes, "install", |outcome| {
+                agents::InstallMessage(outcome).to_string()
+            })
         }
         Commands::Uninstall { agent_id } => {
-            let outcomes = cache::uninstall_agents(&agent_id).await;
-            report_batch_outcome(writer, &outcomes, "uninstall")
+            let outcomes = crate::installer::agents::uninstall_agents(&agent_id).await;
+            for (_, outcome) in &outcomes {
+                if let Ok(outcome) = outcome {
+                    for warning in agents::uninstall_warnings(outcome) {
+                        eprintln!("{warning}");
+                    }
+                }
+            }
+            report_batch_outcome(writer, &outcomes, "uninstall", |outcome| {
+                agents::UninstallMessage(outcome).to_string()
+            })
         }
         Commands::Update { agent_id } => {
-            let outcomes = cache::update_agents(&agent_id).await;
-            report_batch_outcome(writer, &outcomes, "update")
+            let outcomes = crate::installer::agents::update_agents(&agent_id).await;
+            for (_, outcome) in &outcomes {
+                if let Ok(outcome) = outcome {
+                    for warning in agents::install_warnings(outcome) {
+                        eprintln!("{warning}");
+                    }
+                }
+            }
+            report_batch_outcome(writer, &outcomes, "update", |outcome| {
+                agents::InstallMessage(outcome).to_string()
+            })
         }
         Commands::InstallEnv { yes } => {
-            crate::installer::environment::install_env(writer, yes)
+            let report = crate::installer::environment::detect_environment()
+                .context("failed to detect environment dependencies")?;
+            environment::write_detection_report(writer, &report)?;
+            let plan = crate::installer::environment::plan_installation(&report);
+            if plan.targets.is_empty() {
+                environment::write_nothing_to_install(writer)?;
+                return Ok(CliExit::Success);
+            }
+            environment::write_installation_plan(writer, &plan)?;
+            if !yes && !environment::confirm_installation(writer)? {
+                environment::write_cancelled(writer)?;
+                return Ok(CliExit::Success);
+            }
+            environment::write_installation_start(writer)?;
+            let results = crate::installer::environment::install_plan(&plan)
                 .await
                 .context("failed to install environment dependencies")?;
+            environment::write_installation_complete(writer, &results)?;
             Ok(CliExit::Success)
         }
         Commands::Run {
@@ -368,8 +402,8 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             args,
             yolo,
         } => {
-            let args = resolve_yolo_args(&agent_id, yolo, args).await?;
-            let status = run::run_agent(&agent_id, &args)
+            let args = crate::yolo::resolve_args(&agent_id, yolo, args).await?;
+            let status = crate::runner::run_agent(&agent_id, &args)
                 .await
                 .with_context(|| format!("failed to run agent \"{agent_id}\""))?;
             Ok(exit_from_status(status))
@@ -388,18 +422,20 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             yolo,
             args,
         } => {
-            let args = resolve_yolo_args(&agent_id, yolo, args).await?;
+            let args = crate::yolo::resolve_args(&agent_id, yolo, args).await?;
             let subpath = resolve_subpath(&agent_id, subpath, agent_sub_path);
-            serve::serve_agent(
+            crate::serve::serve_agent(
                 &agent_id,
-                serve::ServeOptions {
+                crate::serve::ServeOptions {
                     host,
                     port,
                     subpath,
-                    path,
-                    cors: serve::cors_options(cors_origins, allow_any_origin)?,
-                    health_endpoint: !no_health,
-                    readyz_endpoint: !no_readyz,
+                    router: crate::serve::AgentRouterOptions {
+                        path,
+                        cors: crate::serve::cors_options(cors_origins, allow_any_origin)?,
+                        health_endpoint: !no_health,
+                        readyz_endpoint: !no_readyz,
+                    },
                 },
                 &args,
             )
@@ -409,13 +445,18 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
         }
         Commands::Server { command } => match command {
             ServerCommands::Start { name, host, port } => {
-                let message = server::start(server::StartOptions { name, host, port }).await?;
-                writeln!(writer, "{message}")?;
+                let result =
+                    crate::server::start(crate::server::StartOptions { name, host, port }).await?;
+                writeln!(
+                    writer,
+                    "started server \"{}\" at {}",
+                    result.name, result.address
+                )?;
                 Ok(CliExit::Success)
             }
             ServerCommands::Stop { name } => {
-                let message = server::stop(&name).await?;
-                writeln!(writer, "{message}")?;
+                let result = crate::server::stop(&name).await?;
+                writeln!(writer, "stopped server \"{}\"", result.name)?;
                 Ok(CliExit::Success)
             }
             ServerCommands::Register {
@@ -430,9 +471,9 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 yolo,
                 args,
             } => {
-                let message = server::register(
+                let result = crate::server::register(
                     &agent_id,
-                    server::RegisterOptions {
+                    crate::server::RegisterOptions {
                         name,
                         route,
                         path,
@@ -445,37 +486,52 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                     },
                 )
                 .await?;
-                writeln!(writer, "{message}")?;
+                writeln!(
+                    writer,
+                    "registered agent \"{}\" at {}{}",
+                    result.agent_id, result.address, result.route
+                )?;
                 Ok(CliExit::Success)
             }
             ServerCommands::Unregister { agent_id, name } => {
-                let message = server::unregister(&agent_id, &name).await?;
-                writeln!(writer, "{message}")?;
+                let result = crate::server::unregister(&agent_id, &name).await?;
+                writeln!(
+                    writer,
+                    "unregistered agent \"{}\" from server \"{}\"",
+                    result.agent_id, result.server_name
+                )?;
                 Ok(CliExit::Success)
             }
             ServerCommands::List { json } => {
-                server::list(writer, json)
+                let records = crate::server::list()
                     .await
+                    .context("failed to list named servers")?;
+                server::write_server_list(writer, &records, json)
                     .context("failed to list named servers")?;
                 Ok(CliExit::Success)
             }
             ServerCommands::Status { name, json } => {
-                server::status(writer, &name, json)
+                let record = crate::server::status(&name)
                     .await
+                    .with_context(|| format!("failed to inspect server \"{name}\""))?;
+                server::write_status(writer, &record, json)
                     .with_context(|| format!("failed to inspect server \"{name}\""))?;
                 Ok(CliExit::Success)
             }
             ServerCommands::Registrations { name, json } => {
-                server::registrations(writer, &name, json)
-                    .await
-                    .with_context(|| {
-                        format!("failed to list registrations for server \"{name}\"")
-                    })?;
+                let records = crate::server::registrations(&name).await.with_context(|| {
+                    format!("failed to list registrations for server \"{name}\"")
+                })?;
+                server::write_registrations(writer, &name, &records, json).with_context(|| {
+                    format!("failed to list registrations for server \"{name}\"")
+                })?;
                 Ok(CliExit::Success)
             }
             ServerCommands::Logs { name, lines, json } => {
-                server::logs(writer, &name, lines, json)
+                let record = crate::server::logs(&name, lines)
                     .await
+                    .with_context(|| format!("failed to read logs for server \"{name}\""))?;
+                server::write_logs(writer, &record, json)
                     .with_context(|| format!("failed to read logs for server \"{name}\""))?;
                 Ok(CliExit::Success)
             }
@@ -486,16 +542,16 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             } else {
                 AgentOutputFormat::Tsv
             };
-            search::search_agents_with_format(&query, writer, format)
+            let registry = crate::registry::fetch_registry()
                 .await
+                .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
+            agents::write_registry_agents(writer, registry.search_agents(&query), format)
                 .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
             Ok(CliExit::Success)
         }
     }
 }
 
-/// Resolves the effective served subpath, deriving `/` + agent id when
-/// `--agent-sub-path` is set (equivalent to `--subpath /<agent-id>`).
 fn resolve_subpath(
     agent_id: &str,
     subpath: Option<String>,
@@ -515,23 +571,6 @@ fn exit_from_status(status: ExitStatus) -> CliExit {
     status
         .code()
         .map_or_else(|| CliExit::Code(signal_exit_code(status)), CliExit::Code)
-}
-
-/// Prepends the agent's yolo startup flag when `--yolo` was requested.
-///
-/// Resolution fails loudly (rather than silently skipping the requested
-/// auto-approve behavior) when the agent only supports protocol-level yolo.
-async fn resolve_yolo_args(
-    agent_id: &str,
-    yolo: bool,
-    args: Vec<String>,
-) -> anyhow::Result<Vec<String>> {
-    if !yolo {
-        return Ok(args);
-    }
-
-    let extra = crate::yolo::yolo_extra_args(agent_id).await?;
-    Ok(extra.into_iter().chain(args).collect())
 }
 
 #[cfg(unix)]
@@ -564,7 +603,7 @@ mod tests {
             ),
         ];
 
-        let exit = report_batch_outcome(&mut output, &outcomes, "install").unwrap();
+        let exit = report_batch_outcome(&mut output, &outcomes, "install", Clone::clone).unwrap();
 
         assert!(matches!(exit, CliExit::Success));
         assert_eq!(
@@ -584,10 +623,9 @@ mod tests {
             ("b".to_string(), Err::<String, _>(anyhow::anyhow!("boom"))),
         ];
 
-        let exit = report_batch_outcome(&mut output, &outcomes, "install").unwrap();
+        let exit = report_batch_outcome(&mut output, &outcomes, "install", Clone::clone).unwrap();
 
         assert!(matches!(exit, CliExit::Code(1)));
-        // Success lines are not printed when the batch failed.
         assert!(
             !String::from_utf8(output.clone())
                 .unwrap()
@@ -961,8 +999,6 @@ mod tests {
             resolve_subpath("codex-acp", None, true),
             Some("/codex-acp".to_string())
         );
-        // An explicit --subpath wins over the flag (they conflict at parse,
-        // but the resolver must still prefer the explicit value if reachable).
         assert_eq!(
             resolve_subpath("codex-acp", Some("/myapp".to_string()), false),
             Some("/myapp".to_string())

@@ -8,7 +8,9 @@ This package primarily exists as a CLI, but the implementation is also exposed a
 a library for embedding:
 
 - [`commands`] embeds the CLI parser and dispatch logic.
-- [`installer`] installs agent distributions and local toolchains.
+- [`installer`] owns agent distribution lifecycle and local toolchain setup.
+- [`serve`] serves a registry agent over ACP HTTP transports.
+- [`server`] manages named background servers and their control plane.
 - [`registry`] loads and queries the public ACP registry.
 - [`runner`] launches registry agents as local processes.
 "#]
@@ -22,5 +24,9 @@ pub mod installer;
 pub mod registry;
 /// Local ACP agent command resolution and execution.
 pub mod runner;
+/// ACP HTTP/SSE and WebSocket serving for registry agents.
+pub mod serve;
+/// Named background ACP servers and their local control plane.
+pub mod server;
 /// Embedded yolo-mode catalog and per-agent flag resolution for `--yolo`.
 pub mod yolo;
