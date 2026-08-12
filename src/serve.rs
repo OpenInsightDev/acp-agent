@@ -1,7 +1,10 @@
 //! ACP HTTP/SSE and WebSocket serving for a single registry agent.
 
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_client_protocol::{
@@ -16,9 +19,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
+    serve::Listener,
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::time::{sleep, timeout};
 
 /// ACP HTTP router configuration shared by standalone and named servers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +100,8 @@ pub async fn serve_agent(agent_id: &str, options: ServeOptions, args: &[String])
 }
 
 async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<()> {
-    let mut router = agent_router(config, &options.router)?;
+    let (cancel, cancel_rx) = watch::channel(false);
+    let mut router = agent_router(config, &options.router, cancel_rx)?;
     if let Some(subpath) = options.subpath.as_deref() {
         validate_subpath(subpath)?;
         router = Router::new().nest(subpath, router);
@@ -121,19 +128,24 @@ async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<(
             options.subpath.as_deref().unwrap_or("")
         );
     }
-    serve_listener(listener, router).await
+    serve_listener(listener, router, cancel).await
 }
 
 // Named servers reuse this unprefixed router so both serving modes keep the
 // same transport, CORS, health, and readiness behavior.
-pub(crate) fn agent_router(config: AcpAgentConfig, options: &AgentRouterOptions) -> Result<Router> {
-    agent_router_with_stderr(config, options, AgentStderr::spawn())
+pub(crate) fn agent_router(
+    config: AcpAgentConfig,
+    options: &AgentRouterOptions,
+    cancel: watch::Receiver<bool>,
+) -> Result<Router> {
+    agent_router_with_stderr(config, options, AgentStderr::spawn(), cancel)
 }
 
 fn agent_router_with_stderr(
     config: AcpAgentConfig,
     options: &AgentRouterOptions,
     stderr: AgentStderr,
+    cancel: watch::Receiver<bool>,
 ) -> Result<Router> {
     let server_options = http_server_options(options)?;
     let health = AgentHealth::default();
@@ -145,6 +157,7 @@ fn agent_router_with_stderr(
         let config = config.clone();
         let health = health.clone();
         let stderr = stderr.clone();
+        let cancel = cancel.clone();
         move || {
             let state = Arc::new(LaunchState::new(health.next_generation()));
             let callback_state = state.clone();
@@ -152,7 +165,7 @@ fn agent_router_with_stderr(
             let agent = AcpAgent::new(config.clone()).with_debug(move |line, direction| {
                 forward_agent_line(line, direction, &callback_state, &stderr)
             });
-            ObservedAgent::new(agent, health.clone(), state)
+            ObservedAgent::new(agent, health.clone(), state, cancel.clone())
         }
     };
 
@@ -168,10 +181,238 @@ fn agent_router_with_stderr(
     Ok(router)
 }
 
-async fn serve_listener(listener: TcpListener, router: Router) -> Result<()> {
-    axum::serve(listener, router)
-        .await
-        .context("ACP HTTP server failed")
+/// How long the server waits for active connections to drain after a shutdown
+/// signal before cancelling them so their agent process groups terminate.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// How long the server waits after cancelling connections before giving up.
+const FORCE_CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// Serves the ACP router until SIGINT/SIGTERM, then drains active connections
+/// within [`SHUTDOWN_GRACE`] before cancelling the rest.
+///
+/// The ACP library spawns each agent child as the leader of its own Unix
+/// process group and kills the whole group when the connection future is
+/// dropped. A hard process exit (the default signal handling) would skip
+/// those drops and orphan agent processes, so shutdown stops accepting new
+/// connections, waits for in-flight work to finish within a bounded grace,
+/// and only then cancels the remaining connections so the child guards can
+/// run their process-group teardown.
+async fn serve_listener(
+    listener: TcpListener,
+    router: Router,
+    cancel: watch::Sender<bool>,
+) -> Result<()> {
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    tokio::spawn(await_termination_signal(shutdown));
+    serve_with_shutdown(listener, router, shutdown_rx, cancel, SHUTDOWN_GRACE).await
+}
+
+/// Feeds a shutdown watch channel when the process receives SIGINT or SIGTERM
+/// (Ctrl+C on non-Unix platforms).
+///
+/// The sender is retained for the task's lifetime: dropping it would make the
+/// shutdown receiver treat the watch as closed and stop the server without a
+/// signal ever arriving.
+pub(crate) async fn await_termination_signal(shutdown: watch::Sender<bool>) {
+    match wait_for_termination().await {
+        Ok(()) => {
+            shutdown.send_replace(true);
+        }
+        Err(error) => eprintln!("failed to install termination signal handler: {error}"),
+    }
+    std::future::pending::<()>().await;
+}
+
+async fn wait_for_termination() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+/// Serves `router` on `listener` until `shutdown_rx` is signaled, then drains
+/// active connections within `shutdown_grace` before cancelling the rest so
+/// their agent process groups are terminated by the connection guards.
+///
+/// Shared by the standalone `serve` command (signal-driven) and named servers
+/// (control-plane driven); `cancel` is the sender wired into every agent.
+pub(crate) async fn serve_with_shutdown(
+    listener: TcpListener,
+    router: Router,
+    shutdown_rx: watch::Receiver<bool>,
+    cancel: watch::Sender<bool>,
+    shutdown_grace: Duration,
+) -> Result<()> {
+    let (force_close, force_close_rx) = watch::channel(false);
+    let listener = ForceCloseListener {
+        inner: listener,
+        force_close: force_close_rx,
+    };
+    let mut server_shutdown = shutdown_rx.clone();
+    let mut supervisor_shutdown = shutdown_rx;
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            wait_for_shutdown(&mut server_shutdown).await;
+        })
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result.context("ACP HTTP server failed"),
+        () = wait_for_shutdown(&mut supervisor_shutdown) => {
+            match timeout(shutdown_grace, &mut server).await {
+                Ok(result) => result.context("ACP HTTP server failed"),
+                Err(_) => {
+                    // Cancel agents whose connections did not drain: dropping
+                    // their connection futures runs the child guards that
+                    // terminate the agent process groups.
+                    cancel.send_replace(true);
+                    force_close.send_replace(true);
+                    timeout(FORCE_CLOSE_GRACE, &mut server)
+                        .await
+                        .context("ACP HTTP connections did not close after forced shutdown")??;
+                    Ok(())
+                },
+            }
+        }
+    }
+}
+
+/// Waits until `receiver` observes `true` or its sender is dropped.
+pub(crate) async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Waits until the server-level cancellation fires (shutdown drain grace
+/// expired). A dropped sender means cancellation can never fire, so the
+/// connection runs until the client closes it.
+async fn wait_for_cancellation(receiver: &mut watch::Receiver<bool>) {
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+            return;
+        }
+    }
+}
+
+/// TCP listener that aborts every accepted connection once the shutdown drain
+/// grace expired, so connections that never observed the cancellation still
+/// close instead of blocking shutdown indefinitely.
+pub(crate) struct ForceCloseListener {
+    inner: TcpListener,
+    force_close: watch::Receiver<bool>,
+}
+
+impl Listener for ForceCloseListener {
+    type Io = ForceCloseIo;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, address)) => {
+                    return (ForceCloseIo::new(stream, self.force_close.clone()), address);
+                }
+                Err(error) => {
+                    eprintln!("failed to accept ACP connection: {error}");
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+/// Connection I/O that starts failing once the shutdown drain grace expired.
+pub(crate) struct ForceCloseIo {
+    inner: tokio::net::TcpStream,
+    cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl ForceCloseIo {
+    fn new(inner: tokio::net::TcpStream, mut force_close: watch::Receiver<bool>) -> Self {
+        Self {
+            inner,
+            cancelled: Box::pin(async move {
+                wait_for_shutdown(&mut force_close).await;
+            }),
+        }
+    }
+
+    fn poll_cancelled(&mut self, context: &mut TaskContext<'_>) -> std::io::Result<()> {
+        if self.cancelled.as_mut().poll(context).is_ready() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "ACP shutdown grace expired",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl AsyncRead for ForceCloseIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.poll_cancelled(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for ForceCloseIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if let Err(error) = self.poll_cancelled(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.poll_cancelled(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if let Err(error) = self.poll_cancelled(context) {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
 }
 
 pub(crate) fn validate_router_options(options: &AgentRouterOptions) -> Result<()> {
@@ -412,14 +653,23 @@ struct ObservedAgent {
     inner: AcpAgent,
     health: AgentHealth,
     state: Arc<LaunchState>,
+    /// Set when the owning server shuts down and its drain grace expired;
+    /// terminates the connection so its child guard kills the process group.
+    cancelled: watch::Receiver<bool>,
 }
 
 impl ObservedAgent {
-    fn new(inner: AcpAgent, health: AgentHealth, state: Arc<LaunchState>) -> Self {
+    fn new(
+        inner: AcpAgent,
+        health: AgentHealth,
+        state: Arc<LaunchState>,
+        cancelled: watch::Receiver<bool>,
+    ) -> Self {
         Self {
             inner,
             health,
             state,
+            cancelled,
         }
     }
 }
@@ -496,18 +746,24 @@ impl ConnectTo<Client> for ObservedAgent {
         self,
         client: impl ConnectTo<<Client as Role>::Counterpart>,
     ) -> agent_client_protocol::Result<()> {
+        let ObservedAgent {
+            inner,
+            health,
+            state,
+            mut cancelled,
+        } = self;
         let guard = LaunchGuard {
-            state: self.state.clone(),
-            health: self.health.clone(),
+            state: state.clone(),
+            health: health.clone(),
             completed: false,
         };
         let (agent_channel, agent_future) =
-            <AcpAgent as ConnectTo<Client>>::into_channel_and_future(self.inner);
+            <AcpAgent as ConnectTo<Client>>::into_channel_and_future(inner);
         let (client_channel, client_future) = client.into_channel_and_future();
-        let state_for_requests = self.state.clone();
-        let state_for_responses = self.state.clone();
-        let health_for_responses = self.health.clone();
-        let generation = self.state.generation;
+        let state_for_requests = state.clone();
+        let state_for_responses = state.clone();
+        let health_for_responses = health.clone();
+        let generation = state.generation;
         let bridge = Channel::bridge_with_inspection(
             agent_channel,
             client_channel,
@@ -544,9 +800,21 @@ impl ConnectTo<Client> for ObservedAgent {
                 Ok(())
             },
         );
-        let result = futures::try_join!(agent_future, client_future, bridge).map(|_| ());
-        guard.complete(&result);
-        result
+        let connection = async {
+            let result = futures::try_join!(agent_future, client_future, bridge).map(|_| ());
+            guard.complete(&result);
+            result
+        };
+        futures::pin_mut!(connection);
+        tokio::select! {
+            result = &mut connection => result,
+            () = wait_for_cancellation(&mut cancelled) => {
+                // The connection future is dropped here, which drops the agent
+                // future and runs its child guard: the agent's process group is
+                // terminated even though the client never closed its stream.
+                Ok(())
+            }
+        }
     }
 }
 
@@ -652,6 +920,7 @@ mod tests {
         let router = agent_router(
             AcpAgentConfig::new("unused-agent"),
             &AgentRouterOptions::default(),
+            watch::channel(false).1,
         )
         .unwrap();
 
@@ -698,9 +967,13 @@ mod tests {
             ..AgentRouterOptions::default()
         };
 
-        let error = agent_router(AcpAgentConfig::new("unused-agent"), &options)
-            .err()
-            .unwrap();
+        let error = agent_router(
+            AcpAgentConfig::new("unused-agent"),
+            &options,
+            watch::channel(false).1,
+        )
+        .err()
+        .unwrap();
         assert!(
             error
                 .to_string()
@@ -848,6 +1121,7 @@ mod tests {
     #[cfg(unix)]
     mod network {
         use std::net::SocketAddr;
+        use std::process::Stdio;
         use std::time::{Duration, Instant};
 
         use async_tungstenite::tokio::connect_async;
@@ -905,13 +1179,15 @@ done"#,
                     .await
                     .unwrap();
                 let address = listener.local_addr().unwrap();
-                let mut router = agent_router_with_stderr(config, &options.router, stderr).unwrap();
+                let mut router =
+                    agent_router_with_stderr(config, &options.router, stderr, watch::channel(false).1)
+                        .unwrap();
                 if let Some(subpath) = options.subpath.as_deref() {
                     validate_subpath(subpath).unwrap();
                     router = Router::new().nest(subpath, router);
                 }
                 let task = tokio::spawn(async move {
-                    serve_listener(listener, router).await.unwrap();
+                    serve_listener(listener, router, watch::channel(false).0).await.unwrap();
                 });
                 Self { address, task }
             }
@@ -943,6 +1219,153 @@ done"#,
             .await
             .expect("HTTP initialize timed out")
             .unwrap()
+        }
+
+        // Standalone serve variant with an externally triggerable shutdown, so
+        // the graceful-drain + cancellation path can be tested without signals.
+        struct GracefulServer {
+            address: SocketAddr,
+            task: tokio::task::JoinHandle<()>,
+            shutdown: watch::Sender<bool>,
+        }
+
+        impl GracefulServer {
+            async fn start_with_agent(config: AcpAgentConfig) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (cancel, cancel_rx) = watch::channel(false);
+                let router = agent_router_with_stderr(
+                    config,
+                    &AgentRouterOptions::default(),
+                    AgentStderr::spawn(),
+                    cancel_rx,
+                )
+                .unwrap();
+                let (shutdown, shutdown_rx) = watch::channel(false);
+                let task = tokio::spawn(async move {
+                    serve_with_shutdown(
+                        listener,
+                        router,
+                        shutdown_rx,
+                        cancel,
+                        Duration::from_millis(200),
+                    )
+                    .await
+                    .unwrap();
+                });
+                Self {
+                    address,
+                    task,
+                    shutdown,
+                }
+            }
+
+            fn http_url(&self, path: &str) -> String {
+                format!("http://{}{path}", self.address)
+            }
+
+            /// Signals shutdown and waits for the server to stop.
+            async fn shutdown_and_wait(mut self) {
+                self.shutdown.send_replace(true);
+                timeout(Duration::from_secs(2), &mut self.task)
+                    .await
+                    .expect("graceful shutdown did not stop the server")
+                    .unwrap();
+            }
+        }
+
+        impl Drop for GracefulServer {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        #[tokio::test]
+        async fn shutdown_terminates_long_lived_agent_process_group_after_grace() {
+            let temporary = tempfile::tempdir().unwrap();
+            let child_pid_path = temporary.path().join("child.pid");
+            // The agent shell records its own PID and starts a background
+            // `sleep` (a same-group descendant) before entering the read loop.
+            // The descendant only dies if the connection guard kills the whole
+            // process group: stdin EOF alone would orphan it while the sleep
+            // keeps running for 60 seconds.
+            let agent = AcpAgentConfig::new("/bin/sh").args([
+                "-c",
+                &format!(
+                    r#"echo $$ > {leader}; sleep 60 & echo $! > {child}; while IFS= read -r line; do printf '%s
+' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}'; done"#,
+                    leader = temporary.path().join("leader.pid").display(),
+                    child = child_pid_path.display(),
+                ),
+            ]);
+            let server = GracefulServer::start_with_agent(agent).await;
+            let client = reqwest::Client::new();
+            let endpoint = server.http_url("/acp");
+
+            let initialized = initialize_http(&client, &endpoint).await;
+            assert_eq!(initialized.status(), reqwest::StatusCode::OK);
+            let connection_id = initialized
+                .headers()
+                .get(CONNECTION_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            // Keep the connection active (holding the agent child) through an
+            // SSE stream, like the production client lifecycle.
+            let sse = client
+                .get(&endpoint)
+                .header(ACCEPT, "text/event-stream")
+                .header(CONNECTION_ID, &connection_id)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(sse.status(), reqwest::StatusCode::OK);
+            let mut events = sse.bytes_stream();
+
+            let child_pid: i32 = timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(pid) = std::fs::read_to_string(&child_pid_path) {
+                        break pid.trim().parse().unwrap();
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("agent background child never started");
+
+            server.shutdown_and_wait().await;
+
+            // The SSE stream must close once the connection is cancelled.
+            let end = timeout(Duration::from_secs(1), events.next())
+                .await
+                .expect("SSE connection remained open after shutdown");
+            assert!(
+                end.is_none() || end.as_ref().is_some_and(|result| result.is_err()),
+                "SSE produced data instead of closing after shutdown"
+            );
+
+            // Dropping the connection terminates the agent's whole process
+            // group (the child guard SIGKILLs the group leader), so the
+            // background child dies even though it is not the direct child of
+            // the server process.
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let alive = std::process::Command::new("kill")
+                        .args(["-0", &child_pid.to_string()])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .unwrap()
+                        .success();
+                    if !alive {
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("agent process group survived graceful shutdown");
         }
 
         #[tokio::test]

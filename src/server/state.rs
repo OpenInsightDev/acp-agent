@@ -229,14 +229,6 @@ pub(super) fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-pub(super) async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
-    while !*receiver.borrow() {
-        if receiver.changed().await.is_err() {
-            break;
-        }
-    }
-}
-
 pub(super) async fn cleanup_failed_start(
     child: &mut tokio::process::Child,
     state_path: &Path,

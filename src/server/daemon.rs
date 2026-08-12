@@ -5,6 +5,9 @@ pub(super) struct ServerState {
     pub(super) server_name: String,
     pub(super) agents: Arc<RwLock<HashMap<String, RegisteredAgent>>>,
     pub(super) shutdown: watch::Sender<bool>,
+    /// Cancels every registered agent once the shutdown drain grace expired,
+    /// so their connection guards terminate the agent process groups.
+    pub(super) cancel: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -24,107 +27,6 @@ impl RegisteredAgent {
             router,
             readyz_endpoint: true,
         }
-    }
-}
-
-pub(super) struct ForceCloseListener {
-    inner: TcpListener,
-    force_close: watch::Receiver<bool>,
-}
-
-impl axum::serve::Listener for ForceCloseListener {
-    type Io = ForceCloseIo;
-    type Addr = std::net::SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            match self.inner.accept().await {
-                Ok((stream, address)) => {
-                    return (ForceCloseIo::new(stream, self.force_close.clone()), address);
-                }
-                Err(error) => {
-                    eprintln!("failed to accept named server connection: {error}");
-                    sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.inner.local_addr()
-    }
-}
-
-pub(super) struct ForceCloseIo {
-    inner: tokio::net::TcpStream,
-    cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
-}
-
-impl ForceCloseIo {
-    fn new(inner: tokio::net::TcpStream, mut force_close: watch::Receiver<bool>) -> Self {
-        Self {
-            inner,
-            cancelled: Box::pin(async move {
-                wait_for_shutdown(&mut force_close).await;
-            }),
-        }
-    }
-
-    fn poll_cancelled(&mut self, context: &mut TaskContext<'_>) -> std::io::Result<()> {
-        if self.cancelled.as_mut().poll(context).is_ready() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "named server shutdown grace expired",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl AsyncRead for ForceCloseIo {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut TaskContext<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if let Err(error) = self.poll_cancelled(context) {
-            return Poll::Ready(Err(error));
-        }
-        Pin::new(&mut self.inner).poll_read(context, buffer)
-    }
-}
-
-impl AsyncWrite for ForceCloseIo {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut TaskContext<'_>,
-        buffer: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        if let Err(error) = self.poll_cancelled(context) {
-            return Poll::Ready(Err(error));
-        }
-        Pin::new(&mut self.inner).poll_write(context, buffer)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        context: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if let Err(error) = self.poll_cancelled(context) {
-            return Poll::Ready(Err(error));
-        }
-        Pin::new(&mut self.inner).poll_flush(context)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        context: &mut TaskContext<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if let Err(error) = self.poll_cancelled(context) {
-            return Poll::Ready(Err(error));
-        }
-        Pin::new(&mut self.inner).poll_shutdown(context)
     }
 }
 
@@ -154,10 +56,16 @@ pub(super) async fn run_with(
         );
     }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // SIGINT/SIGTERM stop the daemon exactly like the control-plane shutdown
+    // endpoint: gracefully drain connections within `shutdown_grace` before
+    // cancelling agents so their process groups are terminated.
+    tokio::spawn(crate::serve::await_termination_signal(shutdown_tx.clone()));
+    let (cancel, _) = watch::channel(false);
     let state = ServerState {
         server_name: name.clone(),
         agents: Arc::default(),
         shutdown: shutdown_tx,
+        cancel: cancel.clone(),
     };
     let router = server_router(state.clone());
     let control_url = control_url(&host, address.port())?;
@@ -176,7 +84,9 @@ pub(super) async fn run_with(
         public_url(&file.listen_host, file.port)?
     );
 
-    let result = serve_with_shutdown(listener, router, shutdown_rx, shutdown_grace).await;
+    let result =
+        crate::serve::serve_with_shutdown(listener, router, shutdown_rx, cancel, shutdown_grace)
+            .await;
     let cleanup = match tokio::fs::remove_file(&state_path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -186,40 +96,23 @@ pub(super) async fn run_with(
     result.and(cleanup)
 }
 
+// Test-only wrapper preserving the daemon's internal 4-argument shutdown API;
+// production `run_with` wires the real cancellation sender.
+#[cfg(test)]
 pub(super) async fn serve_with_shutdown(
     listener: TcpListener,
     router: Router,
     shutdown_rx: watch::Receiver<bool>,
     shutdown_grace: Duration,
 ) -> Result<()> {
-    let (force_close, force_close_rx) = watch::channel(false);
-    let listener = ForceCloseListener {
-        inner: listener,
-        force_close: force_close_rx,
-    };
-    let mut server_shutdown = shutdown_rx.clone();
-    let mut supervisor_shutdown = shutdown_rx;
-    let server = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            wait_for_shutdown(&mut server_shutdown).await;
-        })
-        .into_future();
-    tokio::pin!(server);
-    tokio::select! {
-        result = &mut server => result.context("named ACP server failed"),
-        () = wait_for_shutdown(&mut supervisor_shutdown) => {
-            match timeout(shutdown_grace, &mut server).await {
-                Ok(result) => result.context("named ACP server failed"),
-                Err(_) => {
-                    force_close.send_replace(true);
-                    timeout(Duration::from_secs(1), &mut server)
-                        .await
-                        .context("named ACP connections did not close after forced shutdown")??;
-                    Ok(())
-                },
-            }
-        }
-    }
+    crate::serve::serve_with_shutdown(
+        listener,
+        router,
+        shutdown_rx,
+        watch::channel(false).0,
+        shutdown_grace,
+    )
+    .await
 }
 
 pub(super) fn server_router(state: ServerState) -> Router {
@@ -332,7 +225,7 @@ pub(super) async fn add_agent(
     // Router construction may validate configuration and must happen before
     // taking the registry lock; fetching a registry or resolving a binary can
     // be slow and must not block existing dispatches or registrations.
-    let router = match crate::serve::agent_router(config, &options) {
+    let router = match crate::serve::agent_router(config, &options, state.cancel.subscribe()) {
         Ok(router) => router,
         Err(error) => {
             return api_error(

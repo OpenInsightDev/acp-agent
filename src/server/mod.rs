@@ -10,15 +10,12 @@ use state::*;
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::future::{Future, IntoFuture};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -33,7 +30,7 @@ use axum::{
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, ReadBuf},
+    io::{AsyncReadExt, AsyncSeekExt},
     net::TcpListener,
     process::Command,
     sync::{RwLock, watch},
@@ -683,10 +680,12 @@ mod tests {
 
     fn test_state() -> ServerState {
         let (shutdown, _) = watch::channel(false);
+        let (cancel, _) = watch::channel(false);
         ServerState {
             server_name: "test".to_string(),
             agents: Arc::default(),
             shutdown,
+            cancel,
         }
     }
 
@@ -1129,14 +1128,17 @@ done"#,
 
             async fn start_with_agent(config: AcpAgentConfig, shutdown_grace: Duration) -> Self {
                 let (shutdown, receiver) = watch::channel(false);
+                let (cancel, cancel_rx) = watch::channel(false);
                 let state = ServerState {
                     server_name: "test".into(),
                     agents: Arc::default(),
                     shutdown,
+                    cancel: cancel.clone(),
                 };
                 let router = crate::serve::agent_router(
                     config,
                     &crate::serve::AgentRouterOptions::default(),
+                    cancel_rx,
                 )
                 .unwrap();
                 insert_agent(
@@ -1147,10 +1149,11 @@ done"#,
                 .unwrap();
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();
-                let task = tokio::spawn(serve_with_shutdown(
+                let task = tokio::spawn(crate::serve::serve_with_shutdown(
                     listener,
                     server_router(state),
                     receiver,
+                    cancel,
                     shutdown_grace,
                 ));
                 Self {
