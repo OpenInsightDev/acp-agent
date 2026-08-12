@@ -9,6 +9,7 @@ use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use serde_json::to_vec_pretty;
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use tokio::fs;
 use zip::ZipArchive;
 
@@ -107,14 +108,6 @@ async fn cache_binary_target_in_mode(
     );
 
     if !force_refresh && let Some(prepared) = validate_cached_binary(&paths, &expected).await? {
-        make_executable(&prepared.executable_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to mark {} executable",
-                    prepared.executable_path.display()
-                )
-            })?;
         return Ok(prepared);
     }
 
@@ -165,7 +158,10 @@ async fn promote_staged_cache(
                 return Ok(cached);
             }
 
-            if try_exists(&paths.cache_dir).await? {
+            if fs::try_exists(&paths.cache_dir)
+                .await
+                .with_context(|| format!("failed to inspect {}", paths.cache_dir.display()))?
+            {
                 let backup_dir = paths
                     .parent_dir
                     .join(unique_backup_dir_name(&paths.cache_dir));
@@ -325,43 +321,17 @@ fn truncate_install_log(path: &Path) -> std::io::Result<()> {
     std::fs::write(path, rewritten)
 }
 
-/// UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` form, without extra dependencies.
+/// UTC timestamp in `YYYY-MM-DDTHH:MM:SSZ` form.
 fn utc_timestamp() -> String {
-    let since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let days = (since_epoch.as_secs() / 86_400) as i64;
-    let secs_of_day = since_epoch.as_secs() % 86_400;
-    let (year, month, day) = civil_from_days(days);
+    let now = OffsetDateTime::now_utc();
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60
-    )
-}
-
-/// Converts days since the Unix epoch to a `(year, month, day)` civil date
-/// using Howard Hinnant's `civil_from_days` algorithm.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    (
-        if month <= 2 { year + 1 } else { year },
-        month as u32,
-        day as u32,
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z",
+        year = now.year(),
+        month = now.month() as u8,
+        day = now.day(),
+        hour = now.hour(),
+        minute = now.minute(),
+        second = now.second(),
     )
 }
 
@@ -536,7 +506,10 @@ pub(crate) async fn make_executable(path: &Path) -> Result<(), io::Error> {
         use std::os::unix::fs::PermissionsExt;
 
         let mut permissions = fs::metadata(path).await?.permissions();
-        permissions.set_mode(0o755);
+        // Preserve the archive's permission policy and add only the owner
+        // execute bit, so a private `0700` or group-limited `0750` executable
+        // is not broadened to world-readable/executable.
+        permissions.set_mode(permissions.mode() | 0o100);
         fs::set_permissions(path, permissions).await?;
     }
 
@@ -593,7 +566,10 @@ async fn validate_cached_binary(
     paths: &BinaryCachePaths,
     expected: &BinaryCacheMetadata,
 ) -> Result<Option<CachedBinary>> {
-    if !try_exists(&paths.metadata_path).await? {
+    if !fs::try_exists(&paths.metadata_path)
+        .await
+        .with_context(|| format!("failed to inspect {}", paths.metadata_path.display()))?
+    {
         return Ok(None);
     }
 
@@ -632,14 +608,6 @@ async fn validate_cached_binary(
         extracted_dir: paths.extracted_dir.clone(),
         cache_dir: paths.cache_dir.clone(),
     }))
-}
-
-async fn try_exists(path: &Path) -> Result<bool> {
-    match fs::metadata(path).await {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
-    }
 }
 
 async fn cleanup_dir(path: &Path) {
@@ -823,7 +791,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(!try_exists(&paths.cache_dir).await.unwrap());
+        assert!(!fs::try_exists(&paths.cache_dir).await.unwrap());
     }
 
     #[tokio::test]
@@ -997,11 +965,30 @@ mod tests {
         assert_eq!(&timestamp[16..17], ":");
     }
 
-    #[test]
-    fn civil_from_days_matches_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
-        assert_eq!(civil_from_days(20_668), (2026, 8, 3));
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn make_executable_preserves_mode_and_adds_only_owner_execute() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempdir().unwrap();
+        for (source_mode, expected_mode) in [
+            (0o600, 0o700),
+            (0o700, 0o700),
+            (0o750, 0o750),
+            (0o755, 0o755),
+        ] {
+            let path = temp_dir.path().join(format!("tool-{source_mode:o}"));
+            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(source_mode)).unwrap();
+
+            make_executable(&path).await.unwrap();
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, expected_mode,
+                "mode {source_mode:o} should become {expected_mode:o}"
+            );
+        }
     }
 
     // --- ZIP extraction ---
