@@ -43,8 +43,7 @@ pub const YOLO_MODES_URL: &str =
 /// so `--yolo` never hard-fails on a missing network.
 pub const EMBEDDED_YOLO_MODES: &str = include_str!("../data/yolo-modes.json");
 
-/// Timeout for the CDN catalog fetch, so offline environments fall back to the
-/// bundled catalog quickly instead of hanging on the connect attempt.
+// Bound remote lookup so offline use reaches the embedded catalog promptly.
 const YOLO_MODES_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// ACP config-option selector for agents whose yolo mode lives in
@@ -131,7 +130,6 @@ pub async fn fetch_yolo_modes() -> Result<YoloModes> {
     }
 }
 
-/// Downloads the yolo-mode catalog from [`YOLO_MODES_URL`].
 async fn fetch_remote_yolo_modes() -> Result<YoloModes> {
     let client = reqwest::Client::builder()
         .timeout(YOLO_MODES_FETCH_TIMEOUT)
@@ -152,7 +150,6 @@ async fn fetch_remote_yolo_modes() -> Result<YoloModes> {
     YoloModes::from_json(&text)
 }
 
-/// Returns the catalog bundled with this release, parsed once per process.
 fn embedded_yolo_modes() -> &'static YoloModes {
     static EMBEDDED: OnceLock<YoloModes> = OnceLock::new();
     EMBEDDED.get_or_init(|| {
@@ -205,6 +202,15 @@ pub fn yolo_extra_args_from(catalog: &YoloModes, agent_id: &str) -> Result<Vec<S
 pub async fn yolo_extra_args(agent_id: &str) -> Result<Vec<String>> {
     let catalog = fetch_yolo_modes().await?;
     yolo_extra_args_from(&catalog, agent_id)
+}
+
+/// Prepends the agent's yolo startup arguments when `enabled` is true.
+pub async fn resolve_args(agent_id: &str, enabled: bool, args: Vec<String>) -> Result<Vec<String>> {
+    if !enabled {
+        return Ok(args);
+    }
+    let extra = yolo_extra_args(agent_id).await?;
+    Ok(extra.into_iter().chain(args).collect())
 }
 
 #[cfg(test)]
@@ -283,5 +289,16 @@ mod tests {
         let args = yolo_extra_args_from(embedded_yolo_modes(), "codex-acp")
             .expect("codex-acp has a yolo flag");
         assert_eq!(args, vec!["--dangerously-skip-sandbox-and-permissions"]);
+    }
+
+    #[tokio::test]
+    async fn disabled_resolution_preserves_arguments_without_catalog_lookup() {
+        let args = vec!["--model".to_string(), "demo".to_string()];
+        assert_eq!(
+            resolve_args("unknown-agent", false, args.clone())
+                .await
+                .unwrap(),
+            args
+        );
     }
 }

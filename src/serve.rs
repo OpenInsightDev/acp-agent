@@ -1,3 +1,5 @@
+//! ACP HTTP/SSE and WebSocket serving for a single registry agent.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -14,16 +16,9 @@ use axum::{
 };
 use tokio::net::TcpListener;
 
-/// HTTP listener and ACP endpoint configuration.
+/// ACP HTTP router configuration shared by standalone and named servers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServeOptions {
-    /// Hostname or IP address to bind.
-    pub host: String,
-    /// TCP port to bind. Port `0` lets the operating system choose a port.
-    pub port: u16,
-    /// Optional URL prefix applied to all served endpoints (ACP, health,
-    /// readyz). Defaults to the server root when `None`.
-    pub subpath: Option<String>,
+pub struct AgentRouterOptions {
     /// Path serving ACP over HTTP/SSE and WebSocket.
     pub path: String,
     /// Cross-origin browser access policy.
@@ -37,12 +32,9 @@ pub struct ServeOptions {
     pub readyz_endpoint: bool,
 }
 
-impl Default for ServeOptions {
+impl Default for AgentRouterOptions {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".to_string(),
-            port: 0,
-            subpath: None,
             path: "/acp".to_string(),
             cors: CorsOptions::disabled(),
             health_endpoint: true,
@@ -51,7 +43,33 @@ impl Default for ServeOptions {
     }
 }
 
-pub(crate) fn cors_options(origins: Vec<String>, allow_any: bool) -> Result<CorsOptions> {
+/// HTTP listener configuration for serving one agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeOptions {
+    /// Hostname or IP address to bind.
+    pub host: String,
+    /// TCP port to bind. Port `0` lets the operating system choose a port.
+    pub port: u16,
+    /// Optional URL prefix applied to all served endpoints. Defaults to the
+    /// server root when `None`.
+    pub subpath: Option<String>,
+    /// ACP router configuration.
+    pub router: AgentRouterOptions,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            subpath: None,
+            router: AgentRouterOptions::default(),
+        }
+    }
+}
+
+/// Builds the browser-origin policy shared by standalone and named servers.
+pub fn cors_options(origins: Vec<String>, allow_any: bool) -> Result<CorsOptions> {
     if allow_any && !origins.is_empty() {
         bail!("CORS origins cannot be combined with allow_any_origin");
     }
@@ -72,7 +90,11 @@ pub async fn serve_agent(agent_id: &str, options: ServeOptions, args: &[String])
 }
 
 async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<()> {
-    let router = agent_router(config, &options)?;
+    let mut router = agent_router(config, &options.router)?;
+    if let Some(subpath) = options.subpath.as_deref() {
+        validate_subpath(subpath)?;
+        router = Router::new().nest(subpath, router);
+    }
     let listener = TcpListener::bind((options.host.as_str(), options.port))
         .await
         .with_context(|| {
@@ -87,9 +109,9 @@ async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<(
     eprintln!(
         "Serving ACP agent at http://{address}{}{} (WebSocket available on the same endpoint)",
         options.subpath.as_deref().unwrap_or(""),
-        options.path
+        options.router.path
     );
-    if options.readyz_endpoint {
+    if options.router.readyz_endpoint {
         eprintln!(
             "Agent readiness probe at http://{address}{}/readyz",
             options.subpath.as_deref().unwrap_or("")
@@ -98,12 +120,9 @@ async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<(
     serve_listener(listener, router).await
 }
 
-/// Builds the complete ACP HTTP service for an agent.
-///
-/// This includes the ACP HTTP/SSE/WebSocket routes, CORS policy, health
-/// probes, readiness tracking, and an optional subpath. Named servers reuse
-/// this builder so they expose exactly the same agent service as `serve`.
-pub(crate) fn agent_router(config: AcpAgentConfig, options: &ServeOptions) -> Result<Router> {
+// Named servers reuse this unprefixed router so both serving modes keep the
+// same transport, CORS, health, and readiness behavior.
+pub(crate) fn agent_router(config: AcpAgentConfig, options: &AgentRouterOptions) -> Result<Router> {
     let server_options = http_server_options(options)?;
     let health = AgentHealth::default();
     // Wrap each agent so its stderr lands in this process's logs and its
@@ -131,12 +150,6 @@ pub(crate) fn agent_router(config: AcpAgentConfig, options: &ServeOptions) -> Re
     if options.readyz_endpoint {
         router = router.route("/readyz", get(readyz).with_state(health));
     }
-    // When a `--subpath` is configured, serve the entire tree (ACP endpoint,
-    // health, readyz) under that URL prefix.
-    if let Some(subpath) = options.subpath.as_deref() {
-        router = Router::new().nest(subpath, router);
-    }
-
     Ok(router)
 }
 
@@ -146,8 +159,7 @@ async fn serve_listener(listener: TcpListener, router: Router) -> Result<()> {
         .context("ACP HTTP server failed")
 }
 
-/// Validates the options shared by standalone and named ACP HTTP routers.
-pub(crate) fn validate_options(options: &ServeOptions) -> Result<()> {
+pub(crate) fn validate_router_options(options: &AgentRouterOptions) -> Result<()> {
     if !options.path.starts_with('/') {
         bail!("ACP endpoint path must start with '/'");
     }
@@ -160,23 +172,25 @@ pub(crate) fn validate_options(options: &ServeOptions) -> Result<()> {
     if options.readyz_endpoint && options.path == "/readyz" {
         bail!("ACP endpoint path conflicts with the readiness endpoint");
     }
-    if let Some(subpath) = &options.subpath {
-        if !subpath.starts_with('/') {
-            bail!("subpath must start with '/'");
-        }
-        if subpath.len() == 1 {
-            bail!("subpath cannot be '/'");
-        }
-        if subpath.ends_with('/') {
-            bail!("subpath must not end with '/'");
-        }
+    Ok(())
+}
+
+fn validate_subpath(subpath: &str) -> Result<()> {
+    if !subpath.starts_with('/') {
+        bail!("subpath must start with '/'");
+    }
+    if subpath.len() == 1 {
+        bail!("subpath cannot be '/'");
+    }
+    if subpath.ends_with('/') {
+        bail!("subpath must not end with '/'");
     }
 
     Ok(())
 }
 
-fn http_server_options(options: &ServeOptions) -> Result<ServerOptions> {
-    validate_options(options)?;
+fn http_server_options(options: &AgentRouterOptions) -> Result<ServerOptions> {
+    validate_router_options(options)?;
     Ok(ServerOptions {
         path: options.path.clone(),
         cors: options.cors.clone(),
@@ -184,11 +198,8 @@ fn http_server_options(options: &ServeOptions) -> Result<ServerOptions> {
     })
 }
 
-/// Per-server launch-outcome tracking for `GET /readyz`.
-///
-/// Readiness follows the *most recent* launch, not any historical failure:
-/// one transient failure must not flip the probe permanently, and a later
-/// success clears it (the last failure detail is kept for diagnostics).
+// A later successful launch clears a transient readiness failure while the
+// previous failure detail remains available for diagnostics.
 #[derive(Clone, Default)]
 struct AgentHealth {
     state: Arc<Mutex<AgentHealthState>>,
@@ -202,7 +213,6 @@ struct AgentHealthState {
     last_failure: Option<AgentFailure>,
 }
 
-/// Detail of the most recent failed agent launch.
 #[derive(Clone)]
 struct AgentFailure {
     at: SystemTime,
@@ -228,30 +238,16 @@ impl AgentHealth {
     }
 }
 
-/// Per-connection launch signals shared between the debug callback and the
-/// connection future.
-///
-/// The library tears a connection down by aborting its agent task, which
-/// cancels the in-flight connection future before it reports its outcome
-/// (observed for ~80% of fast agent-exit failures). Signals recorded from the
-/// debug callback (which always fires) plus a drop guard on the future make
-/// the outcome observable even when the future is cancelled.
+// The transport may cancel the connection future before it returns. Signals
+// from the debug callback plus the drop guard preserve the launch outcome.
 #[derive(Default)]
 struct LaunchState {
-    /// Agent stdout carried a JSON-RPC response. Stderr is not a liveness
-    /// signal — healthy agents write stderr too.
     protocol_responded: AtomicBool,
-    /// An initialize request was sent; failures are only recorded when this
-    /// is set, so probe connections that never initialize don't count.
     initialize_requested: AtomicBool,
-    /// Bounded tail of agent stderr, used as failure diagnostics.
     stderr_tail: Mutex<String>,
-    /// Ensures the outcome is recorded only once (`complete()` and the drop
-    /// guard may both fire for the same launch).
     outcome_recorded: AtomicBool,
 }
 
-/// Maximum stderr retained per connection for `GET /readyz` diagnostics.
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 
 impl LaunchState {
@@ -269,8 +265,6 @@ impl LaunchState {
     }
 }
 
-/// Forwards agent stderr to this process's logs and records the launch
-/// signals used by `GET /readyz`.
 fn forward_agent_line(line: &str, direction: LineDirection, state: &LaunchState) {
     match direction {
         LineDirection::Stderr => {
@@ -290,8 +284,6 @@ fn forward_agent_line(line: &str, direction: LineDirection, state: &LaunchState)
     }
 }
 
-/// Whether a stdio line is a JSON-RPC response (top-level `result`/`error`),
-/// which proves the agent process is alive and responsive.
 fn is_jsonrpc_response(line: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(line)
         .ok()
@@ -303,7 +295,6 @@ fn is_jsonrpc_response(line: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// An [`AcpAgent`] whose launch outcome is recorded in [`AgentHealth`].
 struct ObservedAgent {
     inner: AcpAgent,
     health: AgentHealth,
@@ -320,10 +311,8 @@ impl ObservedAgent {
     }
 }
 
-/// Records a launch outcome exactly once — from the connection result, or,
-/// when the future is cancelled by teardown, from a drop guard using the
-/// observed signals: responded → success; initialize sent but no response →
-/// failure with the stderr tail; neither → client probe, record nothing.
+// Records once from the connection result or, on cancellation, from the
+// signals collected before the future was dropped.
 struct LaunchGuard {
     state: Arc<LaunchState>,
     health: AgentHealth,
@@ -395,12 +384,6 @@ impl ConnectTo<Client> for ObservedAgent {
     }
 }
 
-/// `GET /readyz` handler.
-///
-/// `200 ready` while the most recent agent launch succeeded, otherwise `503`
-/// with the failure counts and the last failure detail (including the agent
-/// stderr tail). Unlike `GET /health` (HTTP-server liveness), this reflects
-/// agent-process health.
 async fn readyz(State(health): State<AgentHealth>) -> Response {
     let (attempts, failures, last_attempt_failed, last_failure) = {
         let state = health.state.lock().expect("agent health mutex poisoned");
@@ -445,9 +428,9 @@ mod tests {
             ("/health", "conflicts with the health endpoint"),
             ("/readyz", "conflicts with the readiness endpoint"),
         ] {
-            let error = http_server_options(&ServeOptions {
+            let error = http_server_options(&AgentRouterOptions {
                 path: path.to_string(),
-                ..ServeOptions::default()
+                ..AgentRouterOptions::default()
             })
             .unwrap_err();
             assert!(error.to_string().contains(expected), "{error:#}");
@@ -458,11 +441,7 @@ mod tests {
             ("/", "cannot be '/'"),
             ("/myapp/", "must not end with '/'"),
         ] {
-            let error = http_server_options(&ServeOptions {
-                subpath: Some(subpath.to_string()),
-                ..ServeOptions::default()
-            })
-            .unwrap_err();
+            let error = validate_subpath(subpath).unwrap_err();
             assert!(error.to_string().contains(expected), "{error:#}");
         }
 
@@ -500,21 +479,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_router_applies_serve_routing_configuration() {
+    async fn agent_router_builds_an_unprefixed_router() {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
 
-        let options = ServeOptions {
-            subpath: Some("/agent".to_string()),
-            ..ServeOptions::default()
-        };
-        let router = agent_router(AcpAgentConfig::new("unused-agent"), &options).unwrap();
+        let router = agent_router(
+            AcpAgentConfig::new("unused-agent"),
+            &AgentRouterOptions::default(),
+        )
+        .unwrap();
 
         let health = router
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/agent/health")
+                    .uri("/health")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -526,7 +505,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/agent/readyz")
+                    .uri("/readyz")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -534,23 +513,23 @@ mod tests {
             .unwrap();
         assert_eq!(readyz.status(), StatusCode::OK);
 
-        let bare_health = router
+        let nested_health = router
             .oneshot(
                 Request::builder()
-                    .uri("/health")
+                    .uri("/agent/health")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(bare_health.status(), StatusCode::NOT_FOUND);
+        assert_eq!(nested_health.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
-    fn agent_router_uses_serve_validation() {
-        let options = ServeOptions {
+    fn agent_router_validates_router_options() {
+        let options = AgentRouterOptions {
             path: "acp".to_string(),
-            ..ServeOptions::default()
+            ..AgentRouterOptions::default()
         };
 
         let error = agent_router(AcpAgentConfig::new("unused-agent"), &options)
@@ -615,7 +594,11 @@ done"#,
                     .await
                     .unwrap();
                 let address = listener.local_addr().unwrap();
-                let router = agent_router(config, &options).unwrap();
+                let mut router = agent_router(config, &options.router).unwrap();
+                if let Some(subpath) = options.subpath.as_deref() {
+                    validate_subpath(subpath).unwrap();
+                    router = Router::new().nest(subpath, router);
+                }
                 let task = tokio::spawn(async move {
                     serve_listener(listener, router).await.unwrap();
                 });
@@ -822,7 +805,10 @@ done"#,
             assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
 
             let allowed_options = ServeOptions {
-                cors: cors_options(Vec::new(), true).unwrap(),
+                router: AgentRouterOptions {
+                    cors: cors_options(Vec::new(), true).unwrap(),
+                    ..AgentRouterOptions::default()
+                },
                 ..ServeOptions::default()
             };
             let allowed_server = TestServer::start(allowed_options).await;
@@ -858,9 +844,6 @@ done"#,
                     .contains("agent closed before initialize response")
             );
 
-            // The readiness probe must surface the launch failure with its
-            // cause, unlike the liveness probe which only reflects the HTTP
-            // server. The outcome is recorded asynchronously, so poll briefly.
             let readyz = readyz_until_failure(&client, &server).await;
             assert!(readyz.contains("1 of 1 agent launches failed"));
             assert!(
@@ -871,9 +854,6 @@ done"#,
 
         #[tokio::test]
         async fn readyz_surfaces_agent_stderr_tail_after_exit_failure() {
-            // Mirrors the real-world failure mode where the agent process
-            // starts, writes its startup error to stderr (e.g. Deno's
-            // dependency-age rejection), and exits before initializing.
             let server = TestServer::start_with_agent(
                 ServeOptions::default(),
                 AcpAgentConfig::new("/bin/sh").args([
@@ -897,8 +877,6 @@ done"#,
             );
         }
 
-        /// Polls `GET /readyz` until it reports the launch failure, returning
-        /// the response body.
         async fn readyz_until_failure(client: &reqwest::Client, server: &TestServer) -> String {
             timeout(Duration::from_secs(5), async {
                 loop {
@@ -916,9 +894,12 @@ done"#,
         #[tokio::test]
         async fn honors_custom_path_health_and_cors_options() {
             let custom_options = ServeOptions {
-                path: "/rpc".to_string(),
-                cors: cors_options(vec!["https://example.com".to_string()], false).unwrap(),
-                health_endpoint: false,
+                router: AgentRouterOptions {
+                    path: "/rpc".to_string(),
+                    cors: cors_options(vec!["https://example.com".to_string()], false).unwrap(),
+                    health_endpoint: false,
+                    ..AgentRouterOptions::default()
+                },
                 ..ServeOptions::default()
             };
             let server = TestServer::start(custom_options).await;
@@ -976,7 +957,6 @@ done"#,
             let server = TestServer::start(custom_options).await;
             let client = reqwest::Client::new();
 
-            // Endpoints without the subpath prefix must not be reachable.
             let bare_health = client.get(server.http_url("/health")).send().await.unwrap();
             assert_eq!(
                 bare_health.status(),
@@ -996,7 +976,6 @@ done"#,
                 "ACP should only be under the subpath"
             );
 
-            // Health and readyz are reachable under the subpath.
             let health = client
                 .get(server.http_url("/myapp/health"))
                 .send()
@@ -1011,7 +990,6 @@ done"#,
                 .unwrap();
             assert_eq!(readyz.status(), reqwest::StatusCode::OK);
 
-            // The ACP endpoint is served under the subpath.
             let initialized = initialize_http(&client, &server.http_url("/myapp/acp")).await;
             assert_eq!(initialized.status(), reqwest::StatusCode::OK);
             let connection_id = initialized
@@ -1026,7 +1004,6 @@ done"#,
                 .send()
                 .await;
 
-            // WebSocket is served under the same subpath prefix.
             let (mut socket, response) = connect_async(server.ws_url("/myapp/acp")).await.unwrap();
             assert!(
                 response.headers().contains_key(CONNECTION_ID),

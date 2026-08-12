@@ -1,5 +1,4 @@
 use std::env;
-use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
@@ -9,132 +8,78 @@ use tokio::process::Command;
 const JS_TOOLS: [&str; 2] = ["npm", "deno"];
 const PYTHON_TOOLS: [&str; 1] = ["uv"];
 
-/// Detects missing agent toolchains and installs them if confirmed.
-///
-/// The installer currently supports Deno and uv detection.
-/// detection. It prints a plan, optionally prompts unless `assume_yes` is `true`,
-/// runs the installers, and reports the verified installations.
-pub async fn install_env<W: Write>(writer: &mut W, assume_yes: bool) -> Result<()> {
-    let report = detect_environment()?;
-    write_detection_report(&report, writer)?;
-
-    let plan = InstallationPlan::from_report(&report);
-    if plan.targets.is_empty() {
-        writeln!(writer)?;
-        writeln!(
-            writer,
-            "Environment already satisfies the requirements. No installation is needed."
-        )?;
-        return Ok(());
-    }
-
-    writeln!(writer)?;
-    writeln!(writer, "Planned installation:")?;
-    for target in &plan.targets {
-        writeln!(
-            writer,
-            "{}: {}",
-            target.label(),
-            target.official_command_display()
-        )?;
-    }
-
-    let confirmed = if assume_yes {
-        true
-    } else {
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        prompt_for_installation(&mut reader, writer)?
-    };
-
-    if !confirmed {
-        writeln!(writer, "Installation cancelled.")?;
-        return Ok(());
-    }
-
-    writeln!(writer)?;
-    writeln!(writer, "Starting installation...")?;
-    let results = run_installation_plan(&plan).await?;
-
-    writeln!(writer)?;
-    for result in &results {
-        writeln!(
-            writer,
-            "{} installed and verified at {}",
-            result.target.label(),
-            result.path.display()
-        )?;
-        if !result.on_path {
-            writeln!(
-                writer,
-                "Note: {} was installed outside the current PATH. Open a new shell if the command is not yet recognized.",
-                result.target.program()
-            )?;
-        }
-    }
-    writeln!(writer, "Environment installation complete.")?;
-
-    Ok(())
-}
-
+/// Availability of the supported local toolchains.
 #[derive(Debug, Clone)]
-struct EnvironmentReport {
-    js: Vec<ToolAvailability>,
-    python: Vec<ToolAvailability>,
+pub struct EnvironmentReport {
+    /// JavaScript package runners used for npm distributions.
+    pub js: Vec<ToolAvailability>,
+    /// Python package runners used for uvx distributions.
+    pub python: Vec<ToolAvailability>,
 }
 
+/// Availability of one executable on the current machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ToolAvailability {
-    name: &'static str,
-    path: Option<PathBuf>,
+pub struct ToolAvailability {
+    /// Executable name.
+    pub name: &'static str,
+    /// Resolved executable path when available.
+    pub path: Option<PathBuf>,
 }
 
 impl ToolAvailability {
-    fn is_available(&self) -> bool {
+    /// Whether the executable was found on `PATH`.
+    pub fn is_available(&self) -> bool {
         self.path.is_some()
     }
 }
 
+/// Toolchains that should be installed to support agent distributions.
 #[derive(Debug, Clone)]
-struct InstallationPlan {
-    targets: Vec<InstallTarget>,
+pub struct InstallationPlan {
+    /// Ordered installation targets.
+    pub targets: Vec<InstallTarget>,
 }
 
-impl InstallationPlan {
-    fn from_report(report: &EnvironmentReport) -> Self {
-        let mut targets = Vec::new();
+/// Creates the installation plan for an environment report.
+pub fn plan_installation(report: &EnvironmentReport) -> InstallationPlan {
+    let mut targets = Vec::new();
 
-        if report.js.iter().all(|tool| !tool.is_available()) {
-            targets.push(InstallTarget::Deno);
-        }
-
-        if report.python.iter().all(|tool| !tool.is_available()) {
-            targets.push(InstallTarget::Uv);
-        }
-
-        Self { targets }
+    if report.js.iter().all(|tool| !tool.is_available()) {
+        targets.push(InstallTarget::Deno);
     }
+
+    if report.python.iter().all(|tool| !tool.is_available()) {
+        targets.push(InstallTarget::Uv);
+    }
+
+    InstallationPlan { targets }
 }
 
+/// A supported local toolchain installer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InstallTarget {
+pub enum InstallTarget {
+    /// Deno supplies an npm-compatible runner when npm is absent.
     Deno,
+    /// uv supplies the uvx runner for Python distributions.
     Uv,
 }
 
 impl InstallTarget {
-    fn label(self) -> &'static str {
+    /// Stable executable label for the target.
+    pub fn label(self) -> &'static str {
         match self {
             Self::Deno => "deno",
             Self::Uv => "uv",
         }
     }
 
-    fn program(self) -> &'static str {
+    /// Executable expected after installation.
+    pub fn program(self) -> &'static str {
         self.label()
     }
 
-    fn official_command_display(self) -> &'static str {
+    /// Official installer command shown before execution.
+    pub fn official_command_display(self) -> &'static str {
         if cfg!(windows) {
             match self {
                 Self::Deno => r#"powershell -c "irm https://deno.land/install.ps1 | iex""#,
@@ -199,14 +144,19 @@ impl InstallTarget {
     }
 }
 
+/// Verified result of installing one local toolchain.
 #[derive(Debug, Clone)]
-struct InstallationResult {
-    target: InstallTarget,
-    path: PathBuf,
-    on_path: bool,
+pub struct InstallationResult {
+    /// Installed toolchain.
+    pub target: InstallTarget,
+    /// Verified executable path.
+    pub path: PathBuf,
+    /// Whether the executable is already on the current process's `PATH`.
+    pub on_path: bool,
 }
 
-fn detect_environment() -> Result<EnvironmentReport> {
+/// Detects the supported toolchains available in the current environment.
+pub fn detect_environment() -> Result<EnvironmentReport> {
     Ok(EnvironmentReport {
         js: detect_tools(&JS_TOOLS)?,
         python: detect_tools(&PYTHON_TOOLS)?,
@@ -226,48 +176,8 @@ fn detect_tools(programs: &[&'static str]) -> Result<Vec<ToolAvailability>> {
         .collect()
 }
 
-fn write_detection_report<W: Write>(report: &EnvironmentReport, writer: &mut W) -> Result<()> {
-    writeln!(writer, "Environment detection results:")?;
-    writeln!(writer, "JavaScript tools:")?;
-    write_tool_group(&report.js, writer)?;
-    writeln!(writer, "Python tools:")?;
-    write_tool_group(&report.python, writer)?;
-    Ok(())
-}
-
-fn write_tool_group<W: Write>(tools: &[ToolAvailability], writer: &mut W) -> Result<()> {
-    for tool in tools {
-        match &tool.path {
-            Some(path) => writeln!(writer, "{}: available ({})", tool.name, path.display())?,
-            None => writeln!(writer, "{}: missing", tool.name)?,
-        }
-    }
-
-    Ok(())
-}
-
-fn prompt_for_installation<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> Result<bool> {
-    loop {
-        write!(writer, "Proceed with installation? [Y/n]: ")?;
-        writer.flush()?;
-
-        let mut input = String::new();
-        let bytes_read = reader.read_line(&mut input)?;
-        if bytes_read == 0 {
-            return Ok(true);
-        }
-
-        match input.trim().to_ascii_lowercase().as_str() {
-            "" | "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => {
-                writeln!(writer, "Please answer with y or n.")?;
-            }
-        }
-    }
-}
-
-async fn run_installation_plan(plan: &InstallationPlan) -> Result<Vec<InstallationResult>> {
+/// Runs and verifies every target in an installation plan.
+pub async fn install_plan(plan: &InstallationPlan) -> Result<Vec<InstallationResult>> {
     match plan.targets.as_slice() {
         [] => Ok(Vec::new()),
         [target] => Ok(vec![install_and_verify(*target).await?]),
@@ -454,50 +364,22 @@ mod tests {
 
     #[test]
     fn plans_deno_and_uv_when_both_toolchains_are_missing() {
-        let plan = InstallationPlan::from_report(&report(&[], &[]));
+        let plan = plan_installation(&report(&[], &[]));
 
         assert_eq!(plan.targets, vec![InstallTarget::Deno, InstallTarget::Uv]);
     }
 
     #[test]
     fn skips_deno_installation_when_npm_is_available() {
-        let plan = InstallationPlan::from_report(&report(&["npm"], &["uv"]));
+        let plan = plan_installation(&report(&["npm"], &["uv"]));
 
         assert!(plan.targets.is_empty());
     }
 
     #[test]
     fn skips_deno_installation_when_deno_is_available() {
-        let plan = InstallationPlan::from_report(&report(&["deno"], &["uv"]));
+        let plan = plan_installation(&report(&["deno"], &["uv"]));
 
         assert!(plan.targets.is_empty());
-    }
-
-    #[test]
-    fn prompts_default_to_yes_on_empty_input() {
-        let mut input = io::Cursor::new("\n");
-        let mut output = Vec::new();
-
-        let confirmed = prompt_for_installation(&mut input, &mut output).unwrap();
-
-        assert!(confirmed);
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "Proceed with installation? [Y/n]: "
-        );
-    }
-
-    #[test]
-    fn prompts_accept_no_after_retry() {
-        let mut input = io::Cursor::new("maybe\nn\n");
-        let mut output = Vec::new();
-
-        let confirmed = prompt_for_installation(&mut input, &mut output).unwrap();
-
-        assert!(!confirmed);
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "Proceed with installation? [Y/n]: Please answer with y or n.\nProceed with installation? [Y/n]: "
-        );
     }
 }
