@@ -22,6 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, ReadBuf},
@@ -107,8 +108,6 @@ struct ServerStatus {
 struct RegistrationInfo {
     id: String,
     route: String,
-    path: String,
-    health_endpoint: bool,
     readyz_endpoint: bool,
 }
 
@@ -226,10 +225,6 @@ struct RegisteredAgent {
     id: String,
     route: String,
     router: Router,
-    /// ACP endpoint path below the public route.
-    path: String,
-    /// Whether the agent router exposes `/health`.
-    health_endpoint: bool,
     /// Whether the agent router exposes `/readyz`.
     readyz_endpoint: bool,
 }
@@ -242,8 +237,6 @@ impl RegisteredAgent {
             id,
             route,
             router,
-            path: "/acp".to_string(),
-            health_endpoint: true,
             readyz_endpoint: true,
         }
     }
@@ -695,6 +688,7 @@ pub async fn registrations<W: Write>(writer: &mut W, name: &str, json: bool) -> 
     let state = load_live_server(name).await?;
     let response = reqwest::Client::new()
         .get(format!("{}/api/registrations", state.control_url))
+        .timeout(Duration::from_secs(5))
         .send()
         .await
         .with_context(|| format!("failed to contact server \"{name}\""))?;
@@ -705,16 +699,21 @@ pub async fn registrations<W: Write>(writer: &mut W, name: &str, json: bool) -> 
         .json()
         .await
         .context("failed to parse the registrations response")?;
-    let mut records = Vec::with_capacity(registrations.len());
-    for registration in registrations {
-        let (readiness, detail) = probe_registration_readiness(&state, &registration).await;
-        records.push(RegistrationRecord {
-            id: registration.id,
-            route: registration.route,
-            readiness,
-            detail,
-        });
-    }
+    // Probe every route's readiness concurrently: a hung router must not
+    // stall the other probes (each probe is bounded by its own timeout).
+    let mut records = join_all(registrations.into_iter().map(|registration| {
+        let state = &state;
+        async move {
+            let (readiness, detail) = probe_registration_readiness(state, &registration).await;
+            RegistrationRecord {
+                id: registration.id,
+                route: registration.route,
+                readiness,
+                detail,
+            }
+        }
+    }))
+    .await;
     records.sort_by(|left, right| {
         left.route
             .cmp(&right.route)
@@ -836,7 +835,9 @@ async fn server_record(name: &str, state: &ServerFile) -> ServerRecord {
         state: run_state.as_str().to_string(),
         listen_host: Some(state.listen_host.clone()),
         port: Some(state.port),
-        address: public_url(&state.listen_host, state.port).ok(),
+        // The wildcard listeners publish a loopback control address; report
+        // the same reachable address rather than an unconnectable 0.0.0.0.
+        address: control_url(&state.listen_host, state.port).ok(),
         pid: Some(state.pid),
         version: Some(state.version.clone()),
     }
@@ -966,7 +967,8 @@ fn strip_json_suffix(name: &str) -> Option<&str> {
 }
 
 /// Returns the last `max_lines` lines of `content`, dropping a trailing
-/// newline so an empty file yields no lines.
+/// newline so an empty file yields no lines. A trailing `\r` is stripped
+/// from each line so CRLF logs tail cleanly on every platform.
 fn tail_lines(content: &str, max_lines: usize) -> Vec<&str> {
     if max_lines == 0 {
         return Vec::new();
@@ -976,7 +978,10 @@ fn tail_lines(content: &str, max_lines: usize) -> Vec<&str> {
         lines.pop();
     }
     let start = lines.len().saturating_sub(max_lines);
-    lines[start..].to_vec()
+    lines[start..]
+        .iter()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect()
 }
 
 /// Runs the foreground process behind the hidden `__server-run` command.
@@ -1106,8 +1111,6 @@ async fn server_registrations(State(state): State<ServerState>) -> Json<Vec<Regi
             .map(|agent| RegistrationInfo {
                 id: agent.id.clone(),
                 route: agent.route.clone(),
-                path: agent.path.clone(),
-                health_endpoint: agent.health_endpoint,
                 readyz_endpoint: agent.readyz_endpoint,
             })
             .collect()
@@ -1202,8 +1205,6 @@ async fn add_agent(
         id: registration.id,
         route: registration.route,
         router,
-        path: registration.serve.path,
-        health_endpoint: registration.serve.health_endpoint,
         readyz_endpoint: registration.serve.readyz_endpoint,
     };
 
@@ -1673,6 +1674,7 @@ mod tests {
         assert_eq!(tail_lines("a\n", 5), vec!["a"]);
         assert_eq!(tail_lines("", 5), Vec::<&str>::new());
         assert_eq!(tail_lines("a\nb\n", 0), Vec::<&str>::new());
+        assert_eq!(tail_lines("a\r\nb\r\nc\r\n", 2), vec!["b", "c"]);
     }
 
     #[tokio::test]
@@ -1735,12 +1737,13 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let paths = ServerPaths::new(temporary.path().join("servers")).unwrap();
 
-        // Seed one stale record plus one non-state file to ignore.
+        // Seed one stale record plus one non-state file to ignore. The
+        // wildcard listener must publish a reachable (loopback) address.
         write_private_json_atomic(
             &paths.state_file("work"),
             &ServerFile {
                 name: "work".into(),
-                listen_host: "127.0.0.1".into(),
+                listen_host: "0.0.0.0".into(),
                 port: 8020,
                 control_url: "http://127.0.0.1:8020".into(),
                 pid: 999_999_998,
@@ -1757,6 +1760,7 @@ mod tests {
         assert_eq!(records[0]["name"], "work");
         assert_eq!(records[0]["state"], "stale");
         assert_eq!(records[0]["port"], 8020);
+        assert_eq!(records[0]["address"], "http://127.0.0.1:8020");
         // Deterministic field order for automation.
         let serialized = String::from_utf8(output).unwrap();
         let name_pos = serialized.find("\"name\"").unwrap();
@@ -2450,8 +2454,6 @@ mod tests {
                 id: "demo".into(),
                 route: "/demo".into(),
                 router: echo_router(),
-                path: "/rpc".into(),
-                health_endpoint: false,
                 readyz_endpoint: false,
             },
         )
@@ -2472,8 +2474,6 @@ mod tests {
         assert_eq!(registrations.as_array().unwrap().len(), 2);
         assert_eq!(registrations[0]["route"], "/demo");
         assert_eq!(registrations[0]["id"], "demo");
-        assert_eq!(registrations[0]["path"], "/rpc");
-        assert_eq!(registrations[0]["health_endpoint"], false);
         assert_eq!(registrations[0]["readyz_endpoint"], false);
         assert_eq!(registrations[1]["route"], "/zulu");
         assert_eq!(registrations[1]["readyz_endpoint"], true);
@@ -2496,8 +2496,6 @@ mod tests {
             &RegistrationInfo {
                 id: "demo".into(),
                 route: "/demo".into(),
-                path: "/acp".into(),
-                health_endpoint: true,
                 readyz_endpoint: false,
             },
         )
