@@ -5,7 +5,7 @@ CLI and Rust library for discovering, installing, running, and serving [Agent Cl
 ## Install
 
 ```sh
-curl -fsSL https://github.com/OpenInsightDev/acp-agent/releases/latest/download/install.sh | sh
+curl -fsSL https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/scripts/install.sh | sh
 ```
 
 or with `cargo`:
@@ -13,6 +13,15 @@ or with `cargo`:
 ```sh
 cargo install acp-agent
 ```
+
+The installer fetches the binary from the [jsDelivr CDN](https://www.jsdelivr.com/):
+binaries are published to npm as platform packages
+(`@open-insight/acp-agent-<platform>`, built with [cargo-npm](https://github.com/abemedia/cargo-npm))
+and served from `https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-<platform>@<version>/acp-agent`.
+The installer always resolves the exact version to install (from `ACP_AGENT_VERSION`, or by
+following the GitHub `latest` redirect) and verifies the CDN binary reports that version;
+if the CDN is unreachable or mismatched, it falls back to the GitHub release archives
+(verified against SHA256SUMS).
 
 ## Quick start
 
@@ -323,6 +332,13 @@ The server is implemented with [`agent-client-protocol-http` 2.0](https://docs.r
 ## Contribution
 
 If you know how to enable yolo mode for the acp agent you are using, you are welcome to add new entries to the `data/yolo-modes.json` list.
+
+Releases are published to npm automatically (see `release.yml`). Publishing uses npm
+[trusted publishing](https://docs.npmjs.com/trusted-publishers/) (OIDC), with `NPM_TOKEN`
+only as the first-publish fallback. Once the five `@open-insight/acp-agent*` packages are on
+npm, configure each one on npmjs.com (Settings → Trusted publishing → GitHub Actions:
+`OpenInsightDev`/`acp-agent`, workflow `release.yml`, allow `npm publish`), then remove the
+`NPM_TOKEN` secret and the `NODE_AUTH_TOKEN` env in `release.yml`.
 
 ## License
 

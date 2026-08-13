@@ -1,5 +1,6 @@
 /target
 /references
+/npm
 
 .env
 

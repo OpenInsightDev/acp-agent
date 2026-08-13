@@ -110,6 +110,59 @@ jobs:
           generate_release_notes: true
           overwrite_files: true
 
+  npm-publish:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-npm
+        run: cargo install cargo-npm --locked
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Stage binaries for cargo-npm
+        run: |
+          set -eux
+          for tarball in dist/acp-agent-*.tar.gz; do
+            case "$tarball" in
+              *linux-x86_64*) triple="x86_64-unknown-linux-gnu" ;;
+              *linux-aarch64*) triple="aarch64-unknown-linux-gnu" ;;
+              *darwin-x86_64*) triple="x86_64-apple-darwin" ;;
+              *darwin-aarch64*) triple="aarch64-apple-darwin" ;;
+              *) echo "error: no cargo-npm target mapped for $tarball" >&2; exit 1 ;;
+            esac
+            mkdir -p "target/$triple/release"
+            tar -xzf "$tarball" -C "target/$triple/release" acp-agent
+          done
+      - name: Generate npm packages
+        run: cargo npm generate --clean
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24 # npm trusted publishing requires Node >= 22.14
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false # never cache in release builds
+      # NODE_AUTH_TOKEN only needed for the first publish; switch to OIDC
+      # trusted publishing afterwards (see README).
+      - name: Publish to npm
+        run: cargo npm publish -- --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Smoke test CDN URLs
+        run: |
+          set -eux
+          VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "acp-agent") | .version')"
+          for p in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            curl -fsSL --retry 5 --retry-all-errors -o /dev/null \
+              "https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-${p}@${VERSION}/acp-agent"
+          done
+
   docker:
     runs-on: ubuntu-latest
     permissions:
