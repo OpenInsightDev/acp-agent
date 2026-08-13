@@ -6,6 +6,10 @@ use acp_agent::commands::{Cli, CliExit, execute_cli};
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    // Reclaim staging/backup directories left behind by installs interrupted
+    // before the RAII staging guard could run (crash or kill). Best-effort:
+    // a failed sweep must never prevent the requested command from running.
+    let _ = acp_agent::installer::binary::clean_stale_staging_entries().await;
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
 

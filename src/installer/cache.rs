@@ -8,7 +8,7 @@ use tokio::fs;
 use crate::registry::Platform;
 
 const CACHE_NAMESPACE: &str = "acp-agent";
-const AGENTS_DIR: &str = "agents";
+pub(crate) const AGENTS_DIR: &str = "agents";
 pub(crate) const EXTRACTED_DIR_NAME: &str = "extracted";
 pub(crate) const METADATA_FILE_NAME: &str = "metadata.json";
 

@@ -45,6 +45,7 @@ tokio = { version = "1.52.0", features = [
 ] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }
+tempfile = "3.27.0"
 which = "8.0.5"
 # Registry ZIP assets use standard deflate; keep the codec/encryption surface minimal.
 zip = { version = "8.4.0", default-features = false, features = ["deflate-flate2"] }
@@ -55,4 +56,3 @@ libc = "0.2"
 [dev-dependencies]
 async-tungstenite = { version = "0.35.0", features = ["tokio-runtime"] }
 reqwest = { version = "0.13.2", features = ["stream"] }
-tempfile = "3.27.0"

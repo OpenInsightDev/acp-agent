@@ -1,6 +1,12 @@
 use std::fs::File;
+use std::future::Future;
 use std::io;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,7 +19,7 @@ use tokio::fs;
 use zip::ZipArchive;
 
 use crate::installer::cache::{
-    BinaryCacheMetadata, BinaryCachePaths, EXTRACTED_DIR_NAME, METADATA_FILE_NAME,
+    AGENTS_DIR, BinaryCacheMetadata, BinaryCachePaths, EXTRACTED_DIR_NAME, METADATA_FILE_NAME,
     binary_cache_paths, cache_root_dir, platform_cache_key, safe_path_component,
 };
 use crate::registry::{BinaryTarget, Platform, RegistryAgent};
@@ -106,25 +112,39 @@ async fn cache_binary_target_in_mode(
         .await
         .with_context(|| format!("failed to create {}", paths.parent_dir.display()))?;
 
-    let staging_dir = paths
-        .parent_dir
-        .join(unique_staging_dir_name(&agent.version));
-    fs::create_dir_all(&staging_dir)
-        .await
-        .with_context(|| format!("failed to create {}", staging_dir.display()))?;
+    // Stage the new cache in a `tempfile` guard so the payload is removed no
+    // matter how this future ends: an explicit error, a panic, or a
+    // cancellation while awaiting the download, extraction, or metadata
+    // write. The staged payload is renamed into the stable cache directory
+    // only after it has been fully prepared.
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(
+            ".{}-staging-",
+            safe_path_component(&agent.version)
+        ))
+        .tempdir_in(&paths.parent_dir)
+        .with_context(|| {
+            format!(
+                "failed to create staging directory in {}",
+                paths.parent_dir.display()
+            )
+        })?;
 
-    let staged = prepare_staging_directory(&staging_dir, target, &expected).await;
-    match staged {
-        Ok(()) => {}
-        Err(error) => {
-            cleanup_dir(&staging_dir).await;
-            return Err(error);
-        }
-    }
+    prepare_staging_directory(staging.path(), target, &expected).await?;
 
-    promote_staged_cache(&staging_dir, &paths, &expected, force_refresh).await
+    let cached = promote_staged_cache(staging.path(), &paths, &expected, force_refresh).await?;
+    // Promotion moved (or removed) the staged directory, so the guard's path
+    // no longer exists; keep it from attempting a redundant cleanup.
+    let _ = staging.keep();
+    Ok(cached)
 }
 
+/// Moves a fully prepared staging directory into the stable cache location.
+///
+/// The caller owns the staging directory through an RAII guard; on any error
+/// the guard removes whatever remains at `staging_dir`. This function only
+/// removes the staging directory itself on the one success path where it is
+/// abandoned: an existing valid cache is kept instead of the staged one.
 async fn promote_staged_cache(
     staging_dir: &Path,
     paths: &BinaryCachePaths,
@@ -157,7 +177,6 @@ async fn promote_staged_cache(
                     .parent_dir
                     .join(unique_backup_dir_name(&paths.cache_dir));
                 if let Err(backup_error) = fs::rename(&paths.cache_dir, &backup_dir).await {
-                    cleanup_dir(staging_dir).await;
                     return Err(backup_error).with_context(|| {
                         format!(
                             "failed to preserve existing cache directory {} before replacement",
@@ -168,7 +187,6 @@ async fn promote_staged_cache(
 
                 if let Err(promote_error) = fs::rename(staging_dir, &paths.cache_dir).await {
                     let restore_result = fs::rename(&backup_dir, &paths.cache_dir).await;
-                    cleanup_dir(staging_dir).await;
                     return match restore_result {
                         Ok(()) => Err(promote_error).with_context(|| {
                             format!(
@@ -209,7 +227,6 @@ async fn promote_staged_cache(
                 );
             }
 
-            cleanup_dir(staging_dir).await;
             Err(rename_error).with_context(|| {
                 format!(
                     "failed to promote staged cache {} to {}",
@@ -219,6 +236,49 @@ async fn promote_staged_cache(
             })
         }
     }
+}
+
+/// Removes staging and backup directories left behind by interrupted installs.
+///
+/// [`cache_binary_target`] stages new caches in a `tempfile` directory that is
+/// removed automatically when the install future ends, but a process that is
+/// killed (or a machine that crashes) mid-install never runs those drops.
+/// This sweep is invoked at process startup as a recovery measure and removes
+/// every dot-prefixed work directory under the cache's agents tree, including
+/// the `-backup-` directories used to preserve a cache during a forced
+/// refresh.
+pub async fn clean_stale_staging_entries() -> Result<usize> {
+    let root_dir = cache_root_dir()?;
+    Ok(clean_stale_staging_entries_in(&root_dir).await)
+}
+
+/// Removes dot-prefixed work directories under `root_dir/agents/**` and
+/// reports how many were removed. Errors are swallowed: the sweep is a
+/// best-effort recovery measure and must never fail its caller.
+async fn clean_stale_staging_entries_in(root_dir: &Path) -> usize {
+    let agents_dir = root_dir.join(AGENTS_DIR);
+    let mut removed = 0;
+    let Ok(mut agent_entries) = fs::read_dir(&agents_dir).await else {
+        return removed;
+    };
+    while let Ok(Some(agent_entry)) = agent_entries.next_entry().await {
+        let Ok(mut platform_entries) = fs::read_dir(agent_entry.path()).await else {
+            continue;
+        };
+        while let Ok(Some(platform_entry)) = platform_entries.next_entry().await {
+            let Ok(mut version_entries) = fs::read_dir(platform_entry.path()).await else {
+                continue;
+            };
+            while let Ok(Some(version_entry)) = version_entries.next_entry().await {
+                if version_entry.file_name().to_string_lossy().starts_with('.')
+                    && fs::remove_dir_all(version_entry.path()).await.is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
 }
 
 /// Appends one line per binary install attempt to `agent-install.log`.
@@ -430,12 +490,55 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 pub(crate) async fn extract_archive(archive_path: PathBuf, destination: PathBuf) -> Result<()> {
-    tokio::task::spawn_blocking(move || extract_archive_blocking(&archive_path, &destination))
-        .await
-        .context("blocking task failed while extracting archive")?
+    let cancel = Arc::new(AtomicBool::new(false));
+    let task_cancel = Arc::clone(&cancel);
+    let handle = tokio::task::spawn_blocking(move || {
+        extract_archive_blocking(&archive_path, &destination, &task_cancel)
+    });
+    // Dropping this future (an aborted or cancelled install) sets the flag, so
+    // the detached blocking extraction stops before the staging guard removes
+    // the directory instead of racing it.
+    CancellableExtraction { handle, cancel }.await
 }
 
-fn extract_archive_blocking(archive_path: &Path, destination: &Path) -> Result<()> {
+/// [`spawn_blocking`] join that signals a cancellation flag when dropped.
+///
+/// [`tokio::task::spawn_blocking`] tasks cannot be cancelled directly: dropping
+/// the [`JoinHandle`] merely detaches them, so an aborted install would leave a
+/// writer running against a directory the staging guard is deleting. Setting
+/// the flag from `Drop` lets the blocking extraction cooperate with the
+/// cancellation before the guard's removal runs.
+struct CancellableExtraction {
+    handle: tokio::task::JoinHandle<Result<()>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Future for CancellableExtraction {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.handle).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(anyhow!("extraction task failed: {error}"))),
+        }
+    }
+}
+
+impl Drop for CancellableExtraction {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+fn extract_archive_blocking(
+    archive_path: &Path,
+    destination: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("extraction cancelled");
+    }
     let file_name = archive_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -443,29 +546,21 @@ fn extract_archive_blocking(archive_path: &Path, destination: &Path) -> Result<(
         .to_ascii_lowercase();
 
     if file_name.ends_with(".zip") {
-        return extract_zip(archive_path, destination);
+        return extract_zip(archive_path, destination, cancel);
     }
 
     if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
         let file = File::open(archive_path)
             .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
         let decoder = GzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
-        archive
-            .unpack(destination)
-            .with_context(|| format!("failed to unpack archive into {}", destination.display()))?;
-        return Ok(());
+        return extract_tar(decoder, destination, cancel);
     }
 
     if file_name.ends_with(".tar.bz2") || file_name.ends_with(".tbz2") {
         let file = File::open(archive_path)
             .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
         let decoder = BzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
-        archive
-            .unpack(destination)
-            .with_context(|| format!("failed to unpack archive into {}", destination.display()))?;
-        return Ok(());
+        return extract_tar(decoder, destination, cancel);
     }
 
     let file_name = archive_path
@@ -482,17 +577,143 @@ fn extract_archive_blocking(archive_path: &Path, destination: &Path) -> Result<(
     Ok(())
 }
 
-fn extract_zip(archive_path: &Path, destination: &Path) -> Result<()> {
+/// Extracts a tar archive entry by entry, checking the cancellation flag
+/// between entries so an aborted install stops writing promptly.
+fn extract_tar<R: io::Read>(reader: R, destination: &Path, cancel: &AtomicBool) -> Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    let entries = archive.entries().with_context(|| {
+        format!(
+            "failed to read archive entries for {}",
+            destination.display()
+        )
+    })?;
+    for entry in entries {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("extraction cancelled");
+        }
+        let mut entry = entry.with_context(|| {
+            format!(
+                "failed to read an archive entry for {}",
+                destination.display()
+            )
+        })?;
+        entry
+            .unpack(destination)
+            .with_context(|| format!("failed to unpack archive into {}", destination.display()))?;
+    }
+    Ok(())
+}
+
+fn extract_zip(archive_path: &Path, destination: &Path, cancel: &AtomicBool) -> Result<()> {
     let file = File::open(archive_path)
         .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
     let mut archive = ZipArchive::new(file)
         .with_context(|| format!("failed to read ZIP archive {}", archive_path.display()))?;
-    archive.extract(destination).with_context(|| {
+
+    // Modes are applied in a second pass (children first) so a read-only
+    // directory entry cannot prevent its own contents from being extracted.
+    #[cfg(unix)]
+    let mut unix_modes: Vec<(PathBuf, u32)> = Vec::new();
+
+    for index in 0..archive.len() {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("extraction cancelled");
+        }
+        let mut entry = archive
+            .by_index(index)
+            .with_context(|| format!("failed to read ZIP entry {index}"))?;
+        let enclosed = entry.enclosed_name().ok_or_else(|| {
+            anyhow!(
+                "unsafe path in ZIP archive {}: entry {index}",
+                archive_path.display()
+            )
+        })?;
+        let outpath = destination.join(enclosed);
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&outpath)
+                .with_context(|| format!("failed to create directory {}", outpath.display()))?;
+            continue;
+        }
+
+        if entry.is_symlink() {
+            extract_zip_symlink(&mut entry, &outpath)?;
+            continue;
+        }
+
+        if let Some(parent) = outpath.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut outfile = File::create(&outpath)
+            .with_context(|| format!("failed to create {}", outpath.display()))?;
+        io::copy(&mut entry, &mut outfile)
+            .with_context(|| format!("failed to write {}", outpath.display()))?;
+
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            unix_modes.push((outpath, mode));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (path, mode) in unix_modes.into_iter().rev() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Creates a symlink entry from a ZIP archive. Symbolic links require the
+/// archive to record the target as the entry body; on platforms without
+/// symlink support the entry is rejected.
+fn extract_zip_symlink<R: Read>(
+    entry: &mut zip::read::ZipFile<'_, R>,
+    outpath: &Path,
+) -> Result<()> {
+    let mut target = Vec::with_capacity(entry.size() as usize);
+    entry
+        .read_to_end(&mut target)
+        .with_context(|| format!("failed to read symlink target for {}", outpath.display()))?;
+    let target = String::from_utf8(target).with_context(|| {
         format!(
-            "failed to extract ZIP archive into {}",
-            destination.display()
+            "symlink target for {} is not valid UTF-8",
+            outpath.display()
         )
     })?;
+
+    if let Some(parent) = outpath.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, outpath)
+            .with_context(|| format!("failed to create symlink {}", outpath.display()))?;
+    }
+    #[cfg(windows)]
+    {
+        let target_is_dir = std::fs::metadata(&target)
+            .map(|metadata| metadata.is_dir())
+            .unwrap_or(false);
+        if target_is_dir {
+            std::os::windows::fs::symlink_dir(&target, outpath)
+                .with_context(|| format!("failed to create symlink {}", outpath.display()))?;
+        } else {
+            std::os::windows::fs::symlink_file(&target, outpath)
+                .with_context(|| format!("failed to create symlink {}", outpath.display()))?;
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        bail!("symlinks are not supported on this platform");
+    }
     Ok(())
 }
 
@@ -634,18 +855,6 @@ async fn cleanup_dir(path: &Path) {
     let _ = fs::remove_dir_all(path).await;
 }
 
-fn unique_staging_dir_name(agent_version: &str) -> String {
-    let pid = std::process::id();
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!(
-        ".{}-staging-{pid}-{nanos}",
-        safe_path_component(agent_version)
-    )
-}
-
 fn unique_backup_dir_name(cache_dir: &Path) -> String {
     let version = cache_dir
         .file_name()
@@ -667,6 +876,8 @@ fn unique_work_dir_name(component: &str, kind: &str) -> String {
 mod tests {
     use super::*;
     use crate::installer::cache::BinaryCacheMetadata;
+    use crate::registry::{AgentDistribution, BinaryDistribution};
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -1122,7 +1333,7 @@ mod tests {
         });
 
         let destination = temp_dir.path().join("out");
-        extract_zip(&archive_path, &destination).unwrap();
+        extract_zip(&archive_path, &destination, &AtomicBool::new(false)).unwrap();
 
         assert!(destination.join("pkg/bin").is_dir());
         assert!(destination.join("pkg/bin/tool").is_file());
@@ -1139,7 +1350,7 @@ mod tests {
         build_raw_zip(&archive_path, "../escape.txt", b"evil");
 
         let destination = temp_dir.path().join("out");
-        assert!(extract_zip(&archive_path, &destination).is_err());
+        assert!(extract_zip(&archive_path, &destination, &AtomicBool::new(false)).is_err());
         assert!(!destination.join("escape.txt").exists());
         assert!(!temp_dir.path().join("escape.txt").exists());
     }
@@ -1163,7 +1374,7 @@ mod tests {
         });
 
         let destination = temp_dir.path().join("out");
-        extract_zip(&archive_path, &destination).unwrap();
+        extract_zip(&archive_path, &destination, &AtomicBool::new(false)).unwrap();
 
         let link = destination.join("pkg/link");
         let link_metadata = std::fs::symlink_metadata(&link).unwrap();
@@ -1198,10 +1409,259 @@ mod tests {
         });
 
         let destination = temp_dir.path().join("out");
-        extract_zip(&archive_path, &destination).unwrap();
+        extract_zip(&archive_path, &destination, &AtomicBool::new(false)).unwrap();
 
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&destination.join("pkg/run.sh")), 0o755);
         assert_eq!(mode(&destination.join("pkg/README")), 0o644);
+    }
+
+    // --- Cancellation and stale-entry recovery ---
+
+    /// Serves `body` over plain HTTP on an ephemeral localhost port and returns
+    /// its URL. With `dribble`, the body is sent one byte at a time with a
+    /// pause between bytes, so a client stays suspended mid-download until the
+    /// test aborts it.
+    async fn serve_archive(body: Vec<u8>, dribble: Option<Duration>, file_name: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(headers.as_bytes()).await;
+            match dribble {
+                Some(interval) => {
+                    for byte in body {
+                        let _ = socket.write_all(&[byte]).await;
+                        tokio::time::sleep(interval).await;
+                    }
+                }
+                None => {
+                    let _ = socket.write_all(&body).await;
+                }
+            }
+        });
+        format!("http://{address}/{file_name}")
+    }
+
+    /// Builds a ZIP archive with `entry_count` stored (uncompressed) entries.
+    /// Building stored entries is cheap in debug builds, while extracting tens
+    /// of thousands of them takes seconds, so a cancellation can be observed
+    /// deterministically mid-extraction.
+    fn many_entries_zip(entry_count: u32) -> Vec<u8> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let mut bytes = Vec::new();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut bytes));
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for index in 0..entry_count {
+            writer
+                .start_file(format!("pkg/f{index:05}.bin"), options)
+                .unwrap();
+            writer.write_all(&[index as u8; 64]).unwrap();
+        }
+        writer.finish().unwrap();
+        bytes
+    }
+
+    /// Dot-prefixed entry names directly inside `dir` (staging/backup work
+    /// directories left behind by interrupted installs).
+    async fn work_dirs_in(dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let Ok(mut entries) = fs::read_dir(dir).await else {
+            return names;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// Waits until the in-flight install has started writing extracted entries
+    /// into its staging directory, then returns, so a test can land a
+    /// cancellation mid-extraction regardless of machine speed.
+    async fn wait_for_extraction_started(parent_dir: &Path) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let Ok(mut entries) = fs::read_dir(parent_dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.starts_with('.') {
+                    continue;
+                }
+                let Ok(mut extracted_entries) = fs::read_dir(entry.path().join("extracted")).await
+                else {
+                    continue;
+                };
+                if let Ok(Some(_)) = extracted_entries.next_entry().await {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "extraction never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn binary_test_agent(version: &str, archive_url: &str) -> RegistryAgent {
+        let binary = BinaryDistribution {
+            linux_x86_64: Some(BinaryTarget {
+                archive: archive_url.to_string(),
+                cmd: "./bin/demo".to_string(),
+                sha256: None,
+                args: None,
+                env: None,
+            }),
+            ..BinaryDistribution::default()
+        };
+        RegistryAgent {
+            id: "demo".to_string(),
+            name: "Demo".to_string(),
+            version: version.to_string(),
+            description: "Demo agent".to_string(),
+            repository: None,
+            website: None,
+            authors: vec!["ACP".to_string()],
+            license: "MIT".to_string(),
+            icon: None,
+            distribution: AgentDistribution {
+                binary: Some(binary),
+                npx: None,
+                uvx: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_download_removes_the_staging_directory() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let platform = Platform::LinuxX86_64;
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", platform);
+
+        // The archive dribbles out over minutes, so the install is guaranteed
+        // to still be awaiting the download when the task is aborted.
+        let url = serve_archive(
+            vec![0x42; 64 * 1024],
+            Some(Duration::from_millis(25)),
+            "agent.tar.gz",
+        )
+        .await;
+        let agent = binary_test_agent("1.0.0", &url);
+        let target = agent
+            .distribution
+            .binary
+            .as_ref()
+            .unwrap()
+            .for_platform(platform)
+            .unwrap()
+            .clone();
+
+        let root = cache_root.clone();
+        let task = tokio::spawn(async move {
+            cache_binary_target_in_mode(&root, &agent, platform, &target, false).await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+        assert!(task.await.is_err(), "install should have been cancelled");
+
+        assert!(!paths.cache_dir.exists(), "no cache may be promoted");
+        assert_eq!(
+            work_dirs_in(&paths.parent_dir).await,
+            Vec::<String>::new(),
+            "staging directory must be removed on cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_extraction_removes_the_staging_directory() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let platform = Platform::LinuxX86_64;
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", platform);
+
+        // A 30k-entry stored ZIP downloads in a few milliseconds (the archive
+        // is a few megabytes) but takes seconds to extract, so the abort lands
+        // while the blocking extraction is still writing entries.
+        let url = serve_archive(many_entries_zip(30_000), None, "agent.zip").await;
+        let agent = binary_test_agent("1.0.0", &url);
+        let target = agent
+            .distribution
+            .binary
+            .as_ref()
+            .unwrap()
+            .for_platform(platform)
+            .unwrap()
+            .clone();
+
+        let root = cache_root.clone();
+        let task = tokio::spawn(async move {
+            cache_binary_target_in_mode(&root, &agent, platform, &target, false).await
+        });
+        wait_for_extraction_started(&paths.parent_dir).await;
+        task.abort();
+        assert!(task.await.is_err(), "install should have been cancelled");
+
+        // The detached blocking extraction keeps running until its next write
+        // fails against the removed directory; give it a moment to wind down
+        // before asserting the staging directory is gone.
+        for _ in 0..100 {
+            if work_dirs_in(&paths.parent_dir).await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!paths.cache_dir.exists(), "no cache may be promoted");
+        assert_eq!(
+            work_dirs_in(&paths.parent_dir).await,
+            Vec::<String>::new(),
+            "staging directory must be removed on cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_sweep_removes_stale_staging_and_backup_directories() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+
+        // A completed cache entry must survive the sweep.
+        fs::create_dir_all(&paths.extracted_dir).await.unwrap();
+        fs::write(&paths.metadata_path, b"{}").await.unwrap();
+
+        // Work directories abandoned by installs that were killed mid-flight.
+        let stale_staging = paths.parent_dir.join(".1.0.0-staging-123-456");
+        let stale_backup = paths.parent_dir.join(".1.0.0-backup-123-456");
+        fs::create_dir_all(stale_staging.join("extracted"))
+            .await
+            .unwrap();
+        fs::create_dir_all(&stale_backup).await.unwrap();
+
+        let removed = clean_stale_staging_entries_in(&cache_root).await;
+
+        assert_eq!(removed, 2);
+        assert!(!stale_staging.exists());
+        assert!(!stale_backup.exists());
+        assert!(paths.cache_dir.exists());
+        assert!(paths.metadata_path.exists());
     }
 }
