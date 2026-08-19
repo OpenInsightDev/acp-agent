@@ -82,6 +82,8 @@ pub struct RegisterOptions {
     pub health_endpoint: bool,
     /// Whether the agent router exposes `/readyz`.
     pub readyz_endpoint: bool,
+    /// Maximum number of concurrent agent processes for this route.
+    pub max_processes: usize,
     /// Whether to inject the agent's yolo argument.
     pub yolo: bool,
     /// Arguments forwarded to the agent process on connection.
@@ -222,6 +224,8 @@ struct AgentServeRequest {
     health_endpoint: bool,
     #[serde(default = "default_true")]
     readyz_endpoint: bool,
+    #[serde(default = "default_max_processes")]
+    max_processes: usize,
     #[serde(default)]
     yolo: bool,
     #[serde(default)]
@@ -230,6 +234,10 @@ struct AgentServeRequest {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_max_processes() -> usize {
+    crate::serve::DEFAULT_MAX_PROCESSES
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -541,6 +549,57 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "timed-out daemon process {pid} was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_start_reaps_child_and_removes_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = ServerPaths::new(temporary.path().join("servers")).unwrap();
+        let script = temporary.path().join("cancelled-start.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho $$ > \"$ACP_AGENT_SERVER_STATE_DIR/cancelled.pid\"\nprintf '{\"bad\":true}\\n' > \"$ACP_AGENT_SERVER_STATE_DIR/cancelled-start.json\"\nexec /bin/sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let pid_path = paths.directory.join("cancelled.pid");
+        let state_path = paths.state_file("cancelled-start");
+        let task = tokio::spawn(start_with(
+            StartOptions {
+                name: "cancelled-start".into(),
+                host: "127.0.0.1".into(),
+                port: 0,
+            },
+            paths,
+            script,
+            Duration::from_secs(30),
+        ));
+        timeout(Duration::from_secs(2), async {
+            while !pid_path.exists() || !state_path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("server child did not reach startup wait");
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        task.abort();
+        assert!(task.await.is_err());
+        timeout(Duration::from_secs(5), async {
+            while state_path.exists() || unsafe { libc::kill(pid, 0) == 0 } {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cancelled server startup was not cleaned up");
     }
 
     #[cfg(unix)]

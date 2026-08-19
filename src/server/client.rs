@@ -3,6 +3,56 @@ use super::daemon::{
 };
 use super::*;
 
+/// Owns a detached server child until its state file proves that startup has
+/// committed. Dropping the startup future must not leave an untracked daemon.
+struct StartupChildGuard {
+    child: Option<tokio::process::Child>,
+    pid: u32,
+    state_path: PathBuf,
+}
+
+impl StartupChildGuard {
+    fn new(child: tokio::process::Child, pid: u32, state_path: PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            pid,
+            state_path,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("startup child guard was already disarmed")
+    }
+
+    fn disarm(mut self) -> tokio::process::Child {
+        self.child
+            .take()
+            .expect("startup child guard was already disarmed")
+    }
+}
+
+impl Drop for StartupChildGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let pid = self.pid;
+        let state_path = self.state_path.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let cleanup = async move {
+                let _ = cleanup_failed_start(&mut child, &state_path, pid).await;
+            };
+            handle.spawn(cleanup);
+        } else {
+            // A runtime may already be shutting down, so retain a synchronous
+            // best-effort kill path when no executor can own the child.
+            let _ = child.start_kill();
+        }
+    }
+}
+
 /// Starts a named ACP server in the background and returns its URL.
 pub async fn start(options: StartOptions) -> Result<StartResult> {
     validate_name(&options.name)?;
@@ -50,12 +100,14 @@ pub(super) async fn start_with(
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr));
     detach_process(&mut command);
-    let mut child = command.spawn().context("failed to start server process")?;
+    let child = command.spawn().context("failed to start server process")?;
     let child_pid = child.id().context("failed to identify server process")?;
+    let mut startup_child = StartupChildGuard::new(child, child_pid, path.clone());
 
     let ready = async {
         loop {
-            if let Some(status) = child
+            if let Some(status) = startup_child
+                .child_mut()
                 .try_wait()
                 .context("failed to inspect server process")?
             {
@@ -78,21 +130,24 @@ pub(super) async fn start_with(
     let state = match timeout(start_timeout, ready).await {
         Ok(Ok(state)) => state,
         Ok(Err(error)) => {
-            cleanup_failed_start(&mut child, &path, child_pid)
+            cleanup_failed_start(startup_child.child_mut(), &path, child_pid)
                 .await
                 .with_context(|| format!("failed to clean up after startup error: {error:#}"))?;
+            drop(startup_child.disarm());
             return Err(error);
         }
         Err(_) => {
-            cleanup_failed_start(&mut child, &path, child_pid)
+            cleanup_failed_start(startup_child.child_mut(), &path, child_pid)
                 .await
                 .context("failed to clean up after server startup timeout")?;
+            drop(startup_child.disarm());
             bail!(
                 "timed out waiting for server to start; inspect {}",
                 log_path.display()
             );
         }
     };
+    drop(startup_child.disarm());
     Ok(StartResult {
         name: state.name,
         address: public_url(&state.listen_host, state.port)?,
@@ -146,6 +201,7 @@ pub async fn register(agent_id: &str, options: RegisterOptions) -> Result<Regist
             allow_any_origin: options.allow_any_origin,
             health_endpoint: options.health_endpoint,
             readyz_endpoint: options.readyz_endpoint,
+            max_processes: options.max_processes,
             yolo: options.yolo,
             args: options.args,
         },

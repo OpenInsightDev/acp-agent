@@ -1,5 +1,7 @@
 //! ACP HTTP/SSE and WebSocket serving for a single registry agent.
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,13 +19,16 @@ use axum::{
     Router,
     extract::State,
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::get,
     serve::Listener,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc, watch,
+};
 use tokio::time::{sleep, timeout};
 
 /// ACP HTTP router configuration shared by standalone and named servers.
@@ -40,6 +45,18 @@ pub struct AgentRouterOptions {
     /// `GET /health` stays `ok` even while agent launches fail, so this probe
     /// exists for operators/orchestrators to see agent-process health.
     pub readyz_endpoint: bool,
+    /// Maximum number of concurrent agent processes for this route.
+    pub max_processes: usize,
+}
+
+/// Default maximum number of concurrent agent processes per served route.
+pub const DEFAULT_MAX_PROCESSES: usize = 16;
+
+tokio::task_local! {
+    /// Permit reserved by the current HTTP initialize request.  The HTTP
+    /// server constructs its agent synchronously in that request task, so the
+    /// factory can transfer this exact permit without a cross-request queue.
+    static RESERVED_PROCESS_PERMIT: RefCell<Option<OwnedSemaphorePermit>>;
 }
 
 impl Default for AgentRouterOptions {
@@ -49,6 +66,7 @@ impl Default for AgentRouterOptions {
             cors: CorsOptions::disabled(),
             health_endpoint: true,
             readyz_endpoint: true,
+            max_processes: DEFAULT_MAX_PROCESSES,
         }
     }
 }
@@ -95,13 +113,21 @@ pub fn cors_options(origins: Vec<String>, allow_any: bool) -> Result<CorsOptions
 
 /// Exposes a registry agent over ACP HTTP/SSE and WebSocket transports.
 pub async fn serve_agent(agent_id: &str, options: ServeOptions, args: &[String]) -> Result<()> {
-    let config = crate::runner::resolve_agent_config(agent_id, args).await?;
-    serve_config(config, options).await
+    let resolved = crate::runner::resolve_agent_config(agent_id, args).await?;
+    serve_config(resolved, options).await
 }
 
-async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<()> {
+async fn serve_config(
+    resolved: crate::runner::ResolvedAgentConfig,
+    options: ServeOptions,
+) -> Result<()> {
     let (cancel, cancel_rx) = watch::channel(false);
-    let mut router = agent_router(config, &options.router, cancel_rx)?;
+    let mut router = agent_router_with_lease(
+        resolved.config,
+        &options.router,
+        cancel_rx,
+        resolved.cache_use_lease,
+    )?;
     if let Some(subpath) = options.subpath.as_deref() {
         validate_subpath(subpath)?;
         router = Router::new().nest(subpath, router);
@@ -133,22 +159,51 @@ async fn serve_config(config: AcpAgentConfig, options: ServeOptions) -> Result<(
 
 // Named servers reuse this unprefixed router so both serving modes keep the
 // same transport, CORS, health, and readiness behavior.
+#[allow(dead_code)]
 pub(crate) fn agent_router(
     config: AcpAgentConfig,
     options: &AgentRouterOptions,
     cancel: watch::Receiver<bool>,
 ) -> Result<Router> {
-    agent_router_with_stderr(config, options, AgentStderr::spawn(), cancel)
+    agent_router_with_lease(config, options, cancel, None)
 }
 
+pub(crate) fn agent_router_with_lease(
+    config: AcpAgentConfig,
+    options: &AgentRouterOptions,
+    cancel: watch::Receiver<bool>,
+    cache_use_lease: Option<Arc<crate::installer::cache::BinaryCacheLock>>,
+) -> Result<Router> {
+    agent_router_with_stderr_and_lease(
+        config,
+        options,
+        AgentStderr::spawn(),
+        cancel,
+        cache_use_lease,
+    )
+}
+
+#[allow(dead_code)]
 fn agent_router_with_stderr(
     config: AcpAgentConfig,
     options: &AgentRouterOptions,
     stderr: AgentStderr,
     cancel: watch::Receiver<bool>,
 ) -> Result<Router> {
+    agent_router_with_stderr_and_lease(config, options, stderr, cancel, None)
+}
+
+fn agent_router_with_stderr_and_lease(
+    config: AcpAgentConfig,
+    options: &AgentRouterOptions,
+    stderr: AgentStderr,
+    cancel: watch::Receiver<bool>,
+    cache_use_lease: Option<Arc<crate::installer::cache::BinaryCacheLock>>,
+) -> Result<Router> {
+    validate_process_limit(options.max_processes)?;
     let server_options = http_server_options(options)?;
     let health = AgentHealth::default();
+    let admission = AdmissionState::new(options.max_processes);
     // Wrap each agent so its stderr lands in this process's logs (through the
     // non-blocking [`AgentStderr`] sink) and its launch outcome feeds
     // `GET /readyz` (see [`LaunchGuard`] for why the per-connection
@@ -158,6 +213,8 @@ fn agent_router_with_stderr(
         let health = health.clone();
         let stderr = stderr.clone();
         let cancel = cancel.clone();
+        let admission = admission.clone();
+        let cache_use_lease = cache_use_lease.clone();
         move || {
             let state = Arc::new(LaunchState::new(health.next_generation()));
             let callback_state = state.clone();
@@ -165,7 +222,15 @@ fn agent_router_with_stderr(
             let agent = AcpAgent::new(config.clone()).with_debug(move |line, direction| {
                 forward_agent_line(line, direction, &callback_state, &stderr)
             });
-            ObservedAgent::new(agent, health.clone(), state, cancel.clone())
+            ObservedAgent::new(
+                agent,
+                health.clone(),
+                state,
+                cancel.clone(),
+                admission.process_slots.clone(),
+                cache_use_lease.clone(),
+                take_reserved_process_permit().or_else(|| admission.take_websocket_reservation()),
+            )
         }
     };
 
@@ -178,7 +243,83 @@ fn agent_router_with_stderr(
     if options.readyz_endpoint {
         router = router.route("/readyz", get(readyz).with_state(health));
     }
+    // The HTTP library's factory API has no admission hook. This early check
+    // gives overload a stable HTTP response. HTTP permits are transferred by
+    // task-local scope; WebSocket permits are reserved across the 101 upgrade.
+    router = router.layer(middleware::from_fn_with_state(
+        Arc::new(admission),
+        admit_new_connection,
+    ));
     Ok(router)
+}
+
+fn validate_process_limit(max_processes: usize) -> Result<()> {
+    if max_processes == 0 {
+        bail!("max_processes must be greater than zero");
+    }
+    if max_processes > Semaphore::MAX_PERMITS {
+        bail!("max_processes must not exceed {}", Semaphore::MAX_PERMITS);
+    }
+    Ok(())
+}
+
+async fn admit_new_connection(
+    State(admission): State<Arc<AdmissionState>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> Response {
+    let headers = request.headers();
+    let http1_websocket = headers
+        .get(axum::http::header::UPGRADE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    let http2_websocket = request.method() == axum::http::Method::CONNECT
+        && request.version() == axum::http::Version::HTTP_2;
+    let websocket = http1_websocket || http2_websocket;
+    let initial_http =
+        request.method() == axum::http::Method::POST && !headers.contains_key("acp-connection-id");
+    if initial_http {
+        let permit = match admission.process_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return process_capacity_exhausted(),
+        };
+        return RESERVED_PROCESS_PERMIT
+            .scope(RefCell::new(Some(permit)), next.run(request))
+            .await;
+    }
+
+    if websocket {
+        let reservation_id = match admission.reserve_websocket().await {
+            Some(reservation_id) => reservation_id,
+            None => return process_capacity_exhausted(),
+        };
+        let response = next.run(request).await;
+        let accepted = if http2_websocket {
+            response.status().is_success()
+        } else {
+            response.status() == StatusCode::SWITCHING_PROTOCOLS
+        };
+        if !accepted {
+            admission.cancel_websocket_reservation(reservation_id);
+        }
+        return response;
+    }
+
+    next.run(request).await
+}
+
+fn process_capacity_exhausted() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "agent process capacity exhausted\n",
+    )
+        .into_response()
+}
+
+fn take_reserved_process_permit() -> Option<OwnedSemaphorePermit> {
+    RESERVED_PROCESS_PERMIT
+        .try_with(|permit| permit.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
 /// How long the server waits for active connections to drain after a shutdown
@@ -416,6 +557,7 @@ impl AsyncWrite for ForceCloseIo {
 }
 
 pub(crate) fn validate_router_options(options: &AgentRouterOptions) -> Result<()> {
+    validate_process_limit(options.max_processes)?;
     if !options.path.starts_with('/') {
         bail!("ACP endpoint path must start with '/'");
     }
@@ -531,7 +673,7 @@ struct LaunchState {
     outcome_recorded: AtomicBool,
     initialize_requested: AtomicBool,
     initialize_id: Mutex<Option<RequestId>>,
-    stderr_tail: Mutex<String>,
+    stderr_tail: Mutex<VecDeque<u8>>,
 }
 
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
@@ -540,21 +682,34 @@ impl LaunchState {
     fn new(generation: u64) -> Self {
         Self {
             generation,
+            stderr_tail: Mutex::new(VecDeque::with_capacity(STDERR_TAIL_BYTES)),
             ..Self::default()
         }
     }
 
     fn push_stderr(&self, line: &str) {
-        let mut tail = self.stderr_tail.lock().expect("stderr tail mutex poisoned");
-        tail.push_str(line);
-        tail.push('\n');
-        if tail.len() > STDERR_TAIL_BYTES {
-            let start = tail.len() - STDERR_TAIL_BYTES;
-            *tail = tail.split_off(start);
-            if let Some(newline) = tail.find('\n') {
-                tail.drain(..=newline);
-            }
+        let mut tail = recover_lock(&self.stderr_tail);
+        let bytes = line.as_bytes();
+        let required = bytes.len().saturating_add(1);
+        if required >= STDERR_TAIL_BYTES {
+            // Keep only the suffix that fits alongside the line terminator;
+            // never grow the deque to accommodate an attacker-controlled line.
+            tail.clear();
+            let start = bytes.len() - (STDERR_TAIL_BYTES - 1);
+            tail.extend(bytes[start..].iter().copied());
+            tail.push_back(b'\n');
+            return;
         }
+        while tail.len().saturating_add(required) > STDERR_TAIL_BYTES {
+            tail.pop_front();
+        }
+        tail.extend(bytes.iter().copied());
+        tail.push_back(b'\n');
+    }
+
+    fn stderr_tail(&self) -> String {
+        let mut tail = recover_lock(&self.stderr_tail);
+        String::from_utf8_lossy(tail.make_contiguous()).into_owned()
     }
 
     fn initialize_requested(&self, id: RequestId) {
@@ -562,13 +717,13 @@ impl LaunchState {
         *self
             .initialize_id
             .lock()
-            .expect("initialize id mutex poisoned") = Some(id);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id);
     }
 
     fn initialize_id_matches(&self, id: &RequestId) -> bool {
         self.initialize_id
             .lock()
-            .expect("initialize id mutex poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             == Some(id)
     }
@@ -578,6 +733,12 @@ impl LaunchState {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
+}
+
+fn recover_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Bounded, non-blocking sink for agent stderr lines.
@@ -595,6 +756,64 @@ struct AgentStderr {
 
 /// Maximum queued stderr lines per server; excess lines are dropped.
 const STDERR_CHANNEL_CAPACITY: usize = 1024;
+
+/// A WebSocket upgrade returns `101` before the library creates its ACP
+/// connection and calls the agent factory. Keep the exact permit reserved
+/// across that boundary so concurrent upgrades cannot all acknowledge success
+/// and then discover capacity only after the protocol switch.
+struct WsPermitReservation {
+    id: u64,
+    permit: OwnedSemaphorePermit,
+    _handshake_guard: OwnedMutexGuard<()>,
+}
+
+#[derive(Clone)]
+struct AdmissionState {
+    process_slots: Arc<Semaphore>,
+    ws_handshake: Arc<AsyncMutex<()>>,
+    ws_reservation: Arc<Mutex<Option<WsPermitReservation>>>,
+    next_ws_reservation: Arc<AtomicU64>,
+}
+
+impl AdmissionState {
+    fn new(max_processes: usize) -> Self {
+        Self {
+            process_slots: Arc::new(Semaphore::new(max_processes)),
+            ws_handshake: Arc::new(AsyncMutex::new(())),
+            ws_reservation: Arc::new(Mutex::new(None)),
+            next_ws_reservation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    async fn reserve_websocket(&self) -> Option<u64> {
+        // The upstream factory has no request or connection identifier. Keep
+        // at most one upgrade between admission and factory construction so
+        // its reservation can only belong to that handshake.
+        let handshake_guard = self.ws_handshake.clone().lock_owned().await;
+        let permit = self.process_slots.clone().try_acquire_owned().ok()?;
+        let id = self.next_ws_reservation.fetch_add(1, Ordering::Relaxed);
+        *recover_lock(&self.ws_reservation) = Some(WsPermitReservation {
+            id,
+            permit,
+            _handshake_guard: handshake_guard,
+        });
+
+        Some(id)
+    }
+
+    fn cancel_websocket_reservation(&self, id: u64) {
+        let mut reservation = recover_lock(&self.ws_reservation);
+        if reservation.as_ref().is_some_and(|entry| entry.id == id) {
+            reservation.take();
+        }
+    }
+
+    fn take_websocket_reservation(&self) -> Option<OwnedSemaphorePermit> {
+        recover_lock(&self.ws_reservation)
+            .take()
+            .map(|reservation| reservation.permit)
+    }
+}
 
 impl AgentStderr {
     fn spawn() -> Self {
@@ -656,6 +875,9 @@ struct ObservedAgent {
     /// Set when the owning server shuts down and its drain grace expired;
     /// terminates the connection so its child guard kills the process group.
     cancelled: watch::Receiver<bool>,
+    process_slots: Arc<Semaphore>,
+    cache_use_lease: Option<Arc<crate::installer::cache::BinaryCacheLock>>,
+    reserved_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ObservedAgent {
@@ -664,12 +886,18 @@ impl ObservedAgent {
         health: AgentHealth,
         state: Arc<LaunchState>,
         cancelled: watch::Receiver<bool>,
+        process_slots: Arc<Semaphore>,
+        cache_use_lease: Option<Arc<crate::installer::cache::BinaryCacheLock>>,
+        reserved_permit: Option<OwnedSemaphorePermit>,
     ) -> Self {
         Self {
             inner,
             health,
             state,
             cancelled,
+            process_slots,
+            cache_use_lease,
+            reserved_permit,
         }
     }
 }
@@ -718,11 +946,7 @@ impl Drop for LaunchGuard {
         }
         let generation = self.state.generation;
         if self.state.initialize_requested.load(Ordering::SeqCst) {
-            let tail = self
-                .state
-                .stderr_tail
-                .lock()
-                .expect("stderr tail mutex poisoned");
+            let tail = self.state.stderr_tail();
             let detail = if tail.is_empty() {
                 "agent connection ended before completing initialize (no stderr captured)"
                     .to_string()
@@ -751,7 +975,18 @@ impl ConnectTo<Client> for ObservedAgent {
             health,
             state,
             mut cancelled,
+            process_slots,
+            cache_use_lease,
+            reserved_permit,
         } = self;
+        let _cache_use_lease = cache_use_lease;
+        let permit = match reserved_permit.or_else(|| process_slots.try_acquire_owned().ok()) {
+            Some(permit) => permit,
+            None => {
+                return Err(agent_client_protocol::Error::internal_error()
+                    .data("agent process capacity exhausted"));
+            }
+        };
         let guard = LaunchGuard {
             state: state.clone(),
             health: health.clone(),
@@ -805,6 +1040,7 @@ impl ConnectTo<Client> for ObservedAgent {
             guard.complete(&result);
             result
         };
+        let _permit = permit;
         futures::pin_mut!(connection);
         tokio::select! {
             result = &mut connection => result,
@@ -895,7 +1131,10 @@ mod tests {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = occupied.local_addr().unwrap();
         let error = serve_config(
-            AcpAgentConfig::new("unused-agent"),
+            crate::runner::ResolvedAgentConfig {
+                config: AcpAgentConfig::new("unused-agent"),
+                cache_use_lease: None,
+            },
             ServeOptions {
                 host: address.ip().to_string(),
                 port: address.port(),
@@ -981,6 +1220,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn websocket_reservations_are_correlated_until_factory_claim() {
+        let admission = AdmissionState::new(2);
+        let _first_id = admission.reserve_websocket().await.unwrap();
+        let second_admission = admission.clone();
+        let mut second = tokio::spawn(async move { second_admission.reserve_websocket().await });
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "a second handshake bypassed the outstanding reservation"
+        );
+        let first_permit = admission.take_websocket_reservation().unwrap();
+        let second_id = timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        admission.cancel_websocket_reservation(second_id);
+
+        assert_eq!(admission.process_slots.available_permits(), 1);
+        drop(first_permit);
+        assert_eq!(admission.process_slots.available_permits(), 2);
+    }
+
     #[test]
     fn launch_guard_records_failure_for_clean_connection_exit() {
         let state = Arc::new(LaunchState::new(1));
@@ -1046,6 +1311,56 @@ mod tests {
                 .unwrap()
                 .detail
                 .contains("error: boom")
+        );
+    }
+
+    #[test]
+    fn stderr_tail_truncates_at_byte_boundaries_without_panicking() {
+        let state = LaunchState::new(1);
+        let line = "你好".repeat(STDERR_TAIL_BYTES);
+        state.push_stderr(&line);
+
+        let mut expected = line.into_bytes();
+        expected.push(b'\n');
+        let start = expected.len().saturating_sub(STDERR_TAIL_BYTES);
+        let expected = String::from_utf8_lossy(&expected[start..]).into_owned();
+
+        assert_eq!(state.stderr_tail(), expected);
+    }
+
+    #[test]
+    fn stderr_tail_does_not_grow_for_one_extremely_long_line() {
+        let state = LaunchState::new(1);
+        state.push_stderr(&"x".repeat(STDERR_TAIL_BYTES * 64));
+
+        let tail = recover_lock(&state.stderr_tail);
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+        assert_eq!(tail.back(), Some(&b'\n'));
+    }
+
+    #[test]
+    fn launch_guard_recovers_from_poisoned_stderr_tail_mutex() {
+        let state = Arc::new(LaunchState::new(1));
+        state.initialize_requested.store(true, Ordering::SeqCst);
+        let _ = std::panic::catch_unwind({
+            let state = state.clone();
+            move || {
+                let _guard = state.stderr_tail.lock().unwrap();
+                panic!("poison stderr mutex");
+            }
+        });
+
+        let health = AgentHealth::default();
+        let result = std::panic::catch_unwind(|| {
+            let _guard = LaunchGuard {
+                state,
+                health: health.clone(),
+                completed: false,
+            };
+        });
+        assert!(
+            result.is_ok(),
+            "drop should recover from poisoned stderr mutex"
         );
     }
 
@@ -1179,15 +1494,21 @@ done"#,
                     .await
                     .unwrap();
                 let address = listener.local_addr().unwrap();
-                let mut router =
-                    agent_router_with_stderr(config, &options.router, stderr, watch::channel(false).1)
-                        .unwrap();
+                let mut router = agent_router_with_stderr(
+                    config,
+                    &options.router,
+                    stderr,
+                    watch::channel(false).1,
+                )
+                .unwrap();
                 if let Some(subpath) = options.subpath.as_deref() {
                     validate_subpath(subpath).unwrap();
                     router = Router::new().nest(subpath, router);
                 }
                 let task = tokio::spawn(async move {
-                    serve_listener(listener, router, watch::channel(false).0).await.unwrap();
+                    serve_listener(listener, router, watch::channel(false).0)
+                        .await
+                        .unwrap();
                 });
                 Self { address, task }
             }
@@ -1609,6 +1930,171 @@ done"#,
                 readyz.contains("Could not find npm package matching version"),
                 "readyz should include the agent stderr tail: {readyz}"
             );
+        }
+
+        #[tokio::test]
+        async fn process_limit_rejects_overload_but_keeps_probes_available() {
+            let server = TestServer::start(ServeOptions {
+                router: AgentRouterOptions {
+                    max_processes: 1,
+                    ..AgentRouterOptions::default()
+                },
+                ..ServeOptions::default()
+            })
+            .await;
+            let client = reqwest::Client::new();
+            let endpoint = server.http_url("/acp");
+
+            let initialized = initialize_http(&client, &endpoint).await;
+            assert_eq!(initialized.status(), StatusCode::OK);
+            let connection_id = initialized
+                .headers()
+                .get(CONNECTION_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            let saturated = initialize_http(&client, &endpoint).await;
+            assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                saturated.text().await.unwrap(),
+                "agent process capacity exhausted\n"
+            );
+
+            assert_eq!(
+                client
+                    .get(server.http_url("/health"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                client
+                    .get(server.http_url("/readyz"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+
+            let deleted = client
+                .delete(&endpoint)
+                .header(CONNECTION_ID, connection_id)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+        }
+
+        #[tokio::test]
+        async fn process_limit_rejects_websocket_handshake_while_saturated() {
+            let server = TestServer::start(ServeOptions {
+                router: AgentRouterOptions {
+                    max_processes: 1,
+                    ..AgentRouterOptions::default()
+                },
+                ..ServeOptions::default()
+            })
+            .await;
+            let client = reqwest::Client::new();
+            let endpoint = server.http_url("/acp");
+            let initialized = initialize_http(&client, &endpoint).await;
+            assert_eq!(initialized.status(), StatusCode::OK);
+            let connection_id = initialized
+                .headers()
+                .get(CONNECTION_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+
+            let error = connect_async(server.ws_url("/acp")).await.unwrap_err();
+            let async_tungstenite::tungstenite::Error::Http(response) = error else {
+                panic!("expected HTTP overload response, got {error:?}");
+            };
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let deleted = client
+                .delete(&endpoint)
+                .header(CONNECTION_ID, connection_id)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+        }
+
+        #[tokio::test]
+        async fn concurrent_websocket_handshakes_have_deterministic_admission() {
+            let server = TestServer::start(ServeOptions {
+                router: AgentRouterOptions {
+                    max_processes: 1,
+                    ..AgentRouterOptions::default()
+                },
+                ..ServeOptions::default()
+            })
+            .await;
+
+            let (left, right) = tokio::join!(
+                connect_async(server.ws_url("/acp")),
+                connect_async(server.ws_url("/acp")),
+            );
+            let mut successes = 0;
+            for result in [left, right] {
+                match result {
+                    Ok((mut socket, _)) => {
+                        successes += 1;
+                        socket.close(None).await.unwrap();
+                    }
+                    Err(async_tungstenite::tungstenite::Error::Http(response)) => {
+                        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    }
+                    Err(error) => panic!("unexpected WebSocket admission result: {error:?}"),
+                }
+            }
+            assert_eq!(successes, 1);
+        }
+
+        #[tokio::test]
+        async fn concurrent_initialize_requests_yield_one_success_and_one_overload() {
+            let server = TestServer::start(ServeOptions {
+                router: AgentRouterOptions {
+                    max_processes: 1,
+                    ..AgentRouterOptions::default()
+                },
+                ..ServeOptions::default()
+            })
+            .await;
+            let client = reqwest::Client::new();
+            let endpoint = server.http_url("/acp");
+
+            let (left, right) = tokio::join!(
+                initialize_http(&client, &endpoint),
+                initialize_http(&client, &endpoint),
+            );
+            let mut responses = [left, right];
+            responses.sort_by_key(|response| response.status());
+
+            assert_eq!(responses[0].status(), StatusCode::OK);
+            assert_eq!(responses[1].status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let connection_id = responses[0]
+                .headers()
+                .get(CONNECTION_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let deleted = client
+                .delete(&endpoint)
+                .header(CONNECTION_ID, connection_id)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(deleted.status(), StatusCode::ACCEPTED);
         }
 
         async fn readyz_until_failure(client: &reqwest::Client, server: &TestServer) -> String {

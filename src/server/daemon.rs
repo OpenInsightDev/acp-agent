@@ -212,8 +212,9 @@ pub(super) async fn add_agent(
             );
         }
     };
-    let config = match crate::runner::resolve_agent_config_from_registry_agent(agent, &args).await {
-        Ok(config) => config,
+    let resolved = match crate::runner::resolve_agent_config_from_registry_agent(agent, &args).await
+    {
+        Ok(resolved) => resolved,
         Err(error) => {
             return api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -225,7 +226,12 @@ pub(super) async fn add_agent(
     // Router construction may validate configuration and must happen before
     // taking the registry lock; fetching a registry or resolving a binary can
     // be slow and must not block existing dispatches or registrations.
-    let router = match crate::serve::agent_router(config, &options, state.cancel.subscribe()) {
+    let router = match crate::serve::agent_router_with_lease(
+        resolved.config,
+        &options,
+        state.cancel.subscribe(),
+        resolved.cache_use_lease,
+    ) {
         Ok(router) => router,
         Err(error) => {
             return api_error(
@@ -264,6 +270,7 @@ pub(super) fn serve_options(
         cors: crate::serve::cors_options(request.cors_origins.clone(), request.allow_any_origin)?,
         health_endpoint: request.health_endpoint,
         readyz_endpoint: request.readyz_endpoint,
+        max_processes: request.max_processes,
     };
     crate::serve::validate_router_options(&options)?;
     Ok(options)
@@ -450,4 +457,60 @@ pub(super) fn validate_route(route: &str) -> Result<()> {
         bail!("agent route conflicts with a server endpoint");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_options_preserve_requested_process_limit() {
+        let options = serve_options(&crate::server::AgentServeRequest {
+            path: "/rpc".to_string(),
+            cors_origins: Vec::new(),
+            allow_any_origin: false,
+            health_endpoint: true,
+            readyz_endpoint: true,
+            max_processes: 3,
+            yolo: false,
+            args: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(options.path, "/rpc");
+        assert_eq!(options.max_processes, 3);
+    }
+
+    #[test]
+    fn serve_options_reject_zero_process_limit() {
+        let error = serve_options(&crate::server::AgentServeRequest {
+            path: "/rpc".to_string(),
+            cors_origins: Vec::new(),
+            allow_any_origin: false,
+            health_endpoint: true,
+            readyz_endpoint: true,
+            max_processes: 0,
+            yolo: false,
+            args: Vec::new(),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("max_processes"));
+    }
+
+    #[test]
+    fn serve_options_rejects_process_limit_above_tokio_maximum() {
+        let error = serve_options(&AgentServeRequest {
+            path: "/acp".to_string(),
+            cors_origins: Vec::new(),
+            allow_any_origin: false,
+            health_endpoint: true,
+            readyz_endpoint: true,
+            max_processes: tokio::sync::Semaphore::MAX_PERMITS.saturating_add(1),
+            yolo: false,
+            args: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("must not exceed"));
+    }
 }

@@ -20,6 +20,7 @@ a library for embedding:
 pub mod commands;
 /// Agent distribution and local toolchain installers.
 pub mod installer;
+mod process;
 /// Types and helpers for loading ACP agent metadata from the public registry.
 pub mod registry;
 /// Local ACP agent command resolution and execution.

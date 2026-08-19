@@ -134,9 +134,11 @@ mod tests {
         let mut input = io::Cursor::new("\n");
         let mut output = Vec::new();
 
-        assert!(prompt_for_installation(&mut input, &mut output)
-            .await
-            .unwrap());
+        assert!(
+            prompt_for_installation(&mut input, &mut output)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Proceed with installation? [Y/n]: "
@@ -148,9 +150,11 @@ mod tests {
         let mut input = io::Cursor::new("maybe\nn\n");
         let mut output = Vec::new();
 
-        assert!(!prompt_for_installation(&mut input, &mut output)
-            .await
-            .unwrap());
+        assert!(
+            !prompt_for_installation(&mut input, &mut output)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Proceed with installation? [Y/n]: Please answer with y or n.\nProceed with installation? [Y/n]: "
