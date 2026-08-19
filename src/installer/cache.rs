@@ -1,4 +1,6 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc as std_mpsc;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,244 @@ pub(crate) struct BinaryCachePaths {
     pub metadata_path: PathBuf,
 }
 
+/// Returns the stable sibling lock path for one immutable cache key.
+///
+/// The lock lives beside (rather than inside) the final directory so it is
+/// never renamed during publication or removed during cache cleanup.
+pub(crate) fn binary_cache_lock_path(paths: &BinaryCachePaths) -> PathBuf {
+    paths.parent_dir.join(format!(
+        "{}-cache.lock",
+        safe_path_component(
+            paths
+                .cache_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("cache")
+        )
+    ))
+}
+
+/// Returns the stable sibling lock path that protects payload use and removal.
+/// Keeping it separate from the publication lock permits validated readers to
+/// run concurrently while writers still serialize metadata transitions.
+pub(crate) fn binary_cache_use_lock_path(paths: &BinaryCachePaths) -> PathBuf {
+    paths.parent_dir.join(format!(
+        "{}-cache.use.lock",
+        safe_path_component(
+            paths
+                .cache_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("cache")
+        )
+    ))
+}
+
+/// Acquires an exclusive advisory lock for one cache key.
+///
+/// `fd-lock` may block while another process publishes or removes the entry,
+/// so the blocking operation is isolated on a Tokio blocking worker.
+pub(crate) async fn acquire_binary_cache_lock(paths: &BinaryCachePaths) -> Result<BinaryCacheLock> {
+    let lock_path = binary_cache_lock_path(paths);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std_mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let mut lock = fd_lock::RwLock::new(file);
+        let guard = match lock.write() {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        if ready_tx.send(Ok(())).is_err() {
+            return;
+        }
+        let _ = release_rx.recv();
+        drop(guard);
+    });
+    match ready_rx.await {
+        Ok(Ok(())) => Ok(BinaryCacheLock {
+            release: Some(release_tx),
+        }),
+        Ok(Err(error)) => Err(anyhow!("failed to acquire cache lock: {error}")),
+        Err(_) => Err(anyhow!("cache lock task terminated unexpectedly")),
+    }
+}
+
+/// Acquires a shared cache-key lease for a process that will execute the
+/// validated payload. Writers and removers wait until every active reader has
+/// released this lease.
+pub(crate) async fn acquire_binary_cache_use_read_lock(
+    paths: &BinaryCachePaths,
+) -> Result<BinaryCacheLock> {
+    let lock_path = binary_cache_use_lock_path(paths);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std_mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let lock = fd_lock::RwLock::new(file);
+        let guard = match lock.read() {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        if ready_tx.send(Ok(())).is_err() {
+            return;
+        }
+        let _ = release_rx.recv();
+        drop(guard);
+    });
+    match ready_rx.await {
+        Ok(Ok(())) => Ok(BinaryCacheLock {
+            release: Some(release_tx),
+        }),
+        Ok(Err(error)) => Err(anyhow!("failed to acquire cache use lock: {error}")),
+        Err(_) => Err(anyhow!("cache use-lock task terminated unexpectedly")),
+    }
+}
+
+/// Acquires the exclusive payload-use lock used before replacing or deleting
+/// a cache directory.
+pub(crate) async fn acquire_binary_cache_use_write_lock(
+    paths: &BinaryCachePaths,
+) -> Result<BinaryCacheLock> {
+    let lock_path = binary_cache_use_lock_path(paths);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std_mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let mut lock = fd_lock::RwLock::new(file);
+        let guard = match lock.write() {
+            Ok(guard) => guard,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        if ready_tx.send(Ok(())).is_err() {
+            return;
+        }
+        let _ = release_rx.recv();
+        drop(guard);
+    });
+    match ready_rx.await {
+        Ok(Ok(())) => Ok(BinaryCacheLock {
+            release: Some(release_tx),
+        }),
+        Ok(Err(error)) => Err(anyhow!("failed to acquire cache use lock: {error}")),
+        Err(_) => Err(anyhow!("cache use-lock task terminated unexpectedly")),
+    }
+}
+
+/// Attempts to acquire a cache key without waiting for another process.
+/// Startup cleanup uses this to skip active installs rather than delaying
+/// every CLI invocation behind a long download or extraction.
+pub(crate) async fn try_acquire_binary_cache_lock(
+    paths: &BinaryCachePaths,
+) -> Result<Option<BinaryCacheLock>> {
+    let lock_path = binary_cache_lock_path(paths);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std_mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let mut lock = fd_lock::RwLock::new(file);
+        let guard = match lock.try_write() {
+            Ok(guard) => guard,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let _ = ready_tx.send(Ok(false));
+                return;
+            }
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        if ready_tx.send(Ok(true)).is_err() {
+            return;
+        }
+        let _ = release_rx.recv();
+        drop(guard);
+    });
+    match ready_rx.await {
+        Ok(Ok(true)) => Ok(Some(BinaryCacheLock {
+            release: Some(release_tx),
+        })),
+        Ok(Ok(false)) => Ok(None),
+        Ok(Err(error)) => Err(anyhow!("failed to acquire cache lock: {error}")),
+        Err(_) => Err(anyhow!("cache lock task terminated unexpectedly")),
+    }
+}
+
+pub(crate) struct BinaryCacheLock {
+    release: Option<std_mpsc::Sender<()>>,
+}
+
+impl fmt::Debug for BinaryCacheLock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BinaryCacheLock")
+    }
+}
+
+impl Drop for BinaryCacheLock {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BinaryCacheMetadata {
     pub agent_id: String,
@@ -33,6 +273,15 @@ pub(crate) struct BinaryCacheMetadata {
     /// invalidates the cached entry through the existing equality check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// SHA-256 of the extracted executable. Used to detect post-install
+    /// modification of a cache entry before it is executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_sha256: Option<String>,
+    /// Deterministic SHA-256 of the complete extracted payload tree. This
+    /// catches modifications to libraries and auxiliary files beside the
+    /// executable before a cache entry is reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
 }
 
 impl BinaryCacheMetadata {
@@ -50,7 +299,9 @@ impl BinaryCacheMetadata {
             platform: platform_cache_key(platform).to_string(),
             archive: archive.to_string(),
             cmd: cmd.to_string(),
-            sha256: sha256.map(str::to_owned),
+            sha256: sha256.map(|digest| digest.to_ascii_lowercase()),
+            executable_sha256: None,
+            payload_sha256: None,
         }
     }
 }
@@ -80,6 +331,20 @@ pub(crate) fn binary_cache_paths(
         metadata_path: cache_dir.join(METADATA_FILE_NAME),
         cache_dir,
     }
+}
+
+/// Returns cache paths keyed by the immutable registry target digest.
+/// Callers validate the digest before passing it here; digest-less registry
+/// targets are rejected rather than mapped into the historical mutable key.
+pub(crate) fn binary_cache_paths_with_digest(
+    root_dir: &Path,
+    agent_id: &str,
+    agent_version: &str,
+    platform: Platform,
+    sha256: &str,
+) -> BinaryCachePaths {
+    let key = format!("{}-sha256-{}", agent_version, sha256.to_ascii_lowercase());
+    binary_cache_paths(root_dir, agent_id, &key, platform)
 }
 
 pub(crate) fn platform_cache_key(platform: Platform) -> &'static str {
@@ -209,6 +474,7 @@ pub(crate) async fn remove_cached_agent(root_dir: &Path, agent_id: &str) -> Resu
 /// Removes all matching entries except the cache directory that was just
 /// installed. Metadata identity is authoritative because sanitized path
 /// components are not collision-free.
+#[cfg(test)]
 pub(crate) async fn remove_cached_platform_except(
     root_dir: &Path,
     agent_id: &str,
@@ -230,7 +496,54 @@ async fn remove_cached_entries(
     platform: Option<&str>,
     keep: Option<&Path>,
 ) -> Result<bool> {
-    let entries = list_cached_agents(root_dir).await;
+    let mut entries = list_cached_agents(root_dir).await;
+    // Inventory intentionally ignores corrupt metadata, but uninstall must
+    // still be able to remove a damaged entry. The agent namespace is derived
+    // from the same collision-resistant component used by cache publication,
+    // so scanning it cannot select another logical agent.
+    let known_paths = entries
+        .iter()
+        .map(|entry| entry.cache_dir.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let agent_dir = root_dir
+        .join(AGENTS_DIR)
+        .join(safe_path_component(agent_id));
+    if let Ok(mut platform_entries) = fs::read_dir(&agent_dir).await {
+        while let Ok(Some(platform_entry)) = platform_entries.next_entry().await {
+            let platform_name = platform_entry.file_name().to_string_lossy().into_owned();
+            if platform.is_some_and(|expected| expected != platform_name) {
+                continue;
+            }
+            let Ok(file_type) = platform_entry.file_type().await else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Ok(mut version_entries) = fs::read_dir(platform_entry.path()).await else {
+                continue;
+            };
+            while let Ok(Some(version_entry)) = version_entries.next_entry().await {
+                let name = version_entry.file_name();
+                if name.to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let Ok(file_type) = version_entry.file_type().await else {
+                    continue;
+                };
+                if !file_type.is_dir() || known_paths.contains(&version_entry.path()) {
+                    continue;
+                }
+                entries.push(CachedAgent {
+                    agent_id: agent_id.to_string(),
+                    agent_version: name.to_string_lossy().into_owned(),
+                    platform: platform_name.clone(),
+                    cache_dir: version_entry.path(),
+                    executable_path: PathBuf::new(),
+                });
+            }
+        }
+    }
     let mut removed = false;
 
     for entry in entries {
@@ -241,16 +554,37 @@ async fn remove_cached_entries(
             continue;
         }
 
-        fs::remove_dir_all(&entry.cache_dir)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to remove cache directory {}",
-                    entry.cache_dir.display()
-                )
-            })?;
-        removed = true;
-        remove_empty_cache_parents(root_dir, &entry.cache_dir).await;
+        // Hold the same per-key lock used by installers while deleting the
+        // final directory. This prevents uninstall/update cleanup from
+        // deleting a cache another process has just validated or published.
+        let paths = BinaryCachePaths {
+            root_dir: root_dir.to_path_buf(),
+            parent_dir: entry
+                .cache_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root_dir.to_path_buf()),
+            extracted_dir: entry.cache_dir.join(EXTRACTED_DIR_NAME),
+            metadata_path: entry.cache_dir.join(METADATA_FILE_NAME),
+            cache_dir: entry.cache_dir.clone(),
+        };
+        let _lock = acquire_binary_cache_lock(&paths).await?;
+        let _use_lock = acquire_binary_cache_use_write_lock(&paths).await?;
+        match fs::remove_dir_all(&entry.cache_dir).await {
+            Ok(()) => {
+                removed = true;
+                remove_empty_cache_parents(root_dir, &entry.cache_dir).await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove cache directory {}",
+                        entry.cache_dir.display()
+                    )
+                });
+            }
+        }
     }
 
     Ok(removed)
@@ -324,6 +658,26 @@ mod tests {
         // The digest is deterministic for the same input.
         assert_eq!(safe_path_component("demo/agent"), "demo_agent-0b26afc5211b");
         assert_eq!(safe_path_component("demo/agent"), "demo_agent-0b26afc5211b");
+    }
+
+    #[test]
+    fn digest_bound_cache_paths_are_case_insensitive() {
+        let root = Path::new("/tmp/cache");
+        let lower = binary_cache_paths_with_digest(
+            root,
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            &"ab".repeat(32),
+        );
+        let upper = binary_cache_paths_with_digest(
+            root,
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            &"AB".repeat(32),
+        );
+        assert_eq!(lower.cache_dir, upper.cache_dir);
     }
 
     #[test]
@@ -455,6 +809,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uninstall_removes_corrupt_cache_without_metadata() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths_with_digest(
+            &cache_root,
+            "demo",
+            "1.0.0",
+            Platform::LinuxX86_64,
+            &"a".repeat(64),
+        );
+        fs::create_dir_all(&paths.extracted_dir).await.unwrap();
+        fs::write(&paths.metadata_path, b"not-json").await.unwrap();
+
+        assert!(remove_cached_agent(&cache_root, "demo").await.unwrap());
+        assert!(!paths.cache_dir.exists());
+    }
+
+    #[tokio::test]
     async fn removes_only_requested_platform_when_updating() {
         let temp_dir = tempdir().unwrap();
         let cache_root = temp_dir.path().join("cache").join("acp-agent");
@@ -515,6 +887,75 @@ mod tests {
         );
         assert!(!old.cache_dir.exists());
         assert!(current.cache_dir.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removal_waits_for_the_cache_key_lock() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        write_cache_entry(&paths, "demo", "1.0.0", Platform::LinuxX86_64).await;
+
+        let lock = acquire_binary_cache_lock(&paths).await.unwrap();
+        let task_root = cache_root.clone();
+        let removal = tokio::spawn(async move { remove_cached_agent(&task_root, "demo").await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(paths.cache_dir.exists());
+        assert!(
+            !removal.is_finished(),
+            "removal should wait for the publisher lock"
+        );
+
+        drop(lock);
+        assert!(removal.await.unwrap().unwrap());
+        assert!(!paths.cache_dir.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removal_waits_for_active_payload_use_lease() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let paths = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        write_cache_entry(&paths, "demo", "1.0.0", Platform::LinuxX86_64).await;
+
+        let lease = acquire_binary_cache_use_read_lock(&paths).await.unwrap();
+        let task_root = cache_root.clone();
+        let removal = tokio::spawn(async move { remove_cached_agent(&task_root, "demo").await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(paths.cache_dir.exists());
+        assert!(
+            !removal.is_finished(),
+            "removal should wait while a runner owns the payload lease"
+        );
+
+        drop(lease);
+        assert!(removal.await.unwrap().unwrap());
+        assert!(!paths.cache_dir.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_lock_waiter_does_not_leak_the_lock() {
+        let temp_dir = tempdir().unwrap();
+        let paths = binary_cache_paths(temp_dir.path(), "demo", "1.0.0", Platform::LinuxX86_64);
+        fs::create_dir_all(&paths.parent_dir).await.unwrap();
+        let held = acquire_binary_cache_lock(&paths).await.unwrap();
+        let waiter_paths = paths.clone();
+        let waiter = tokio::spawn(async move { acquire_binary_cache_lock(&waiter_paths).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        waiter.abort();
+        assert!(waiter.await.is_err());
+
+        drop(held);
+        let reacquired = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            acquire_binary_cache_lock(&paths),
+        )
+        .await
+        .expect("cancelled waiter must release after acquiring")
+        .unwrap();
+        drop(reacquired);
     }
 
     async fn write_cache_entry(
