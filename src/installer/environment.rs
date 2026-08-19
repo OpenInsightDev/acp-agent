@@ -6,6 +6,8 @@ use std::process::ExitStatus;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
 
+use crate::process;
+
 const JS_TOOLS: [&str; 2] = ["npm", "deno"];
 const PYTHON_TOOLS: [&str; 1] = ["uv"];
 
@@ -226,9 +228,9 @@ async fn install_and_verify(target: InstallTarget) -> Result<InstallationResult>
 async fn run_installer(target: InstallTarget) -> Result<()> {
     ensure_installer_prerequisites(target)?;
     let command = target.installer_command();
-    let output = Command::new(command.program)
-        .args(command.args)
-        .output()
+    let mut process = Command::new(command.program);
+    process.args(command.args);
+    let output = process::output(&mut process)
         .await
         .with_context(|| format!("failed to run installer for {}", target.label()))?;
 
@@ -261,16 +263,17 @@ async fn verify_installation(target: InstallTarget) -> Result<InstallationResult
     let on_path_available = on_path.is_some();
     let path = match on_path {
         Some(path) => path,
-        None => {
-            resolve_program_with_directories(target.program(), &target.known_bin_directories(&home))?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "verification failed for {}: {} was not found after installation",
-                        target.label(),
-                        target.program()
-                    )
-                })?
-        }
+        None => resolve_program_with_directories(
+            target.program(),
+            &target.known_bin_directories(&home),
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "verification failed for {}: {} was not found after installation",
+                target.label(),
+                target.program()
+            )
+        })?,
     };
 
     verify_program_version(&path, target.label()).await?;
@@ -282,9 +285,9 @@ async fn verify_installation(target: InstallTarget) -> Result<InstallationResult
 }
 
 async fn verify_program_version(path: &Path, subject: &str) -> Result<()> {
-    let output = Command::new(path)
-        .arg("--version")
-        .output()
+    let mut process = Command::new(path);
+    process.arg("--version");
+    let output = process::output(&mut process)
         .await
         .with_context(|| format!("failed to run installer for {subject}"))?;
 
@@ -362,11 +365,7 @@ fn display_status(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes tests that temporarily mutate the process-wide `PATH` (and on
-    /// Windows `PATHEXT`) environment variable, which would otherwise race
-    /// when the test binary runs them in parallel.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::installer::test_support::ENV_LOCK;
 
     fn report(js_available: &[&str], python_available: &[&str]) -> EnvironmentReport {
         EnvironmentReport {
@@ -508,7 +507,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::tempdir;
 
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = tempdir().unwrap();
         let bin = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -526,10 +527,7 @@ mod tests {
                 format!(
                     "{}:{}",
                     bin.display(),
-                    previous_path
-                        .clone()
-                        .unwrap_or_default()
-                        .to_string_lossy()
+                    previous_path.clone().unwrap_or_default().to_string_lossy()
                 ),
             );
         }
@@ -550,7 +548,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::tempdir;
 
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = tempdir().unwrap();
         let bin = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -583,7 +583,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::tempdir;
 
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = tempdir().unwrap();
         let first = temp_dir.path().join("first");
         let second = temp_dir.path().join("second");
@@ -614,7 +616,9 @@ mod tests {
     fn windows_resolution_finds_executable_extension() {
         use tempfile::tempdir;
 
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = tempdir().unwrap();
         let bin = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();

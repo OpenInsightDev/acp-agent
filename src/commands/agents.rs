@@ -90,11 +90,17 @@ impl fmt::Display for InstallMessage<'_> {
                 agent_id,
                 method,
                 package,
-            } => write!(
-                formatter,
-                "Installed {agent_id} via {}: {package}",
-                install_method(*method)
-            ),
+            } => match method {
+                InstallMethod::Npm => {
+                    write!(formatter, "Installed {agent_id} via npm: {package}")
+                }
+                InstallMethod::Deno => {
+                    write!(formatter, "Prepared {agent_id} via deno cache: {package}")
+                }
+                InstallMethod::Uvx => {
+                    write!(formatter, "Installed {agent_id} via uv: {package}")
+                }
+            },
         }
     }
 }
@@ -115,6 +121,10 @@ impl fmt::Display for UninstallMessage<'_> {
                 formatter,
                 "Uninstalled {agent_id} via {}: {package}",
                 install_method(*method)
+            ),
+            UninstallOutcome::RunnerManaged { agent_id, runner } => write!(
+                formatter,
+                "Nothing to uninstall for {agent_id}: its package is cached by {runner}, which manages its own cache"
             ),
         }
     }
@@ -250,6 +260,53 @@ mod tests {
                 .next()
                 .unwrap()
                 .contains("without checking package-manager distributions (request timed out)")
+        );
+    }
+
+    #[test]
+    fn renders_package_preparation_and_runner_managed_messages() {
+        use crate::installer::agents::InstallMethod;
+        use crate::runner::PackageRunner;
+
+        let npm = InstallOutcome::PackageManager {
+            agent_id: "demo".into(),
+            method: InstallMethod::Npm,
+            package: "@acme/demo".into(),
+        };
+        assert_eq!(
+            InstallMessage(&npm).to_string(),
+            "Installed demo via npm: @acme/demo"
+        );
+
+        // The Deno fallback never creates a launcher: install only warms the
+        // npm cache that `deno x` reads, and the message says so.
+        let deno = InstallOutcome::PackageManager {
+            agent_id: "demo".into(),
+            method: InstallMethod::Deno,
+            package: "@acme/demo".into(),
+        };
+        assert_eq!(
+            InstallMessage(&deno).to_string(),
+            "Prepared demo via deno cache: @acme/demo"
+        );
+
+        let uvx = InstallOutcome::PackageManager {
+            agent_id: "demo".into(),
+            method: InstallMethod::Uvx,
+            package: "acme-demo".into(),
+        };
+        assert_eq!(
+            InstallMessage(&uvx).to_string(),
+            "Installed demo via uv: acme-demo"
+        );
+
+        let managed = UninstallOutcome::RunnerManaged {
+            agent_id: "demo".into(),
+            runner: PackageRunner::Deno,
+        };
+        assert_eq!(
+            UninstallMessage(&managed).to_string(),
+            "Nothing to uninstall for demo: its package is cached by deno, which manages its own cache"
         );
     }
 }

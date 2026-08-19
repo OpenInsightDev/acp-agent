@@ -79,6 +79,7 @@ acp-agent serve codex-acp --host 127.0.0.1 --port 8010
 | [`--allow-any-origin`](#cors)            | `false`     | Allow requests from every browser origin.                                    |
 | [`--no-health`](#health-and-readiness)   | `false`     | Disable the `GET /health` endpoint.                                          |
 | [`--no-readyz`](#health-and-readiness)   | `false`     | Disable the `GET /readyz` agent readiness endpoint.                          |
+| `--max-processes <n>`   | `16`        | Maximum concurrent agent processes for this served route.                    |
 | `--yolo`                 | `false`     | Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).|
 | [`-- <args>`](#arguments)    | _(none)_    | Arguments passed to the agent process.                                       |
 
@@ -93,6 +94,7 @@ The server exposes:
 
 Both ACP transports use `/acp` by default.
 Each connection starts an independent agent process.
+When the process limit is exhausted, new initial connections receive HTTP `503` while health and readiness probes remain available.
 Use `--path` to change the ACP endpoint, `--no-health` to disable the health check, and `--no-readyz` to disable the readiness probe.
 
 Use [`--subpath`](#serve-subpath) to serve under a URL prefix, e.g. a reverse-proxy mount point or a shared host path:
@@ -151,7 +153,7 @@ acp-agent server register claude --route /reviewer -- --model opus
 | `register`  | `<agent-id>`                  | _(required)_ | Agent to register under this server.                                    |
 |             | `--name <name>`               | `default`   | Target server name.                                                      |
 |             | `--route <path>` (`--subpath`) | `/<agent-id>` | Public route prefix.                                                    |
-|             | serve-like settings            | —           | [`--path`](#serve-parameters), repeated [`--cors-origin`](#serve-parameters), [`--allow-any-origin`](#serve-parameters), [`--no-health`](#serve-parameters), [`--no-readyz`](#serve-parameters), [`--yolo`](#serve-parameters), and trailing [`-- <args>`](#serve-parameters), as in the [serve parameter table](#serve-parameters). |
+|             | serve-like settings            | —           | [`--path`](#serve-parameters), repeated [`--cors-origin`](#serve-parameters), [`--allow-any-origin`](#serve-parameters), [`--no-health`](#serve-parameters), [`--no-readyz`](#serve-parameters), [`--max-processes`](#serve-parameters), [`--yolo`](#serve-parameters), and trailing [`-- <args>`](#serve-parameters), as in the [serve parameter table](#serve-parameters). |
 | `unregister`| `<agent-id>`                  | _(required)_ | Agent to remove from the server.                                        |
 |             | `--name <name>`               | `default`   | Target server name.                                                      |
 | `list`      | —                             | —           | List every recorded named server and its lifecycle state.                |
@@ -205,7 +207,7 @@ acp-agent server logs --name work --json | jq '.lines'
 By default, `server register <agent-id>` creates the public route `/<agent-id>`.
 Its ACP endpoint is `/<agent-id>/acp`, and its health endpoints are `/<agent-id>/health` and `/<agent-id>/readyz`.
 `--route` (also accepted as `--subpath`) changes the public route prefix.
-The register command accepts the same serve-like endpoint and agent settings as [`serve`](#serve-parameters): `--path`, repeated `--cors-origin`, `--allow-any-origin`, `--no-health`, `--no-readyz`, `--yolo`, and trailing agent arguments.
+The register command accepts the same serve-like endpoint and agent settings as [`serve`](#serve-parameters): `--path`, repeated `--cors-origin`, `--allow-any-origin`, `--no-health`, `--no-readyz`, `--max-processes`, `--yolo`, and trailing agent arguments.
 
 ### Management API (advanced)
 
@@ -224,6 +226,7 @@ POST accepts the agent ID, public route, and serve-like settings; it does not ac
     "allow_any_origin": false,
     "health_endpoint": true,
     "readyz_endpoint": true,
+    "max_processes": 16,
     "yolo": false,
     "args": ["--model", "gpt-5"]
   }
@@ -242,7 +245,11 @@ Windows uses the current user's cache-directory ACL.
 
 ## Local Cache
 
-Binary agents are cached and managed by `acp-agent`, while `npx` and `uvx` agents are installed and managed on demand by their respective tools (`npm`/`npx` and `uv`/`uvx`).
+Binary agents are cached and managed by `acp-agent`. `npx` and `uvx` agents are executed on demand by their respective runners (`npm exec`, `deno x`, and `uvx`); `install` prepares the same runner cache that `run`/`serve` will read, so installation and execution share one lifecycle:
+
+- **npm** — the package is installed globally, which `npm exec` finds first;
+- **uv** — the tool is installed with `uv tool install`, which `uvx` prefers;
+- **Deno** (when npm is unavailable) — the package is fetched into Deno's npm cache with `deno cache`, which `deno x` reads.
 
 Binary agents are stored in the platform cache directory (`$HOME/.cache/acp-agent` on macOS and Linux, `%LOCALAPPDATA%\acp-agent` on Windows, `/cache/acp-agent` inside the Docker image).
 
@@ -254,14 +261,15 @@ acp-agent list --installed
 
 - Add `--json` to return the installed records as structured JSON, including their cache and executable paths.
 
-Remove an agent from the local cache, and uninstall its globally installed npm/uv wrapper when it ships as a package:
+Remove an agent from the local cache, and uninstall any npm/uv launcher that `install` created. Deno-managed packages have nothing to remove: their cache belongs to Deno, which garbage-collects it:
 
 ```sh
 acp-agent uninstall codex-acp
 acp-agent uninstall codex-acp claude dev # uninstall multiple agents
 ```
 
-Stale cached versions are discarded before the preferred distribution is (re)installed:
+Digest-keyed binary updates keep older validated cache entries in place so a running server can continue using the executable it already resolved.
+`uninstall` removes all cached versions for the agent.
 
 ```sh
 acp-agent update codex-acp

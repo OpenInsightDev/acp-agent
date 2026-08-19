@@ -130,6 +130,9 @@ enum Commands {
         /// Disable the GET /readyz agent readiness endpoint.
         #[arg(long)]
         no_readyz: bool,
+        /// Maximum number of concurrent agent processes for this route.
+        #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_PROCESSES)]
+        max_processes: usize,
         /// Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).
         #[arg(long)]
         yolo: bool,
@@ -199,6 +202,9 @@ enum ServerCommands {
         /// Disable the agent's GET /readyz endpoint.
         #[arg(long)]
         no_readyz: bool,
+        /// Maximum number of concurrent agent processes for this route.
+        #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_PROCESSES)]
+        max_processes: usize,
         /// Activate the agent's yolo/auto-approve mode.
         #[arg(long)]
         yolo: bool,
@@ -419,6 +425,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             allow_any_origin,
             no_health,
             no_readyz,
+            max_processes,
             yolo,
             args,
         } => {
@@ -435,6 +442,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                         cors: crate::serve::cors_options(cors_origins, allow_any_origin)?,
                         health_endpoint: !no_health,
                         readyz_endpoint: !no_readyz,
+                        max_processes,
                     },
                 },
                 &args,
@@ -468,6 +476,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 allow_any_origin,
                 no_health,
                 no_readyz,
+                max_processes,
                 yolo,
                 args,
             } => {
@@ -481,6 +490,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                         allow_any_origin,
                         health_endpoint: !no_health,
                         readyz_endpoint: !no_readyz,
+                        max_processes,
                         yolo,
                         args,
                     },
@@ -771,6 +781,8 @@ mod tests {
             "/assistant",
             "--path",
             "/rpc",
+            "--max-processes",
+            "7",
             "--yolo",
             "--",
             "--model",
@@ -785,6 +797,7 @@ mod tests {
                     name,
                     route,
                     path,
+                    max_processes,
                     yolo,
                     args,
                     ..
@@ -793,6 +806,7 @@ mod tests {
                 && name == "work"
                 && route.as_deref() == Some("/assistant")
                 && path == "/rpc"
+                && max_processes == 7
                 && yolo
                 && args == ["--model", "gpt-5"]
         ));
@@ -888,6 +902,8 @@ mod tests {
             "https://example.com",
             "--no-health",
             "--no-readyz",
+            "--max-processes",
+            "3",
             "--",
             "--model",
             "gpt-5",
@@ -904,6 +920,7 @@ mod tests {
                 cors_origins,
                 no_health,
                 no_readyz,
+                max_processes,
                 args,
                 ..
             }
@@ -915,6 +932,7 @@ mod tests {
                     && cors_origins == ["https://example.com"]
                     && no_health
                     && no_readyz
+                    && max_processes == 3
                     && args == ["--model", "gpt-5"]
         ));
     }
@@ -933,6 +951,7 @@ mod tests {
                 allow_any_origin,
                 no_health,
                 no_readyz,
+                max_processes,
                 yolo,
                 ..
             } if host == "127.0.0.1"
@@ -943,6 +962,7 @@ mod tests {
                 && !allow_any_origin
                 && !no_health
                 && !no_readyz
+                && max_processes == crate::serve::DEFAULT_MAX_PROCESSES
                 && !yolo
         ));
     }
