@@ -12,6 +12,8 @@ use axum::{
     http::{Request, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
@@ -21,7 +23,7 @@ use std::{
 };
 use tokio::net::TcpListener;
 #[cfg(unix)]
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 use tower::ServiceExt;
 
@@ -113,13 +115,26 @@ pub async fn run() -> Result<()> {
 async fn run_supervisor() -> Result<()> {
     let (listener, socket_path) = protocol::bind_daemon_socket()?;
     let state = SupervisorState::shared();
-    let (shutdown, mut shutdown_rx) = watch::channel(false);
+    let (shutdown, shutdown_rx) = watch::channel(false);
     tokio::spawn(crate::serve::await_termination_signal(shutdown.clone()));
+    run_supervisor_loop(listener, socket_path, state, shutdown, shutdown_rx).await
+}
 
+#[cfg(unix)]
+async fn run_supervisor_loop(
+    listener: UnixListener,
+    socket_path: PathBuf,
+    state: SharedSupervisorState,
+    shutdown: watch::Sender<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
     let result = loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted.context("failed to accept daemon connection")?;
+                let (stream, _) = match accepted {
+                    Ok(connection) => connection,
+                    Err(error) => break Err(error).context("failed to accept daemon connection"),
+                };
                 let state = state.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
@@ -686,9 +701,10 @@ async fn dispatch_instance(
     State(instance): State<Arc<DaemonInstance>>,
     request: Request<Body>,
 ) -> Response {
-    // State is checked before the route snapshot. A request that passes this
-    // check owns its runtime Arc and may finish while stop drains the listener.
-    if *instance.state.lock().await != InstanceState::Running {
+    // Hold the state lock through route selection so stop cannot transition the
+    // instance between the admission check and the runtime snapshot.
+    let state = instance.state.lock().await;
+    if *state != InstanceState::Running {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let path = request.uri().path();
@@ -700,6 +716,7 @@ async fn dispatch_instance(
             .max_by_key(|(route, _)| route.route.len())
             .map(|(route, runtime)| (route.route.clone(), runtime.clone()))
     };
+    drop(state);
     let Some((route, runtime)) = route else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -780,6 +797,12 @@ pub(super) fn validate_route(route: &str) -> Result<()> {
 mod tests {
     use super::*;
     use axum::http::header;
+    #[cfg(unix)]
+    use tempfile::TempDir;
+    #[cfg(unix)]
+    use tokio::net::{TcpStream, UnixListener};
+    #[cfg(unix)]
+    use tokio::time::timeout;
 
     fn create_request(name: &str, host: &str, port: u16) -> CreateInstanceRequest {
         CreateInstanceRequest {
@@ -792,6 +815,239 @@ mod tests {
     async fn stop_test_instance(state: &SharedSupervisorState, name: &str) {
         stop_instance(state, name).await.unwrap();
         assert!(!state.lock().await.instances.contains_key(name));
+    }
+
+    #[cfg(unix)]
+    struct SupervisorHarness {
+        socket_path: std::path::PathBuf,
+        task: tokio::task::JoinHandle<Result<()>>,
+        _tempdir: TempDir,
+    }
+
+    #[cfg(unix)]
+    impl SupervisorHarness {
+        async fn start() -> Self {
+            let tempdir = tempfile::tempdir_in("/tmp").unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(tempdir.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            let socket_path = protocol::socket_path_from(Some(
+                tempdir.path().join("daemon.sock").into_os_string(),
+            ))
+            .unwrap();
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let state = SupervisorState::shared();
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(run_supervisor_loop(
+                listener,
+                socket_path.clone(),
+                state,
+                shutdown,
+                shutdown_rx,
+            ));
+            Self {
+                socket_path,
+                task,
+                _tempdir: tempdir,
+            }
+        }
+
+        async fn request(&self, command: ProtocolRequest) -> ResponseEnvelope {
+            let mut stream = UnixStream::connect(&self.socket_path).await.unwrap();
+            protocol::write_frame(
+                &mut stream,
+                &RequestEnvelope {
+                    version: protocol::PROTOCOL_VERSION,
+                    command,
+                },
+            )
+            .await
+            .unwrap();
+            timeout(
+                Duration::from_secs(5),
+                protocol::read_frame::<_, ResponseEnvelope>(&mut stream),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        async fn shutdown(self) {
+            let response = self.request(ProtocolRequest::Shutdown).await;
+            assert_eq!(
+                response,
+                success(ProtocolResponse::Shutdown),
+                "shutdown response must be readable before cleanup"
+            );
+            let Self {
+                socket_path,
+                task,
+                _tempdir,
+            } = self;
+            task.await.unwrap().unwrap();
+            assert!(!socket_path.exists(), "daemon socket should be removed");
+        }
+    }
+
+    #[cfg(unix)]
+    fn instance_response(response: ResponseEnvelope) -> InstanceResult {
+        match response {
+            ResponseEnvelope::Success {
+                result: ProtocolResponse::CreateInstance(instance),
+                ..
+            } => instance,
+            other => panic!("expected create response, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_control_plane_covers_lifecycle_and_isolated_public_listener() {
+        let harness = SupervisorHarness::start().await;
+
+        assert_eq!(
+            harness.request(ProtocolRequest::Health).await,
+            success(ProtocolResponse::Health(HealthResult {
+                protocol_version: protocol::PROTOCOL_VERSION,
+            }))
+        );
+
+        let first = instance_response(
+            harness
+                .request(ProtocolRequest::CreateInstance(create_request(
+                    "first",
+                    "127.0.0.1",
+                    0,
+                )))
+                .await,
+        );
+        let second = instance_response(
+            harness
+                .request(ProtocolRequest::CreateInstance(create_request(
+                    "second",
+                    "127.0.0.1",
+                    0,
+                )))
+                .await,
+        );
+        assert_ne!(first.port, 0);
+        assert_ne!(second.port, 0);
+        assert_ne!(first.port, second.port);
+        assert_eq!(first.address, format!("http://127.0.0.1:{}", first.port));
+        assert_eq!(second.address, format!("http://127.0.0.1:{}", second.port));
+
+        let list = harness.request(ProtocolRequest::List).await;
+        match list {
+            ResponseEnvelope::Success {
+                result: ProtocolResponse::List(result),
+                ..
+            } => assert_eq!(
+                result
+                    .instances
+                    .iter()
+                    .map(|instance| instance.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["first", "second"]
+            ),
+            other => panic!("expected list response, got {other:?}"),
+        }
+
+        let conflict = harness
+            .request(ProtocolRequest::CreateInstance(create_request(
+                "first", "0.0.0.0", first.port,
+            )))
+            .await;
+        assert!(matches!(
+            conflict,
+            ResponseEnvelope::Error {
+                error: ProtocolError {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let mut public_stream = TcpStream::connect(("127.0.0.1", first.port)).await.unwrap();
+        protocol::write_frame(
+            &mut public_stream,
+            &RequestEnvelope {
+                version: protocol::PROTOCOL_VERSION,
+                command: ProtocolRequest::Health,
+            },
+        )
+        .await
+        .unwrap();
+        let public_response = timeout(
+            Duration::from_secs(2),
+            protocol::read_frame::<_, ResponseEnvelope>(&mut public_stream),
+        )
+        .await;
+        assert!(
+            public_response.is_err() || public_response.unwrap().is_err(),
+            "public HTTP listener must not expose typed control responses"
+        );
+
+        let stopped = harness
+            .request(ProtocolRequest::StopInstance(
+                protocol::StopInstanceRequest {
+                    name: "first".into(),
+                },
+            ))
+            .await;
+        assert_eq!(
+            stopped,
+            success(ProtocolResponse::StopInstance(StopInstanceResult {
+                name: "first".into(),
+            }))
+        );
+        let status = harness
+            .request(ProtocolRequest::Status(protocol::StatusRequest {
+                name: "first".into(),
+            }))
+            .await;
+        assert!(matches!(
+            status,
+            ResponseEnvelope::Error {
+                error: ProtocolError {
+                    code: ErrorCode::NotFound,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(TcpStream::connect(("127.0.0.1", first.port)).await.is_err());
+
+        harness.shutdown().await;
+        assert!(
+            TcpStream::connect(("127.0.0.1", second.port))
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_equal_creates_are_idempotent_over_unix_socket() {
+        let harness = SupervisorHarness::start().await;
+        let request = ProtocolRequest::CreateInstance(create_request("shared", "127.0.0.1", 0));
+        let (left, right) =
+            tokio::join!(harness.request(request.clone()), harness.request(request));
+        let left = instance_response(left);
+        let right = instance_response(right);
+        assert_eq!(left, right);
+        assert_ne!(left.port, 0);
+
+        let status = harness
+            .request(ProtocolRequest::Status(protocol::StatusRequest {
+                name: "shared".into(),
+            }))
+            .await;
+        assert_eq!(status, success(ProtocolResponse::Status(left.clone())));
+
+        harness.shutdown().await;
     }
 
     #[cfg(unix)]
