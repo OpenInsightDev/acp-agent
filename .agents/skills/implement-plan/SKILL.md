@@ -7,7 +7,7 @@ description: Understand the goals in a user-provided plan document and implement
 
 Implement the plan according to its intended goal, not mechanically according to every detail in the document.
 
-- Fully understand the plan and the existing code before making changes.
+- Fully understand the plan and the existing code before making changes. Implement independently from the plan; do not search Git history, old versions, or other sources for outdated implementations.
 - Keep the implementation clean. Do not retain any forward-compatibility code, legacy interfaces, dual behavior, deprecated paths, or temporary adapters unless explicitly requested.
 - Do not preserve existing outdated or incorrect code without explicit permission. Remove obsolete logic, dead code, and superseded behavior.
 - Do not add unnecessary abstractions or duplicate implementations. If the plan conflicts with its intended goal, implement the goal; ask the user when the intent is genuinely unclear.
