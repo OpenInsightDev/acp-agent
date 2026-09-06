@@ -2,6 +2,7 @@
 
 mod client;
 mod daemon;
+mod protocol;
 mod state;
 
 pub use client::{list, logs, register, registrations, start, status, stop, unregister};
