@@ -52,6 +52,60 @@ pub struct AgentRouterOptions {
 /// Default maximum number of concurrent agent processes per served route.
 pub const DEFAULT_MAX_PROCESSES: usize = 16;
 
+/// Reusable single-agent route runtime shared by standalone and named servers.
+///
+/// The runtime owns the router's health and connection-factory state. Callers
+/// may clone the router for dispatch while retaining the runtime for readiness
+/// inspection and route lifetime ownership.
+pub(crate) struct RouteRuntime {
+    router: Router,
+    health: AgentHealth,
+}
+
+/// Point-in-time launch readiness data for one route runtime.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadinessSnapshot {
+    pub(crate) attempts: u64,
+    pub(crate) failures: u64,
+    pub(crate) last_attempt_failed: bool,
+    pub(crate) last_failure: Option<ReadinessFailure>,
+}
+
+/// Details for the most recent failed launch.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadinessFailure {
+    pub(crate) at: SystemTime,
+    pub(crate) detail: String,
+}
+
+impl RouteRuntime {
+    /// Builds a reusable route runtime from a resolved agent configuration.
+    pub(crate) fn new(
+        resolved: crate::runner::ResolvedAgentConfig,
+        options: &AgentRouterOptions,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Self> {
+        route_runtime_with_stderr_and_lease(
+            resolved.config,
+            options,
+            AgentStderr::spawn(),
+            cancel,
+            resolved.cache_use_lease,
+        )
+    }
+
+    /// Returns a cloneable router service for dispatching one request.
+    pub(crate) fn router(&self) -> Router {
+        self.router.clone()
+    }
+
+    /// Returns the current launch readiness state without holding the health
+    /// lock across any caller work.
+    pub(crate) fn readiness_snapshot(&self) -> ReadinessSnapshot {
+        self.health.snapshot()
+    }
+}
+
 tokio::task_local! {
     /// Permit reserved by the current HTTP initialize request.  The HTTP
     /// server constructs its agent synchronously in that request task, so the
@@ -122,12 +176,8 @@ async fn serve_config(
     options: ServeOptions,
 ) -> Result<()> {
     let (cancel, cancel_rx) = watch::channel(false);
-    let mut router = agent_router_with_lease(
-        resolved.config,
-        &options.router,
-        cancel_rx,
-        resolved.cache_use_lease,
-    )?;
+    let runtime = RouteRuntime::new(resolved, &options.router, cancel_rx)?;
+    let mut router = runtime.router();
     if let Some(subpath) = options.subpath.as_deref() {
         validate_subpath(subpath)?;
         router = Router::new().nest(subpath, router);
@@ -174,13 +224,14 @@ pub(crate) fn agent_router_with_lease(
     cancel: watch::Receiver<bool>,
     cache_use_lease: Option<Arc<crate::installer::cache::BinaryCacheLock>>,
 ) -> Result<Router> {
-    agent_router_with_stderr_and_lease(
+    route_runtime_with_stderr_and_lease(
         config,
         options,
         AgentStderr::spawn(),
         cancel,
         cache_use_lease,
     )
+    .map(|runtime| runtime.router())
 }
 
 #[allow(dead_code)]
@@ -190,16 +241,17 @@ fn agent_router_with_stderr(
     stderr: AgentStderr,
     cancel: watch::Receiver<bool>,
 ) -> Result<Router> {
-    agent_router_with_stderr_and_lease(config, options, stderr, cancel, None)
+    route_runtime_with_stderr_and_lease(config, options, stderr, cancel, None)
+        .map(|runtime| runtime.router())
 }
 
-fn agent_router_with_stderr_and_lease(
+fn route_runtime_with_stderr_and_lease(
     config: AcpAgentConfig,
     options: &AgentRouterOptions,
     stderr: AgentStderr,
     cancel: watch::Receiver<bool>,
     cache_use_lease: Option<Arc<crate::installer::cache::BinaryCacheLock>>,
-) -> Result<Router> {
+) -> Result<RouteRuntime> {
     validate_process_limit(options.max_processes)?;
     let server_options = http_server_options(options)?;
     let health = AgentHealth::default();
@@ -241,7 +293,7 @@ fn agent_router_with_stderr_and_lease(
     // layer (like the library's own `/health`): probes must stay reachable
     // regardless of CORS policy.
     if options.readyz_endpoint {
-        router = router.route("/readyz", get(readyz).with_state(health));
+        router = router.route("/readyz", get(readyz).with_state(health.clone()));
     }
     // The HTTP library's factory API has no admission hook. This early check
     // gives overload a stable HTTP response. HTTP permits are transferred by
@@ -250,7 +302,7 @@ fn agent_router_with_stderr_and_lease(
         Arc::new(admission),
         admit_new_connection,
     ));
-    Ok(router)
+    Ok(RouteRuntime { router, health })
 }
 
 fn validate_process_limit(max_processes: usize) -> Result<()> {
@@ -614,7 +666,7 @@ struct AgentHealthState {
     /// `last_attempt_failed` and `last_failure`.
     outcome_generation: u64,
     last_attempt_failed: bool,
-    last_failure: Option<AgentFailure>,
+    last_failure: Option<ReadinessFailure>,
 }
 
 impl Default for AgentHealth {
@@ -624,12 +676,6 @@ impl Default for AgentHealth {
             next_generation: Arc::new(AtomicU64::new(0)),
         }
     }
-}
-
-#[derive(Clone)]
-struct AgentFailure {
-    at: SystemTime,
-    detail: String,
 }
 
 impl AgentHealth {
@@ -654,10 +700,20 @@ impl AgentHealth {
         if generation > state.outcome_generation {
             state.outcome_generation = generation;
             state.last_attempt_failed = true;
-            state.last_failure = Some(AgentFailure {
+            state.last_failure = Some(ReadinessFailure {
                 at: SystemTime::now(),
                 detail,
             });
+        }
+    }
+
+    fn snapshot(&self) -> ReadinessSnapshot {
+        let state = self.state.lock().expect("agent health mutex poisoned");
+        ReadinessSnapshot {
+            attempts: state.attempts,
+            failures: state.failures,
+            last_attempt_failed: state.last_attempt_failed,
+            last_failure: state.last_failure.clone(),
         }
     }
 }
@@ -1055,15 +1111,13 @@ impl ConnectTo<Client> for ObservedAgent {
 }
 
 async fn readyz(State(health): State<AgentHealth>) -> Response {
-    let (attempts, failures, last_attempt_failed, last_failure) = {
-        let state = health.state.lock().expect("agent health mutex poisoned");
-        (
-            state.attempts,
-            state.failures,
-            state.last_attempt_failed,
-            state.last_failure.clone(),
-        )
-    };
+    let snapshot = health.snapshot();
+    let ReadinessSnapshot {
+        attempts,
+        failures,
+        last_attempt_failed,
+        last_failure,
+    } = snapshot;
 
     if !last_attempt_failed {
         return (StatusCode::OK, "ready\n").into_response();
