@@ -322,12 +322,9 @@ fn display_status(status: ExitStatus) -> String {
         return code.to_string();
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return format!("signal {signal}");
-        }
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(signal) = status.signal() {
+        return format!("signal {signal}");
     }
 
     "unknown".to_string()
@@ -468,7 +465,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     // The guard intentionally spans the await below: it serializes tests that
     // mutate the process-wide `PATH`, which the test runtime would otherwise
@@ -513,7 +509,6 @@ mod tests {
         assert!(result.on_path);
     }
 
-    #[cfg(unix)]
     #[test]
     fn unix_resolution_rejects_non_executable_regular_files() {
         use std::os::unix::fs::PermissionsExt;
@@ -548,7 +543,6 @@ mod tests {
         assert_eq!(with_exec_bit.unwrap().unwrap(), tool);
     }
 
-    #[cfg(unix)]
     #[test]
     fn duplicate_path_entries_resolve_to_the_first_executable_match() {
         use std::os::unix::fs::PermissionsExt;

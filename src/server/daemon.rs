@@ -12,7 +12,6 @@ use axum::{
     http::{Request, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
-#[cfg(unix)]
 use std::path::PathBuf;
 use std::{
     collections::HashMap,
@@ -22,7 +21,6 @@ use std::{
     time::Duration,
 };
 use tokio::net::TcpListener;
-#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 use tower::ServiceExt;
@@ -111,7 +109,6 @@ pub async fn run() -> Result<()> {
     run_supervisor().await
 }
 
-#[cfg(unix)]
 async fn run_supervisor() -> Result<()> {
     let (listener, socket_path) = protocol::bind_daemon_socket()?;
     let state = SupervisorState::shared();
@@ -120,7 +117,6 @@ async fn run_supervisor() -> Result<()> {
     run_supervisor_loop(listener, socket_path, state, shutdown, shutdown_rx).await
 }
 
-#[cfg(unix)]
 async fn run_supervisor_loop(
     listener: UnixListener,
     socket_path: PathBuf,
@@ -164,12 +160,6 @@ async fn run_supervisor_loop(
     result
 }
 
-#[cfg(not(unix))]
-async fn run_supervisor() -> Result<()> {
-    bail!("the named-server daemon requires Unix-domain sockets")
-}
-
-#[cfg(unix)]
 async fn handle_protocol_connection(
     mut stream: UnixStream,
     state: SharedSupervisorState,
@@ -204,7 +194,6 @@ async fn handle_protocol_connection(
     result
 }
 
-#[cfg(unix)]
 async fn handle_request(
     command: ProtocolRequest,
     state: SharedSupervisorState,
@@ -797,11 +786,8 @@ pub(super) fn validate_route(route: &str) -> Result<()> {
 mod tests {
     use super::*;
     use axum::http::header;
-    #[cfg(unix)]
     use tempfile::TempDir;
-    #[cfg(unix)]
     use tokio::net::{TcpStream, UnixListener};
-    #[cfg(unix)]
     use tokio::time::timeout;
 
     fn create_request(name: &str, host: &str, port: u16) -> CreateInstanceRequest {
@@ -817,14 +803,12 @@ mod tests {
         assert!(!state.lock().await.instances.contains_key(name));
     }
 
-    #[cfg(unix)]
     struct SupervisorHarness {
         socket_path: std::path::PathBuf,
         task: tokio::task::JoinHandle<Result<()>>,
         _tempdir: TempDir,
     }
 
-    #[cfg(unix)]
     impl SupervisorHarness {
         async fn start() -> Self {
             let tempdir = tempfile::tempdir_in("/tmp").unwrap();
@@ -891,7 +875,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn instance_response(response: ResponseEnvelope) -> InstanceResult {
         match response {
             ResponseEnvelope::Success {
@@ -902,7 +885,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn unix_control_plane_covers_lifecycle_and_isolated_public_listener() {
         let harness = SupervisorHarness::start().await;
@@ -1028,7 +1010,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn concurrent_equal_creates_are_idempotent_over_unix_socket() {
         let harness = SupervisorHarness::start().await;
@@ -1050,7 +1031,6 @@ mod tests {
         harness.shutdown().await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn create_binds_before_commit_and_reports_port_zero_address() {
         let state = SupervisorState::shared();
@@ -1064,7 +1044,6 @@ mod tests {
         stop_test_instance(&state, "ephemeral").await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn equal_creates_are_idempotent_and_conflicts_do_not_bind() {
         let state = SupervisorState::shared();
@@ -1081,7 +1060,6 @@ mod tests {
         stop_test_instance(&state, "shared").await;
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn failed_bind_leaves_no_instance() {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1094,7 +1072,6 @@ mod tests {
         assert!(state.lock().await.instances.is_empty());
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn stopping_instance_rejects_public_dispatch() {
         let state = SupervisorState::shared();

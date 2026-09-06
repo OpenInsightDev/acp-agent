@@ -530,16 +530,10 @@ fn exit_from_status(status: ExitStatus) -> CliExit {
         .map_or_else(|| CliExit::Code(signal_exit_code(status)), CliExit::Code)
 }
 
-#[cfg(unix)]
 fn signal_exit_code(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
 
     status.signal().map_or(1, |signal| 128 + signal)
-}
-
-#[cfg(not(unix))]
-fn signal_exit_code(_: ExitStatus) -> i32 {
-    1
 }
 
 #[cfg(test)]

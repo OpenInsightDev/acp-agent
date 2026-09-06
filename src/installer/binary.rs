@@ -1020,7 +1020,6 @@ fn extract_zip_with_limits(
 
     // Modes are applied in a second pass (children first) so a read-only
     // directory entry cannot prevent its own contents from being extracted.
-    #[cfg(unix)]
     let mut unix_modes: Vec<(PathBuf, u32)> = Vec::new();
 
     let mut expanded = 0u64;
@@ -1055,7 +1054,6 @@ fn extract_zip_with_limits(
         if entry.is_dir() {
             std::fs::create_dir_all(&outpath)
                 .with_context(|| format!("failed to create directory {}", outpath.display()))?;
-            #[cfg(unix)]
             if let Some(mode) = entry.unix_mode() {
                 unix_modes.push((outpath, mode));
             }
@@ -1097,13 +1095,11 @@ fn extract_zip_with_limits(
             );
         }
 
-        #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {
             unix_modes.push((outpath, mode));
         }
     }
 
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1149,15 +1145,8 @@ fn extract_zip_symlink<R: Read>(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&target, outpath)
-            .with_context(|| format!("failed to create symlink {}", outpath.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        bail!("symlinks are not supported on this platform");
-    }
+    std::os::unix::fs::symlink(&target, outpath)
+        .with_context(|| format!("failed to create symlink {}", outpath.display()))?;
     Ok(())
 }
 
@@ -1187,19 +1176,14 @@ pub(crate) fn resolve_cmd_path(extracted_dir: &Path, cmd: &str) -> Result<PathBu
 
 #[cfg(test)]
 pub(crate) async fn make_executable(path: &Path) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-        let mut permissions = fs::metadata(path).await?.permissions();
-        // Preserve the archive's permission policy and add only the owner
-        // execute bit, so a private `0700` or group-limited `0750` executable
-        // is not broadened to world-readable/executable.
-        permissions.set_mode(permissions.mode() | 0o100);
-        fs::set_permissions(path, permissions).await?;
-    }
-
-    Ok(())
+    let mut permissions = fs::metadata(path).await?.permissions();
+    // Preserve the archive's permission policy and add only the owner
+    // execute bit, so a private `0700` or group-limited `0750` executable
+    // is not broadened to world-readable/executable.
+    permissions.set_mode(permissions.mode() | 0o100);
+    fs::set_permissions(path, permissions).await
 }
 
 async fn prepare_staging_directory(
@@ -1296,16 +1280,9 @@ fn hash_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
 }
 
 fn path_hash_bytes(path: &Path) -> Vec<u8> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStrExt;
 
-        path.as_os_str().as_bytes().to_vec()
-    }
-    #[cfg(not(unix))]
-    {
-        path.to_string_lossy().as_bytes().to_vec()
-    }
+    path.as_os_str().as_bytes().to_vec()
 }
 
 fn hash_payload_entry(
@@ -1365,16 +1342,11 @@ fn hash_payload_entry(
 }
 
 fn make_executable_blocking(path: &Path) -> Result<(), io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-        let mut permissions = std::fs::metadata(path)?.permissions();
-        permissions.set_mode(permissions.mode() | 0o100);
-        std::fs::set_permissions(path, permissions)?;
-    }
-
-    Ok(())
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(permissions.mode() | 0o100);
+    std::fs::set_permissions(path, permissions)
 }
 
 /// Owns a fully prepared staging directory between extraction and publication.
@@ -2256,7 +2228,6 @@ mod tests {
         assert_eq!(&timestamp[16..17], ":");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn make_executable_preserves_mode_and_adds_only_owner_execute() {
         use std::os::unix::fs::PermissionsExt;
@@ -2415,7 +2386,6 @@ mod tests {
         assert!(!temp_dir.path().join("escape.txt").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn zip_extracts_symlinks_as_symlinks() {
         use std::io::Write;
@@ -2442,7 +2412,6 @@ mod tests {
         assert_eq!(std::fs::read_link(&link).unwrap(), PathBuf::from("target"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn zip_preserves_unix_permissions_and_executable_helpers() {
         use std::io::Write;
@@ -2885,7 +2854,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn cancelled_extraction_removes_the_staging_directory() {
         let temp_dir = tempdir().unwrap();

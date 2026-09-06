@@ -398,7 +398,6 @@ mod tests {
         assert_eq!(PackageRunner::Deno.to_string(), "deno");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     // The guard intentionally spans the await below: it serializes tests that
     // mutate the process-wide `PATH`, which the test runtime would otherwise

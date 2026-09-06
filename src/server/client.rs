@@ -307,25 +307,15 @@ fn error_code_name(code: ErrorCode) -> &'static str {
 }
 
 async fn request_or_start(command: ProtocolRequest) -> Result<ProtocolResponse> {
-    #[cfg(unix)]
-    {
-        match request_existing(command.clone()).await {
-            Ok(response) => return Ok(response),
-            Err(error) if error.downcast_ref::<MissingDaemonEndpoint>().is_some() => {}
-            Err(error) => return Err(error),
-        }
-        start_daemon().await?;
-        request_existing(command).await
+    match request_existing(command.clone()).await {
+        Ok(response) => return Ok(response),
+        Err(error) if error.downcast_ref::<MissingDaemonEndpoint>().is_some() => {}
+        Err(error) => return Err(error),
     }
-
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-        bail!("named server control requires Unix-domain sockets")
-    }
+    start_daemon().await?;
+    request_existing(command).await
 }
 
-#[cfg(unix)]
 async fn request_existing(command: ProtocolRequest) -> Result<ProtocolResponse> {
     let path = protocol::daemon_socket_path().context("failed to resolve daemon endpoint")?;
     let mut stream = tokio::net::UnixStream::connect(&path)
@@ -349,7 +339,6 @@ async fn request_existing(command: ProtocolRequest) -> Result<ProtocolResponse> 
     response_result(response)
 }
 
-#[cfg(unix)]
 async fn start_daemon() -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate acp-agent executable")?;
     let child = Command::new(executable)
@@ -379,7 +368,6 @@ async fn start_daemon() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 async fn wait_for_health(guard: &mut StartupChildGuard) -> Result<()> {
     let mut child_exited = false;
     let mut waiting_for_winner = false;

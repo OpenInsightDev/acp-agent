@@ -50,8 +50,6 @@ which = "8.0.5"
 # Registry ZIP assets use standard deflate; keep the codec/encryption surface minimal.
 zip = { version = "8.4.0", default-features = false, features = ["deflate-flate2"] }
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
 
 
 [dev-dependencies]

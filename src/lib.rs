@@ -16,6 +16,9 @@ a library for embedding:
 "#]
 #![warn(missing_docs)]
 
+#[cfg(not(unix))]
+compile_error!("acp-agent supports Unix platforms only");
+
 /// CLI parsing and command-dispatch helpers used by the `acp-agent` executable.
 pub mod commands;
 /// Agent distribution and local toolchain installers.

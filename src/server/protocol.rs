@@ -13,7 +13,6 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
 /// The control-protocol version, independent of the package version.
@@ -29,10 +28,7 @@ pub(crate) const DAEMON_SOCKET_ENV: &str = "ACP_AGENT_DAEMON_SOCKET";
 pub(crate) const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
 /// The largest path that can be represented by a Unix `sockaddr_un`.
-#[cfg(target_os = "macos")]
 const MAX_SOCKET_PATH_BYTES: usize = 104 - 1;
-#[cfg(all(unix, not(target_os = "macos")))]
-const MAX_SOCKET_PATH_BYTES: usize = 108 - 1;
 
 /// Resolve the configured daemon socket and ensure its parent is private.
 pub(crate) fn daemon_socket_path() -> Result<PathBuf> {
@@ -83,18 +79,15 @@ fn validate_socket_path(path: &Path) -> Result<()> {
             path.display()
         )
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        if path.as_os_str().as_bytes().contains(&0) {
-            bail!("daemon socket path must not contain NUL")
-        }
-        if path.as_os_str().as_bytes().len() > MAX_SOCKET_PATH_BYTES {
-            bail!(
-                "daemon socket path is too long (maximum is {MAX_SOCKET_PATH_BYTES} bytes): {}",
-                path.display()
-            )
-        }
+    use std::os::unix::ffi::OsStrExt;
+    if path.as_os_str().as_bytes().contains(&0) {
+        bail!("daemon socket path must not contain NUL")
+    }
+    if path.as_os_str().as_bytes().len() > MAX_SOCKET_PATH_BYTES {
+        bail!(
+            "daemon socket path is too long (maximum is {MAX_SOCKET_PATH_BYTES} bytes): {}",
+            path.display()
+        )
     }
     Ok(())
 }
@@ -128,31 +121,27 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
             });
         }
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if created {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).with_context(
-                || {
-                    format!(
-                        "failed to secure daemon socket directory {}",
-                        path.display()
-                    )
-                },
-            )?;
-        }
-        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
-        if mode != 0o700 {
-            bail!(
-                "daemon socket parent must have mode 0700 (found {mode:04o}): {}",
-                path.display()
-            )
-        }
+    use std::os::unix::fs::PermissionsExt;
+    if created {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "failed to secure daemon socket directory {}",
+                    path.display()
+                )
+            },
+        )?;
+    }
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        bail!(
+            "daemon socket parent must have mode 0700 (found {mode:04o}): {}",
+            path.display()
+        )
     }
     Ok(())
 }
 
-#[cfg(unix)]
 /// Bind the daemon's Unix control socket without stale-endpoint recovery.
 pub(crate) fn bind_daemon_socket() -> Result<(UnixListener, PathBuf)> {
     let path = daemon_socket_path()?;
@@ -161,8 +150,7 @@ pub(crate) fn bind_daemon_socket() -> Result<(UnixListener, PathBuf)> {
     Ok((listener, path))
 }
 
-#[cfg(unix)]
-#[expect(dead_code, reason = "used by the B4 Unix-socket client")]
+#[expect(dead_code, reason = "used by the Unix-socket client")]
 /// Connect to the configured daemon Unix control socket.
 pub(crate) async fn connect_daemon_socket() -> Result<UnixStream> {
     let path = daemon_socket_path()?;
