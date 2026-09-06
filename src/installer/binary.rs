@@ -1117,8 +1117,8 @@ fn extract_zip_with_limits(
 }
 
 /// Creates a symlink entry from a ZIP archive. Symbolic links require the
-/// archive to record the target as the entry body; on platforms without
-/// symlink support the entry is rejected.
+/// archive to record the target as the entry body; on unsupported platforms
+/// the entry is rejected.
 fn extract_zip_symlink<R: Read>(
     entry: &mut zip::read::ZipFile<'_, R>,
     outpath: &Path,
@@ -1154,20 +1154,7 @@ fn extract_zip_symlink<R: Read>(
         std::os::unix::fs::symlink(&target, outpath)
             .with_context(|| format!("failed to create symlink {}", outpath.display()))?;
     }
-    #[cfg(windows)]
-    {
-        let target_is_dir = std::fs::metadata(&target)
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false);
-        if target_is_dir {
-            std::os::windows::fs::symlink_dir(&target, outpath)
-                .with_context(|| format!("failed to create symlink {}", outpath.display()))?;
-        } else {
-            std::os::windows::fs::symlink_file(&target, outpath)
-                .with_context(|| format!("failed to create symlink {}", outpath.display()))?;
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         bail!("symlinks are not supported on this platform");
     }
@@ -1210,11 +1197,6 @@ pub(crate) async fn make_executable(path: &Path) -> Result<(), io::Error> {
         // is not broadened to world-readable/executable.
         permissions.set_mode(permissions.mode() | 0o100);
         fs::set_permissions(path, permissions).await?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
     }
 
     Ok(())
@@ -1320,16 +1302,7 @@ fn path_hash_bytes(path: &Path) -> Vec<u8> {
 
         path.as_os_str().as_bytes().to_vec()
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-
-        path.as_os_str()
-            .encode_wide()
-            .flat_map(u16::to_le_bytes)
-            .collect()
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         path.to_string_lossy().as_bytes().to_vec()
     }
@@ -1399,11 +1372,6 @@ fn make_executable_blocking(path: &Path) -> Result<(), io::Error> {
         let mut permissions = std::fs::metadata(path)?.permissions();
         permissions.set_mode(permissions.mode() | 0o100);
         std::fs::set_permissions(path, permissions)?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
     }
 
     Ok(())

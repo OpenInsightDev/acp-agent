@@ -116,51 +116,23 @@ impl InstallTarget {
 
     /// Structured installer command for this target.
     fn installer_command(self) -> InstallerCommand {
-        if cfg!(windows) {
-            match self {
-                Self::Deno => InstallerCommand {
-                    program: "powershell",
-                    args: &["-c", r#"irm https://deno.land/install.ps1 | iex"#],
-                },
-                Self::Uv => InstallerCommand {
-                    program: "powershell",
-                    args: &[
-                        "-ExecutionPolicy",
-                        "ByPass",
-                        "-c",
-                        r#"irm https://astral.sh/uv/install.ps1 | iex"#,
-                    ],
-                },
-            }
-        } else {
-            match self {
-                Self::Deno => InstallerCommand {
-                    program: "sh",
-                    args: &["-c", "curl -fsSL https://deno.land/install.sh | sh"],
-                },
-                Self::Uv => InstallerCommand {
-                    program: "sh",
-                    args: &["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
-                },
-            }
+        match self {
+            Self::Deno => InstallerCommand {
+                program: "sh",
+                args: &["-c", "curl -fsSL https://deno.land/install.sh | sh"],
+            },
+            Self::Uv => InstallerCommand {
+                program: "sh",
+                args: &["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
+            },
         }
     }
 
     fn known_bin_directories(self, home: &Path) -> Vec<PathBuf> {
         match self {
             Self::Deno => vec![home.join(".deno").join("bin")],
-            Self::Uv => {
-                let mut directories = vec![home.join(".local").join("bin")];
-                if cfg!(windows) {
-                    directories.push(home.join(".cargo").join("bin"));
-                }
-                directories
-            }
+            Self::Uv => vec![home.join(".local").join("bin")],
         }
-    }
-
-    fn requires_curl(self) -> bool {
-        !cfg!(windows)
     }
 }
 
@@ -247,7 +219,7 @@ async fn run_installer(target: InstallTarget) -> Result<()> {
 }
 
 fn ensure_installer_prerequisites(target: InstallTarget) -> Result<()> {
-    if target.requires_curl() && resolve_program("curl")?.is_none() {
+    if resolve_program("curl")?.is_none() {
         return Err(anyhow!(
             "Cannot install {} because curl is not available in the current environment",
             target.label()
@@ -324,8 +296,7 @@ pub(crate) fn program_available(program: &str) -> Result<bool> {
 /// Resolves `program` against the preferred directories followed by `PATH`.
 ///
 /// Resolution delegates to `which`, so a candidate must be an executable
-/// regular file on Unix and Windows resolution follows the active `PATHEXT`
-/// instead of a hard-coded extension list.
+/// regular file on Unix.
 fn resolve_program_with_directories(
     program: &str,
     preferred_directories: &[PathBuf],
@@ -609,36 +580,5 @@ mod tests {
         }
 
         assert_eq!(resolved, first.join("tool"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_resolution_finds_executable_extension() {
-        use tempfile::tempdir;
-
-        let _env_guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp_dir = tempdir().unwrap();
-        let bin = temp_dir.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("tool.exe"), b"tool").unwrap();
-
-        // The real `PATHEXT` is left untouched so `which` initializes its
-        // per-process extension cache from the actual value; `.EXE` is always
-        // present on Windows. A hard-coded extension list would also pass this
-        // test, so it guards the delegation itself rather than PATHEXT parsing,
-        // which `which` owns.
-        let previous_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", &bin);
-        }
-        let resolved = resolve_program("tool");
-        match previous_path {
-            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-
-        assert_eq!(resolved.unwrap().unwrap(), bin.join("tool.exe"));
     }
 }
