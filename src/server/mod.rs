@@ -176,7 +176,7 @@ mod tests {
         assert!(validate_route("/codex-acp").is_ok());
         assert!(validate_route("/team/codex").is_ok());
         assert!(validate_route("/").is_err());
-        assert!(validate_route("/api/agents").is_ok());
+        assert!(validate_route("/custom/route").is_ok());
         assert!(validate_route("/bad/").is_err());
         assert!(validate_route("/bad path").is_err());
     }
