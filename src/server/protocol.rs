@@ -20,7 +20,7 @@ use tokio::net::{UnixListener, UnixStream};
 ///
 /// Wire-compatible changes must keep this value unchanged. A future incompatible
 /// protocol can be introduced by incrementing it.
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 
 /// Environment variable used to override the control socket path.
 pub(crate) const DAEMON_SOCKET_ENV: &str = "ACP_AGENT_DAEMON_SOCKET";
@@ -354,6 +354,29 @@ pub(crate) struct RegistrationResult {
     pub(crate) name: String,
     pub(crate) id: String,
     pub(crate) route: String,
+    pub(crate) address: String,
+    pub(crate) path: String,
+    pub(crate) health_endpoint: bool,
+    pub(crate) readyz_endpoint: bool,
+    pub(crate) max_processes: usize,
+    pub(crate) readiness: ReadinessResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReadinessResult {
+    pub(crate) status: ReadinessStatus,
+    pub(crate) attempts: u64,
+    pub(crate) failures: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReadinessStatus {
+    Disabled,
+    Ready,
+    NotReady,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,8 +530,77 @@ mod tests {
         let json = serde_json::to_string(&sample_request()).unwrap();
         assert_eq!(
             json,
-            r#"{"version":1,"command":"CreateInstance","payload":{"name":"work","host":"127.0.0.1","port":0}}"#
+            r#"{"version":2,"command":"CreateInstance","payload":{"name":"work","host":"127.0.0.1","port":0}}"#
         );
+    }
+
+    #[test]
+    fn registration_results_roundtrip_with_address_and_readiness_statuses() {
+        let response = ResponseEnvelope::Success {
+            version: PROTOCOL_VERSION,
+            result: Response::Registrations(RegistrationsResult {
+                name: "work".into(),
+                registrations: vec![
+                    RegistrationResult {
+                        name: "work".into(),
+                        id: "disabled".into(),
+                        route: "/disabled".into(),
+                        address: "http://127.0.0.1:8010".into(),
+                        path: "/acp".into(),
+                        health_endpoint: true,
+                        readyz_endpoint: false,
+                        max_processes: 2,
+                        readiness: ReadinessResult {
+                            status: ReadinessStatus::Disabled,
+                            attempts: 0,
+                            failures: 0,
+                            detail: None,
+                        },
+                    },
+                    RegistrationResult {
+                        name: "work".into(),
+                        id: "ready".into(),
+                        route: "/ready".into(),
+                        address: "http://127.0.0.1:8010".into(),
+                        path: "/acp".into(),
+                        health_endpoint: true,
+                        readyz_endpoint: true,
+                        max_processes: 2,
+                        readiness: ReadinessResult {
+                            status: ReadinessStatus::Ready,
+                            attempts: 1,
+                            failures: 0,
+                            detail: None,
+                        },
+                    },
+                    RegistrationResult {
+                        name: "work".into(),
+                        id: "not-ready".into(),
+                        route: "/not-ready".into(),
+                        address: "http://127.0.0.1:8010".into(),
+                        path: "/acp".into(),
+                        health_endpoint: true,
+                        readyz_endpoint: true,
+                        max_processes: 2,
+                        readiness: ReadinessResult {
+                            status: ReadinessStatus::NotReady,
+                            attempts: 2,
+                            failures: 1,
+                            detail: Some("spawn failed".into()),
+                        },
+                    },
+                ],
+            }),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains(r#""address":"http://127.0.0.1:8010""#));
+        assert!(json.contains(r#""status":"disabled""#));
+        assert!(json.contains(r#""status":"ready""#));
+        assert!(json.contains(r#""status":"not_ready""#));
+        assert!(json.contains(r#""detail":"spawn failed""#));
+
+        let decoded: ResponseEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]
