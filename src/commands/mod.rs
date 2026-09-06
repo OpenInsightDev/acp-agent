@@ -31,16 +31,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Internal foreground process for a named ACP server.
-    #[command(name = "__server-run", hide = true)]
-    ServerRun {
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        host: String,
-        #[arg(long)]
-        port: u16,
-    },
+    /// Run the named-server daemon in the foreground.
+    Daemon,
     /// List every published agent.
     List {
         /// List agents cached locally instead of the published registry.
@@ -234,18 +226,6 @@ enum ServerCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Tail a named server's log.
-    Logs {
-        /// Local server name.
-        #[arg(long, default_value = "default")]
-        name: String,
-        /// Number of log lines to tail.
-        #[arg(long, default_value_t = 50)]
-        lines: usize,
-        /// Emit the log lines as structured JSON.
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 /// Process outcome returned by a CLI command.
@@ -289,8 +269,8 @@ where
 /// Dispatches a parsed CLI command.
 pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<CliExit> {
     match cli.command {
-        Commands::ServerRun { name, host, port } => {
-            crate::server::run(name, host, port).await?;
+        Commands::Daemon => {
+            crate::server::run().await?;
             Ok(CliExit::Success)
         }
         Commands::List { installed, json } => {
@@ -510,14 +490,6 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 server::write_registrations(writer, &name, &records, json).with_context(|| {
                     format!("failed to list registrations for server \"{name}\"")
                 })?;
-                Ok(CliExit::Success)
-            }
-            ServerCommands::Logs { name, lines, json } => {
-                let record = crate::server::logs(&name, lines)
-                    .await
-                    .with_context(|| format!("failed to read logs for server \"{name}\""))?;
-                server::write_logs(writer, &record, json)
-                    .with_context(|| format!("failed to read logs for server \"{name}\""))?;
                 Ok(CliExit::Success)
             }
         },
@@ -815,23 +787,14 @@ mod tests {
             } if name == "work"
         ));
 
-        let logs = Cli::try_parse_from([
-            "acp-agent",
-            "server",
-            "logs",
-            "--name",
-            "work",
-            "--lines",
-            "100",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            logs.command,
-            Commands::Server {
-                command: ServerCommands::Logs { name, lines, json: true }
-            } if name == "work" && lines == 100
-        ));
+        let daemon = Cli::try_parse_from(["acp-agent", "daemon"]).unwrap();
+        assert!(matches!(daemon.command, Commands::Daemon));
+    }
+
+    #[test]
+    fn rejects_hidden_server_runner_and_server_logs_commands() {
+        assert!(Cli::try_parse_from(["acp-agent", "__server-run"]).is_err());
+        assert!(Cli::try_parse_from(["acp-agent", "server", "logs"]).is_err());
     }
 
     #[test]

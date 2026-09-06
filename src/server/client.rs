@@ -1,35 +1,121 @@
-use super::daemon::{
-    api_error_detail, load_live_server, server_is_alive, validate_name, validate_route,
+use super::daemon::{validate_name, validate_route};
+use super::protocol::{
+    self, CreateInstanceRequest, ErrorCode, InstanceResult, InstanceState, ProtocolError,
+    ReadinessStatus, RegisterRequest, RegistrationsRequest, Request as ProtocolRequest,
+    RequestEnvelope, Response as ProtocolResponse, ResponseEnvelope, StatusRequest,
+    StopInstanceRequest, UnregisterRequest,
 };
-use super::*;
+use super::{
+    RegisterOptions, RegisterResult, RegistrationRecord, ServerRecord, StartOptions, StartResult,
+    StopResult, UnregisterResult,
+};
+use anyhow::{Context, Result, anyhow, bail};
+use std::{
+    fmt,
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    time::Duration,
+};
+use tokio::time::{sleep, timeout};
 
-/// Owns a detached server child until its state file proves that startup has
-/// committed. Dropping the startup future must not leave an untracked daemon.
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct MissingDaemonEndpoint {
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+impl fmt::Display for MissingDaemonEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "daemon endpoint {} is missing: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for MissingDaemonEndpoint {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Debug)]
+struct DaemonEndpointError {
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+impl fmt::Display for DaemonEndpointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "daemon endpoint {} is unusable: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for DaemonEndpointError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Debug)]
+struct DaemonClientError {
+    code: ErrorCode,
+    message: String,
+}
+
+impl fmt::Display for DaemonClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "daemon {} error: {}",
+            error_code_name(self.code),
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for DaemonClientError {}
+
+/// Keeps a daemon child owned by this client until the daemon answers health.
 struct StartupChildGuard {
-    child: Option<tokio::process::Child>,
-    pid: u32,
-    state_path: PathBuf,
+    child: Option<Child>,
 }
 
 impl StartupChildGuard {
-    fn new(child: tokio::process::Child, pid: u32, state_path: PathBuf) -> Self {
-        Self {
-            child: Some(child),
-            pid,
-            state_path,
-        }
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
     }
 
-    fn child_mut(&mut self) -> &mut tokio::process::Child {
+    fn child_mut(&mut self) -> &mut Child {
         self.child
             .as_mut()
             .expect("startup child guard was already disarmed")
     }
 
-    fn disarm(mut self) -> tokio::process::Child {
+    fn disarm(mut self) -> Child {
         self.child
             .take()
             .expect("startup child guard was already disarmed")
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        let _ = child.kill();
+        child
+            .wait()
+            .context("failed to wait for daemon child during startup cleanup")?;
+        Ok(())
     }
 }
 
@@ -38,515 +124,362 @@ impl Drop for StartupChildGuard {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        let pid = self.pid;
-        let state_path = self.state_path.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let cleanup = async move {
-                let _ = cleanup_failed_start(&mut child, &state_path, pid).await;
-            };
-            handle.spawn(cleanup);
-        } else {
-            // A runtime may already be shutting down, so retain a synchronous
-            // best-effort kill path when no executor can own the child.
-            let _ = child.start_kill();
-        }
+        // A cancelled startup future cannot run its async cleanup branch. Kill
+        // and reap synchronously so cancellation cannot orphan this child.
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
-/// Starts a named ACP server in the background and returns its URL.
+/// Starts a named ACP server through the daemon control protocol.
 pub async fn start(options: StartOptions) -> Result<StartResult> {
     validate_name(&options.name)?;
-    let executable = std::env::current_exe().context("failed to locate acp-agent executable")?;
-    start_with(options, ServerPaths::discover()?, executable, START_TIMEOUT).await
-}
-
-pub(super) async fn start_with(
-    options: StartOptions,
-    paths: ServerPaths,
-    executable: PathBuf,
-    start_timeout: Duration,
-) -> Result<StartResult> {
-    validate_name(&options.name)?;
-    let path = paths.state_file(&options.name);
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        if let Ok(existing) = read_json::<ServerFile>(&path).await
-            && server_is_alive(&existing).await
-        {
-            bail!(
-                "server \"{}\" is already running at {}",
-                options.name,
-                public_url(&existing.listen_host, existing.port)?
-            );
-        }
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    let log_path = paths.log_file(&options.name);
-    let log = open_private_file(&log_path, true)?;
-    let stderr = log
-        .try_clone()
-        .context("failed to clone server log handle")?;
-    let mut command = Command::new(executable);
-    command
-        .arg("__server-run")
-        .arg("--name")
-        .arg(&options.name)
-        .arg("--host")
-        .arg(&options.host)
-        .arg("--port")
-        .arg(options.port.to_string())
-        .env(SERVER_STATE_DIR_ENV, &paths.directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr));
-    detach_process(&mut command);
-    let child = command.spawn().context("failed to start server process")?;
-    let child_pid = child.id().context("failed to identify server process")?;
-    let mut startup_child = StartupChildGuard::new(child, child_pid, path.clone());
-
-    let ready = async {
-        loop {
-            if let Some(status) = startup_child
-                .child_mut()
-                .try_wait()
-                .context("failed to inspect server process")?
-            {
-                bail!(
-                    "server process exited with {status}; inspect {}",
-                    log_path.display()
-                );
-            }
-            if let Ok(state) = read_json::<ServerFile>(&path).await
-                && state.name == options.name
-                && state.version == SERVER_PROTOCOL_VERSION
-                && state.pid == child_pid
-                && server_is_alive(&state).await
-            {
-                return Ok(state);
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    let state = match timeout(start_timeout, ready).await {
-        Ok(Ok(state)) => state,
-        Ok(Err(error)) => {
-            cleanup_failed_start(startup_child.child_mut(), &path, child_pid)
-                .await
-                .with_context(|| format!("failed to clean up after startup error: {error:#}"))?;
-            drop(startup_child.disarm());
-            return Err(error);
-        }
-        Err(_) => {
-            cleanup_failed_start(startup_child.child_mut(), &path, child_pid)
-                .await
-                .context("failed to clean up after server startup timeout")?;
-            drop(startup_child.disarm());
-            bail!(
-                "timed out waiting for server to start; inspect {}",
-                log_path.display()
-            );
-        }
-    };
-    drop(startup_child.disarm());
+    let response = request_or_start(ProtocolRequest::CreateInstance(CreateInstanceRequest {
+        name: options.name,
+        host: options.host,
+        port: options.port,
+    }))
+    .await?;
+    let instance = expect_create_instance(response)?;
     Ok(StartResult {
-        name: state.name,
-        address: public_url(&state.listen_host, state.port)?,
+        name: instance.name,
+        address: instance.address,
     })
 }
 
-/// Stops a named ACP server.
+/// Stops a named ACP server through the daemon control protocol.
 pub async fn stop(name: &str) -> Result<StopResult> {
     validate_name(name)?;
-    let path = ServerPaths::discover()?.state_file(name);
-    let state: ServerFile = read_json(&path)
-        .await
-        .with_context(|| format!("server \"{name}\" is not running"))?;
-    if state.name != name || !server_is_alive(&state).await {
-        bail!("server \"{name}\" is not running");
-    }
-    let response = reqwest::Client::new()
-        .post(format!("{}/api/shutdown", state.control_url))
-        .send()
-        .await
-        .with_context(|| format!("failed to contact server \"{name}\""))?;
-    if !response.status().is_success() {
-        bail!("server \"{name}\" rejected the shutdown request");
-    }
-
-    let wait = async {
-        while tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            sleep(Duration::from_millis(50)).await;
-        }
-    };
-    timeout(START_TIMEOUT, wait)
-        .await
-        .context("timed out waiting for server to stop")?;
-    Ok(StopResult {
+    let response = request_existing(ProtocolRequest::StopInstance(StopInstanceRequest {
         name: name.to_string(),
-    })
+    }))
+    .await?;
+    let result = match response {
+        ProtocolResponse::StopInstance(result) => result,
+        other => bail!("daemon returned {other:?} for StopInstance"),
+    };
+    Ok(StopResult { name: result.name })
 }
 
-/// Registers an in-process agent router with a named ACP server.
+/// Registers an agent route through the daemon control protocol when supported.
 pub async fn register(agent_id: &str, options: RegisterOptions) -> Result<RegisterResult> {
     validate_name(&options.name)?;
     let route = options.route.unwrap_or_else(|| format!("/{agent_id}"));
     validate_route(&route)?;
-    let state = load_live_server(&options.name).await?;
-    let registration = AgentRegistrationRequest {
+    let response = request_existing(ProtocolRequest::Register(RegisterRequest {
+        name: options.name,
         id: agent_id.to_string(),
         route: route.clone(),
-        serve: AgentServeRequest {
-            path: options.path,
-            cors_origins: options.cors_origins,
-            allow_any_origin: options.allow_any_origin,
-            health_endpoint: options.health_endpoint,
-            readyz_endpoint: options.readyz_endpoint,
-            max_processes: options.max_processes,
-            yolo: options.yolo,
-            args: options.args,
-        },
+        path: options.path,
+        cors_origins: options.cors_origins,
+        allow_any_origin: options.allow_any_origin,
+        health_endpoint: options.health_endpoint,
+        readyz_endpoint: options.readyz_endpoint,
+        max_processes: options.max_processes,
+        yolo: options.yolo,
+        args: options.args,
+    }))
+    .await?;
+    let registration = match response {
+        ProtocolResponse::Register(result) => result,
+        other => bail!("daemon returned {other:?} for Register"),
     };
-    let response = reqwest::Client::new()
-        .post(format!("{}/api/agents", state.control_url))
-        .json(&registration)
-        .send()
-        .await
-        .with_context(|| format!("failed to register with server \"{}\"", options.name))?;
-    if !response.status().is_success() {
-        let detail = response.text().await.unwrap_or_default();
-        bail!(
-            "server rejected agent registration: {}",
-            api_error_detail(&detail)
-        );
-    }
     Ok(RegisterResult {
-        agent_id: agent_id.to_string(),
-        route,
-        address: public_url(&state.listen_host, state.port)?,
+        agent_id: registration.id,
+        route: registration.route,
+        address: registration.address,
     })
 }
 
-/// Removes an agent router from a named ACP server.
+/// Removes an agent route through the daemon control protocol when supported.
 pub async fn unregister(agent_id: &str, name: &str) -> Result<UnregisterResult> {
     validate_name(name)?;
-    let state = load_live_server(name).await?;
-    let response = reqwest::Client::new()
-        .delete(format!("{}/api/agents", state.control_url))
-        .json(&AgentSelector {
-            id: agent_id.to_string(),
-        })
-        .send()
-        .await
-        .with_context(|| format!("failed to contact server \"{name}\""))?;
-    if !response.status().is_success() {
-        let detail = response.text().await.unwrap_or_default();
-        bail!(
-            "server rejected agent unregistration: {}",
-            api_error_detail(&detail)
-        );
-    }
+    let response = request_existing(ProtocolRequest::Unregister(UnregisterRequest {
+        name: name.to_string(),
+        id: agent_id.to_string(),
+    }))
+    .await?;
+    let result = match response {
+        ProtocolResponse::Unregister(result) => result,
+        other => bail!("daemon returned {other:?} for Unregister"),
+    };
     Ok(UnregisterResult {
-        agent_id: agent_id.to_string(),
-        server_name: name.to_string(),
+        agent_id: result.id,
+        server_name: result.name,
     })
 }
 
-/// Lists named servers recorded in the state directory and their states.
-///
-/// Servers are sorted by name; each record reports the configured host, the
-/// actual bound address, the daemon PID/version, and a lifecycle state.
+/// Lists daemon-owned named server instances.
 pub async fn list() -> Result<Vec<ServerRecord>> {
-    let paths = ServerPaths::discover()?;
-    list_with_paths(&paths).await
+    let response = request_existing(ProtocolRequest::List).await?;
+    let result = match response {
+        ProtocolResponse::List(result) => result,
+        other => bail!("daemon returned {other:?} for List"),
+    };
+    Ok(result.instances.iter().map(server_record).collect())
 }
 
-pub(super) async fn list_with_paths(paths: &ServerPaths) -> Result<Vec<ServerRecord>> {
-    let mut records = Vec::new();
-    let mut entries = tokio::fs::read_dir(&paths.directory)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to read server state directory {}",
-                paths.directory.display()
-            )
-        })?;
-    while let Some(entry) = entries.next_entry().await? {
-        let file_name = entry.file_name().to_string_lossy().into_owned();
-        let Some(name) = strip_json_suffix(&file_name) else {
-            continue;
-        };
-        let state = read_json::<ServerFile>(&paths.state_file(name))
-            .await
-            .with_context(|| format!("failed to inspect server state for {name:?}"))?;
-        if state.name != name {
-            bail!(
-                "server state file {} contains server {:?}, expected {:?}",
-                paths.state_file(name).display(),
-                state.name,
-                name
-            );
-        }
-        records.push(server_record(name, &state).await);
-    }
-    records.sort_by(|left, right| left.name.cmp(&right.name));
-
-    Ok(records)
-}
-
-/// Reports the state of a single named server.
-///
-/// Unlike `register`/`unregister`/`registrations`, a missing or stale record
-/// is not an error: `status` is the diagnostic command, so `stopped`, `stale`
-/// and `starting` are all reported as states (with exit code 0).
+/// Reports one daemon-owned named server instance.
 pub async fn status(name: &str) -> Result<ServerRecord> {
     validate_name(name)?;
-    let paths = ServerPaths::discover()?;
-    status_with_paths(&paths, name).await
+    let response = request_existing(ProtocolRequest::Status(StatusRequest {
+        name: name.to_string(),
+    }))
+    .await?;
+    let instance = expect_status_instance(response)?;
+    Ok(server_record(&instance))
 }
 
-pub(super) async fn status_with_paths(paths: &ServerPaths, name: &str) -> Result<ServerRecord> {
-    validate_name(name)?;
-    let state_path = paths.state_file(name);
-    let exists = tokio::fs::try_exists(&state_path)
-        .await
-        .with_context(|| format!("failed to inspect server state for {name:?}"))?;
-    let record = if !exists {
-        ServerRecord {
-            name: name.to_string(),
-            state: ServerRunState::Stopped.as_str().to_string(),
-            listen_host: None,
-            port: None,
-            address: None,
-            pid: None,
-            version: None,
-        }
-    } else {
-        let state = read_json::<ServerFile>(&state_path)
-            .await
-            .with_context(|| format!("failed to inspect server state for {name:?}"))?;
-        if state.name != name {
-            bail!(
-                "server state file {} contains server {:?}, expected {:?}",
-                state_path.display(),
-                state.name,
-                name
-            );
-        }
-        server_record(name, &state).await
-    };
-    Ok(record)
-}
-
-/// Lists the agent routes registered with a named server and probes each
-/// route's readiness endpoint.
+/// Lists registrations through the daemon control protocol when supported.
 pub async fn registrations(name: &str) -> Result<Vec<RegistrationRecord>> {
     validate_name(name)?;
-    let state = load_live_server(name).await?;
-    let response = reqwest::Client::new()
-        .get(format!("{}/api/registrations", state.control_url))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .with_context(|| format!("failed to contact server \"{name}\""))?;
-    if !response.status().is_success() {
-        bail!("server \"{name}\" rejected the registrations request");
-    }
-    let registrations: Vec<RegistrationInfo> = response
-        .json()
-        .await
-        .context("failed to parse the registrations response")?;
-    // Probe every route's readiness concurrently: a hung router must not
-    // stall the other probes (each probe is bounded by its own timeout).
-    let mut records = join_all(registrations.into_iter().map(|registration| {
-        let state = &state;
-        async move {
-            let (readiness, detail) = probe_registration_readiness(state, &registration).await;
-            RegistrationRecord {
-                id: registration.id,
-                route: registration.route,
-                readiness,
-                detail,
-            }
-        }
+    let response = request_existing(ProtocolRequest::Registrations(RegistrationsRequest {
+        name: name.to_string(),
     }))
-    .await;
-    records.sort_by(|left, right| {
-        left.route
-            .cmp(&right.route)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-
-    Ok(records)
+    .await?;
+    let result = match response {
+        ProtocolResponse::Registrations(result) => result,
+        other => bail!("daemon returned {other:?} for Registrations"),
+    };
+    Ok(result
+        .registrations
+        .into_iter()
+        .map(|registration| RegistrationRecord {
+            id: registration.id,
+            route: registration.route,
+            readiness: readiness_status_name(registration.readiness.status).to_string(),
+            detail: registration.readiness.detail,
+        })
+        .collect())
 }
 
-/// Tails a named server's log.
-///
-/// The tail is bounded by `lines`.
-pub async fn logs(name: &str, lines: usize) -> Result<LogRecord> {
-    validate_name(name)?;
-    let log_path = ServerPaths::discover()?.log_file(name);
-    let content = match read_log_tail(&log_path, lines).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "server \"{name}\" has no log file; start it with `acp-agent server start --name {name}`"
-            );
+fn server_record(instance: &InstanceResult) -> ServerRecord {
+    ServerRecord {
+        name: instance.name.clone(),
+        state: instance_state_name(instance.state).to_string(),
+        host: instance.host.clone(),
+        port: instance.port,
+        address: instance.address.clone(),
+    }
+}
+
+fn instance_state_name(state: InstanceState) -> &'static str {
+    match state {
+        InstanceState::Running => "running",
+        InstanceState::Stopping => "stopping",
+    }
+}
+
+fn readiness_status_name(status: ReadinessStatus) -> &'static str {
+    match status {
+        ReadinessStatus::Disabled => "disabled",
+        ReadinessStatus::Ready => "ready",
+        ReadinessStatus::NotReady => "not_ready",
+    }
+}
+
+fn expect_create_instance(response: ProtocolResponse) -> Result<InstanceResult> {
+    match response {
+        ProtocolResponse::CreateInstance(instance) => Ok(instance),
+        other => bail!("daemon returned {other:?} for CreateInstance"),
+    }
+}
+
+fn expect_status_instance(response: ProtocolResponse) -> Result<InstanceResult> {
+    match response {
+        ProtocolResponse::Status(instance) => Ok(instance),
+        other => bail!("daemon returned {other:?} for Status"),
+    }
+}
+
+fn error_code_name(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::Unavailable => "unavailable",
+        ErrorCode::InvalidInput => "invalid_input",
+        ErrorCode::NotFound => "not_found",
+        ErrorCode::Conflict => "conflict",
+        ErrorCode::Operation => "operation",
+    }
+}
+
+async fn request_or_start(command: ProtocolRequest) -> Result<ProtocolResponse> {
+    #[cfg(unix)]
+    {
+        match request_existing(command.clone()).await {
+            Ok(response) => return Ok(response),
+            Err(error) if error.downcast_ref::<MissingDaemonEndpoint>().is_some() => {}
+            Err(error) => return Err(error),
         }
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", log_path.display()));
-        }
+        start_daemon().await?;
+        request_existing(command).await
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        bail!("named server control requires Unix-domain sockets")
+    }
+}
+
+#[cfg(unix)]
+async fn request_existing(command: ProtocolRequest) -> Result<ProtocolResponse> {
+    let path = protocol::daemon_socket_path().context("failed to resolve daemon endpoint")?;
+    let mut stream = tokio::net::UnixStream::connect(&path)
+        .await
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::new(MissingDaemonEndpoint { path, source })
+            } else {
+                anyhow::Error::new(DaemonEndpointError { path, source })
+            }
+        })?;
+    protocol::write_frame(
+        &mut stream,
+        &RequestEnvelope {
+            version: protocol::PROTOCOL_VERSION,
+            command,
+        },
+    )
+    .await?;
+    let response: ResponseEnvelope = protocol::read_frame(&mut stream).await?;
+    response_result(response)
+}
+
+#[cfg(unix)]
+async fn start_daemon() -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate acp-agent executable")?;
+    let child = Command::new(executable)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to start acp-agent daemon")?;
+    let mut guard = StartupChildGuard::new(child);
+    let health = match timeout(DAEMON_START_TIMEOUT, wait_for_health(&mut guard)).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "timed out waiting for the acp-agent daemon to become healthy"
+        )),
     };
-    Ok(LogRecord {
-        name: name.to_string(),
-        lines: tail_lines(&content, lines)
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+    if let Err(error) = health {
+        let cleanup = guard.cleanup();
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(format!(
+                "failed to clean up daemon after startup failure: {cleanup_error:#}"
+            ))),
+        };
+    }
+    drop(guard.disarm());
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_health(guard: &mut StartupChildGuard) -> Result<()> {
+    let mut child_exited = false;
+    let mut waiting_for_winner = false;
+    loop {
+        match request_existing(ProtocolRequest::Health).await {
+            Ok(ProtocolResponse::Health(result)) => {
+                if result.protocol_version != protocol::PROTOCOL_VERSION {
+                    bail!(
+                        "daemon reported protocol version {}, expected {}",
+                        result.protocol_version,
+                        protocol::PROTOCOL_VERSION
+                    );
+                }
+                return Ok(());
+            }
+            Ok(other) => bail!("daemon returned {other:?} for Health"),
+            Err(error) if error.downcast_ref::<MissingDaemonEndpoint>().is_some() => {}
+            Err(error) if error.downcast_ref::<DaemonEndpointError>().is_some() => {}
+            Err(error) => return Err(error),
+        }
+
+        if !child_exited {
+            if let Some(status) = guard
+                .child_mut()
+                .try_wait()
+                .context("failed to inspect daemon startup process")?
+            {
+                child_exited = true;
+                if !status.success() {
+                    // A concurrent starter may have won the endpoint race. Keep
+                    // checking until the startup timeout for its health response.
+                    waiting_for_winner = true;
+                } else {
+                    bail!("acp-agent daemon exited before health succeeded");
+                }
+            }
+        } else if !waiting_for_winner {
+            bail!("acp-agent daemon exited before health succeeded");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn response_result(response: ResponseEnvelope) -> Result<ProtocolResponse> {
+    match response {
+        ResponseEnvelope::Success { version, result } => {
+            if version != protocol::PROTOCOL_VERSION {
+                bail!(
+                    "daemon response used protocol version {version}, expected {}",
+                    protocol::PROTOCOL_VERSION
+                );
+            }
+            Ok(result)
+        }
+        ResponseEnvelope::Error { version, error } => {
+            if version != protocol::PROTOCOL_VERSION {
+                bail!(
+                    "daemon error response used protocol version {version}, expected {}",
+                    protocol::PROTOCOL_VERSION
+                );
+            }
+            Err(protocol_error(error))
+        }
+    }
+}
+
+fn protocol_error(error: ProtocolError) -> anyhow::Error {
+    anyhow::Error::new(DaemonClientError {
+        code: error.code,
+        message: error.message,
     })
 }
 
-// Read backwards in bounded chunks so a short tail never loads an unbounded
-// daemon log into memory.
-pub(super) async fn read_log_tail(path: &Path, lines: usize) -> std::io::Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
-    if lines == 0 {
-        return Ok(String::new());
-    }
-    let length = file.metadata().await?.len();
-    if length == 0 {
-        return Ok(String::new());
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    const CHUNK_SIZE: usize = 8192;
-    let mut position = length;
-    let mut chunks = Vec::new();
-    let mut newline_count = 0usize;
-    let mut bytes_read = 0usize;
-    let required_newlines = lines.saturating_add(1);
-    while position > 0 && newline_count < required_newlines {
-        let remaining = MAX_LOG_TAIL_BYTES - bytes_read;
-        if remaining == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "log tail exceeds the {} byte read limit before finding {lines} lines",
-                    MAX_LOG_TAIL_BYTES
-                ),
-            ));
-        }
-        let amount = position.min(CHUNK_SIZE.min(remaining) as u64) as usize;
-        position -= amount as u64;
-        file.seek(std::io::SeekFrom::Start(position)).await?;
-        let mut chunk = vec![0; amount];
-        file.read_exact(&mut chunk).await?;
-        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
-        bytes_read += amount;
-        chunks.push(chunk);
-    }
-    chunks.reverse();
-    let capacity = chunks.iter().map(Vec::len).sum();
-    let mut bytes = Vec::with_capacity(capacity);
-    for chunk in chunks {
-        bytes.extend_from_slice(&chunk);
-    }
-    String::from_utf8(bytes)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-}
-
-pub(super) async fn server_record(name: &str, state: &ServerFile) -> ServerRecord {
-    let run_state = observed_state(state).await;
-    ServerRecord {
-        name: name.to_string(),
-        state: run_state.as_str().to_string(),
-        listen_host: Some(state.listen_host.clone()),
-        port: Some(state.port),
-        address: control_url(&state.listen_host, state.port).ok(),
-        pid: Some(state.pid),
-        version: Some(state.version.clone()),
-    }
-}
-
-pub(super) async fn observed_state(state: &ServerFile) -> ServerRunState {
-    if server_is_alive(state).await {
-        return ServerRunState::Running;
-    }
-    if process_alive(state.pid) {
-        return ServerRunState::Starting;
-    }
-    ServerRunState::Stale
-}
-
-// Signal 0 probes existence without terminating the process; EPERM still
-// means the process exists.
-#[cfg(unix)]
-pub(super) fn process_alive(pid: u32) -> bool {
-    // SAFETY: signal 0 never delivers a signal; `pid` comes from a state file
-    // written by this tool, and negative values cannot occur for u32.
-    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-pub(super) fn process_alive(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .map(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-        })
-        .unwrap_or(false)
-}
-
-pub(super) async fn probe_registration_readiness(
-    state: &ServerFile,
-    registration: &RegistrationInfo,
-) -> (String, Option<String>) {
-    if !registration.readyz_endpoint {
-        return ("disabled".to_string(), None);
-    }
-    let url = format!("{}{}/readyz", state.control_url, registration.route);
-    let Ok(response) = reqwest::Client::new()
-        .get(&url)
-        .timeout(Duration::from_millis(1500))
-        .send()
-        .await
-    else {
-        return (
-            "unknown".to_string(),
-            Some("readiness probe failed".to_string()),
+    #[test]
+    fn maps_protocol_errors_to_stable_typed_messages() {
+        let error = protocol_error(ProtocolError {
+            code: ErrorCode::NotFound,
+            message: "missing".to_string(),
+        });
+        assert_eq!(error.to_string(), "daemon not_found error: missing");
+        assert_eq!(
+            error
+                .downcast_ref::<DaemonClientError>()
+                .map(|error| error.code),
+            Some(ErrorCode::NotFound)
         );
-    };
-    match response.status() {
-        StatusCode::OK => ("ready".to_string(), None),
-        StatusCode::SERVICE_UNAVAILABLE => {
-            let detail = response.text().await.unwrap_or_default();
-            let detail = detail.trim().to_string();
-            ("not_ready".to_string(), Some(detail))
-        }
-        StatusCode::NOT_FOUND => ("disabled".to_string(), None),
-        _ => (
-            "unknown".to_string(),
-            Some(format!("unexpected probe status {}", response.status())),
-        ),
     }
-}
 
-pub(super) fn strip_json_suffix(name: &str) -> Option<&str> {
-    name.strip_suffix(".json").filter(|name| !name.is_empty())
-}
-
-pub(super) fn tail_lines(content: &str, max_lines: usize) -> Vec<&str> {
-    if max_lines == 0 {
-        return Vec::new();
+    #[test]
+    fn maps_instance_states_without_legacy_process_fields() {
+        let record = server_record(&InstanceResult {
+            name: "default".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8010,
+            address: "http://127.0.0.1:8010".to_string(),
+            state: InstanceState::Running,
+        });
+        assert_eq!(record.state, "running");
+        assert_eq!(record.host, "127.0.0.1");
+        assert_eq!(record.port, 8010);
+        assert_eq!(record.address, "http://127.0.0.1:8010");
     }
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    if lines.last() == Some(&"") {
-        lines.pop();
-    }
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..]
-        .iter()
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect()
 }
