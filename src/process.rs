@@ -15,7 +15,7 @@ pub(crate) fn cancellable(command: &mut Command) -> &mut Command {
 
 /// Configures a child for an internal wrapper process.  The wrapper must stay
 /// in its supervisor's Unix process group so killing the supervisor also
-/// reaches the wrapped executable.  Windows still uses a private Job Object.
+/// reaches the wrapped executable.
 pub(crate) fn cancellable_in_supervisor_group(command: &mut Command) -> &mut Command {
     command.kill_on_drop(true);
     command
@@ -60,12 +60,7 @@ struct ProcessTreeGuard {
     pid: Option<u32>,
 }
 
-#[cfg(windows)]
-struct ProcessTreeGuard {
-    job: Option<windows_sys::Win32::Foundation::HANDLE>,
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 struct ProcessTreeGuard;
 
 impl ProcessTreeGuard {
@@ -76,45 +71,7 @@ impl ProcessTreeGuard {
                 pid: owns_unix_process_group.then(|| child.id()).flatten(),
             })
         }
-        #[cfg(windows)]
-        {
-            let _ = owns_unix_process_group;
-            use std::os::windows::io::RawHandle;
-            use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
-            use windows_sys::Win32::System::JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject,
-            };
-
-            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if job.is_null() {
-                return Err(std::io::Error::from_raw_os_error(unsafe {
-                    GetLastError() as i32
-                }));
-            }
-            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let configured = unsafe {
-                SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            } != 0;
-            let process: Option<RawHandle> = child.raw_handle();
-            let assigned = configured
-                && process.is_some_and(|handle| unsafe {
-                    AssignProcessToJobObject(job, handle as HANDLE) != 0
-                });
-            if !assigned {
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(Self { job: Some(job) })
-        }
-        #[cfg(not(any(unix, windows)))]
+        #[cfg(not(unix))]
         {
             let _ = (child, owns_unix_process_group);
             Ok(Self)
@@ -132,12 +89,6 @@ impl Drop for ProcessTreeGuard {
             unsafe {
                 libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
             }
-        }
-        #[cfg(windows)]
-        if let Some(job) = self.job.take() {
-            // Closing a job configured with KILL_ON_JOB_CLOSE terminates every
-            // process assigned to it, including descendants created later.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
         }
     }
 }
