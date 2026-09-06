@@ -353,8 +353,6 @@ pub(crate) fn platform_cache_key(platform: Platform) -> &'static str {
         Platform::DarwinX86_64 => "darwin-x86_64",
         Platform::LinuxAarch64 => "linux-aarch64",
         Platform::LinuxX86_64 => "linux-x86_64",
-        Platform::WindowsAarch64 => "windows-aarch64",
-        Platform::WindowsX86_64 => "windows-x86_64",
     }
 }
 

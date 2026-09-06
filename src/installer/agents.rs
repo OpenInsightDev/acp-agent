@@ -716,8 +716,6 @@ mod tests {
             Platform::DarwinX86_64 => binary.darwin_x86_64 = Some(target),
             Platform::LinuxAarch64 => binary.linux_aarch64 = Some(target),
             Platform::LinuxX86_64 => binary.linux_x86_64 = Some(target),
-            Platform::WindowsAarch64 => binary.windows_aarch64 = Some(target),
-            Platform::WindowsX86_64 => binary.windows_x86_64 = Some(target),
         }
         let mut agent = sample_agent();
         agent.distribution.binary = Some(binary);
