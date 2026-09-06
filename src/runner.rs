@@ -1,6 +1,6 @@
 //! Local ACP agent process execution.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
@@ -111,9 +111,9 @@ pub(crate) async fn resolve_agent_config_from_registry_agent(
     agent: &RegistryAgent,
     user_args: &[String],
 ) -> Result<ResolvedAgentConfig> {
-    resolve_agent_command(agent, user_args)
+    Ok(resolve_agent_command(agent, user_args)
         .await?
-        .into_resolved_config()
+        .into_resolved_config())
 }
 
 async fn resolve_agent(agent_id: &str, user_args: &[String]) -> Result<CommandSpec> {
@@ -125,29 +125,13 @@ async fn resolve_agent(agent_id: &str, user_args: &[String]) -> Result<CommandSp
 }
 
 impl CommandSpec {
-    fn into_resolved_config(self) -> Result<ResolvedAgentConfig> {
-        // Every served agent goes through this small wrapper. The wrapped
-        // command remains in the process group created by `AcpAgent`, which
-        // terminates package-runner descendants as well as binary agents when
-        // the transport connection is cancelled.
-        let current_dir = match self.current_dir {
-            Some(current_dir) => current_dir,
-            None => std::env::current_dir()
-                .context("failed to resolve the agent process working directory")?,
-        };
-        let mut args = vec![
-            "__run-in-dir".to_string(),
-            path_argument(&current_dir, "working directory")?,
-            path_argument(&self.program, "executable path")?,
-        ];
-        args.extend(self.args);
-        let command = std::env::current_exe()
-            .context("failed to locate acp-agent executable for process supervision")?;
-
-        Ok(ResolvedAgentConfig {
-            config: AcpAgentConfig::new(command).args(args).envs(self.env),
+    fn into_resolved_config(self) -> ResolvedAgentConfig {
+        ResolvedAgentConfig {
+            config: AcpAgentConfig::new(self.program)
+                .args(self.args)
+                .envs(self.env),
             cache_use_lease: self.cache_use_lease,
-        })
+        }
     }
 
     fn command(&self) -> Command {
@@ -162,12 +146,6 @@ impl CommandSpec {
             .stderr(Stdio::inherit());
         command
     }
-}
-
-fn path_argument(path: &Path, description: &str) -> Result<String> {
-    path.to_str()
-        .map(str::to_owned)
-        .with_context(|| format!("agent {description} is not valid UTF-8: {path:?}"))
 }
 
 async fn resolve_agent_command(agent: &RegistryAgent, user_args: &[String]) -> Result<CommandSpec> {
@@ -287,30 +265,11 @@ async fn run_command(spec: CommandSpec, agent_id: &str) -> Result<ExitStatus> {
         .with_context(|| format!("failed to run {program} for {agent_id}"))
 }
 
-/// Runs a command with inherited stdio from a specific working directory.
-pub(crate) async fn run_in_directory(
-    current_dir: &Path,
-    program: &Path,
-    args: Vec<String>,
-) -> std::io::Result<ExitStatus> {
-    let spec = CommandSpec {
-        program: program.to_owned(),
-        args,
-        env: Environment::new(),
-        current_dir: Some(current_dir.to_owned()),
-        cache_use_lease: None,
-    };
-    let mut command = spec.command();
-    // This is invoked by the hidden ACP wrapper.  Keep the wrapped process in
-    // the wrapper's supervisor group on Unix so cancellation of the wrapper
-    // also terminates the real agent and its descendants.
-    process::status_in_supervisor_group(&mut command).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry::{AgentDistribution, NpxDistribution, UvxDistribution};
+    use std::path::Path;
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -504,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn wraps_package_process_config_for_process_tree_supervision() {
+    fn resolves_direct_process_config() {
         let spec = CommandSpec {
             program: PathBuf::from("agent-program"),
             args: strings(&["--stdio", "--model", "gpt-5"]),
@@ -513,16 +472,10 @@ mod tests {
             cache_use_lease: None,
         };
 
-        let config = spec.into_resolved_config().unwrap().config;
+        let config = spec.into_resolved_config().config;
 
-        assert_eq!(config.command(), std::env::current_exe().unwrap());
-        let arguments = config.arguments();
-        assert_eq!(arguments[0], "__run-in-dir");
-        assert_eq!(arguments[1], std::env::current_dir().unwrap());
-        assert_eq!(
-            arguments[2..],
-            ["agent-program", "--stdio", "--model", "gpt-5"]
-        );
+        assert_eq!(config.command(), Path::new("agent-program"));
+        assert_eq!(config.arguments(), ["--stdio", "--model", "gpt-5"]);
         assert_eq!(
             config.environment().get("AGENT_MODE"),
             Some(&"serve".to_string())
@@ -530,30 +483,20 @@ mod tests {
     }
 
     #[test]
-    fn wraps_binary_process_config_to_preserve_working_directory() {
+    fn command_preserves_optional_working_directory() {
         let spec = CommandSpec {
-            program: PathBuf::from("/cache/demo/bin/agent"),
+            program: PathBuf::from("agent-program"),
             args: strings(&["--stdio"]),
             env: Environment::from([("AGENT_MODE".to_string(), "serve".to_string())]),
             current_dir: Some(PathBuf::from("/cache/demo")),
             cache_use_lease: None,
         };
 
-        let config = spec.into_resolved_config().unwrap().config;
+        let command = spec.command();
 
-        assert_eq!(config.command(), std::env::current_exe().unwrap());
         assert_eq!(
-            config.arguments(),
-            [
-                "__run-in-dir",
-                "/cache/demo",
-                "/cache/demo/bin/agent",
-                "--stdio",
-            ]
-        );
-        assert_eq!(
-            config.environment().get("AGENT_MODE"),
-            Some(&"serve".to_string())
+            command.as_std().get_current_dir(),
+            Some(Path::new("/cache/demo"))
         );
     }
 
@@ -566,12 +509,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(config.config.command(), std::env::current_exe().unwrap());
-        let arguments = config.config.arguments();
-        assert_eq!(arguments[0], "__run-in-dir");
+        assert_eq!(config.config.command(), Path::new("uvx"));
         assert_eq!(
-            arguments[2..],
-            ["uvx", "acme-demo", "--stdio", "--model", "gpt-5"]
+            config.config.arguments(),
+            ["acme-demo", "--stdio", "--model", "gpt-5"]
         );
         assert_eq!(
             config.config.environment().get("DEMO_MODE"),

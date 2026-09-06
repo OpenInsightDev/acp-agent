@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use anyhow::Context;
@@ -32,14 +31,6 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Internal process wrapper used to preserve binary distribution working directories.
-    #[command(name = "__run-in-dir", hide = true, trailing_var_arg = true)]
-    RunInDir {
-        current_dir: PathBuf,
-        program: PathBuf,
-        #[arg(allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
     /// Internal foreground process for a named ACP server.
     #[command(name = "__server-run", hide = true)]
     ServerRun {
@@ -298,22 +289,6 @@ where
 /// Dispatches a parsed CLI command.
 pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<CliExit> {
     match cli.command {
-        Commands::RunInDir {
-            current_dir,
-            program,
-            args,
-        } => {
-            let status = crate::runner::run_in_directory(&current_dir, &program, args)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to run {} in {}",
-                        program.display(),
-                        current_dir.display()
-                    )
-                })?;
-            Ok(exit_from_status(status))
-        }
         Commands::ServerRun { name, host, port } => {
             crate::server::run(name, host, port).await?;
             Ok(CliExit::Success)
@@ -721,31 +696,6 @@ mod tests {
         assert!(matches!(
             search.command,
             Commands::Search { json: false, .. }
-        ));
-    }
-
-    #[test]
-    fn parses_internal_working_directory_wrapper_arguments() {
-        let cli = Cli::try_parse_from([
-            "acp-agent",
-            "__run-in-dir",
-            "/cache/demo",
-            "/cache/demo/bin/agent",
-            "--stdio",
-            "--model",
-            "gpt-5",
-        ])
-        .unwrap();
-
-        assert!(matches!(
-            cli.command,
-            Commands::RunInDir {
-                current_dir,
-                program,
-                args,
-            } if current_dir == std::path::Path::new("/cache/demo")
-                && program == std::path::Path::new("/cache/demo/bin/agent")
-                && args == ["--stdio", "--model", "gpt-5"]
         ));
     }
 
