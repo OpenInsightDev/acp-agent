@@ -11,8 +11,8 @@ pub mod environment;
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    /// Serializes tests that temporarily mutate the process-wide `PATH` (and on
-    /// Windows `PATHEXT`) environment variable, which would otherwise race when
-    /// the test binary runs them in parallel.
+    /// Serializes tests that temporarily mutate the process-wide `PATH`
+    /// environment variable, which would otherwise race when the test binary
+    /// runs them in parallel.
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

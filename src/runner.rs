@@ -126,10 +126,9 @@ async fn resolve_agent(agent_id: &str, user_args: &[String]) -> Result<CommandSp
 
 impl CommandSpec {
     fn into_resolved_config(self) -> Result<ResolvedAgentConfig> {
-        // Every served agent goes through this small wrapper. On Unix the
-        // wrapped command remains in the process group created by `AcpAgent`;
-        // on Windows the wrapper owns a kill-on-close Job Object. Both paths
-        // terminate package-runner descendants as well as binary agents when
+        // Every served agent goes through this small wrapper. The wrapped
+        // command remains in the process group created by `AcpAgent`, which
+        // terminates package-runner descendants as well as binary agents when
         // the transport connection is cancelled.
         let current_dir = match self.current_dir {
             Some(current_dir) => current_dir,

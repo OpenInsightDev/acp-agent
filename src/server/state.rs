@@ -53,8 +53,6 @@ pub(super) fn ensure_private_directory(path: &Path) -> Result<()> {
             || format!("failed to secure server state directory {}", path.display()),
         )?;
     }
-    // Windows inherits the current user's ACL from the platform cache root;
-    // Unix modes do not have an ACL-equivalent meaning there.
     Ok(())
 }
 
@@ -80,7 +78,6 @@ pub(super) fn open_private_file(path: &Path, append: bool) -> Result<std::fs::Fi
         file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("failed to secure private file {}", path.display()))?;
     }
-    // On Windows the newly created file inherits the private cache ACL.
     Ok(file)
 }
 
@@ -259,15 +256,4 @@ pub(super) fn detach_process(command: &mut Command) {
     use std::os::unix::process::CommandExt;
 
     command.as_std_mut().process_group(0);
-}
-
-#[cfg(windows)]
-pub(super) fn detach_process(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    command
-        .as_std_mut()
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
 }
