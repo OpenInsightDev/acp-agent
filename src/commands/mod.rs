@@ -31,7 +31,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run the named-server daemon in the foreground.
+    /// Run the foreground daemon that owns named ACP instances.
     Daemon,
     /// List every published agent.
     List {
@@ -123,7 +123,7 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Manage named ACP servers and their agent routes.
+    /// Manage live named ACP instances through the daemon.
     Server {
         #[command(subcommand)]
         command: ServerCommands,
@@ -139,28 +139,28 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum ServerCommands {
-    /// Start a named ACP server in the background.
+    /// Create or reuse a named ACP instance in the foreground daemon.
     Start {
-        /// Local server name used by later commands.
+        /// Named instance used by later commands.
         #[arg(long, default_value = "default")]
         name: String,
-        /// Hostname or IP address for the named server listener.
+        /// Hostname or IP address for the instance's public listener.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// TCP port for the named server listener. Use 0 for an ephemeral port.
+        /// TCP port for the instance's public listener. Use 0 for an ephemeral port.
         #[arg(long, default_value_t = 8010)]
         port: u16,
     },
-    /// Stop a named ACP server.
+    /// Stop and remove a named ACP instance from the daemon.
     Stop {
-        /// Local server name.
+        /// Named instance.
         #[arg(long, default_value = "default")]
         name: String,
     },
-    /// Register an agent route with a named server.
+    /// Register an agent route with a named instance.
     Register {
         agent_id: String,
-        /// Target server name.
+        /// Target instance name.
         #[arg(long, default_value = "default")]
         name: String,
         /// Public route prefix. Defaults to `/<agent-id>`.
@@ -195,31 +195,31 @@ enum ServerCommands {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Remove an agent route from a named server.
+    /// Remove an agent route from a named instance.
     Unregister {
         agent_id: String,
-        /// Target server name.
+        /// Target instance name.
         #[arg(long, default_value = "default")]
         name: String,
     },
-    /// List named servers and their process states.
+    /// List live named instances owned by the daemon.
     List {
-        /// Emit server records as structured JSON.
+        /// Emit instance records as structured JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Show the state of a named server.
+    /// Show a live named instance's state and listener.
     Status {
-        /// Local server name.
+        /// Named instance.
         #[arg(long, default_value = "default")]
         name: String,
-        /// Emit the server record as structured JSON.
+        /// Emit the instance record as structured JSON.
         #[arg(long)]
         json: bool,
     },
-    /// List the agent routes registered with a named server.
+    /// List the routes and daemon-sourced readiness for a named instance.
     Registrations {
-        /// Local server name.
+        /// Named instance.
         #[arg(long, default_value = "default")]
         name: String,
         /// Emit registration records as structured JSON.
@@ -792,9 +792,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hidden_server_runner_and_server_logs_commands() {
-        assert!(Cli::try_parse_from(["acp-agent", "__server-run"]).is_err());
-        assert!(Cli::try_parse_from(["acp-agent", "server", "logs"]).is_err());
+    fn rejects_unsupported_commands() {
+        assert!(Cli::try_parse_from(["acp-agent", "unsupported"]).is_err());
+        assert!(Cli::try_parse_from(["acp-agent", "server", "unsupported"]).is_err());
     }
 
     #[test]

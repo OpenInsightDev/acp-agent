@@ -1,9 +1,9 @@
 use super::daemon::{validate_name, validate_route};
 use super::protocol::{
     self, CreateInstanceRequest, ErrorCode, InstanceResult, InstanceState, ProtocolError,
-    ReadinessStatus, RegisterRequest, RegistrationsRequest, Request as ProtocolRequest,
-    RequestEnvelope, Response as ProtocolResponse, ResponseEnvelope, StatusRequest,
-    StopInstanceRequest, UnregisterRequest,
+    ReadinessStatus, RegisterRequest, RegistrationResult, RegistrationsRequest,
+    Request as ProtocolRequest, RequestEnvelope, Response as ProtocolResponse, ResponseEnvelope,
+    StatusRequest, StopInstanceRequest, UnregisterRequest,
 };
 use super::{
     RegisterOptions, RegisterResult, RegistrationRecord, ServerRecord, StartOptions, StartResult,
@@ -161,7 +161,7 @@ pub async fn stop(name: &str) -> Result<StopResult> {
     Ok(StopResult { name: result.name })
 }
 
-/// Registers an agent route through the daemon control protocol when supported.
+/// Registers an agent route through the daemon control protocol.
 pub async fn register(agent_id: &str, options: RegisterOptions) -> Result<RegisterResult> {
     validate_name(&options.name)?;
     let route = options.route.unwrap_or_else(|| format!("/{agent_id}"));
@@ -191,7 +191,7 @@ pub async fn register(agent_id: &str, options: RegisterOptions) -> Result<Regist
     })
 }
 
-/// Removes an agent route through the daemon control protocol when supported.
+/// Removes an agent route through the daemon control protocol.
 pub async fn unregister(agent_id: &str, name: &str) -> Result<UnregisterResult> {
     validate_name(name)?;
     let response = request_existing(ProtocolRequest::Unregister(UnregisterRequest {
@@ -230,7 +230,7 @@ pub async fn status(name: &str) -> Result<ServerRecord> {
     Ok(server_record(&instance))
 }
 
-/// Lists registrations through the daemon control protocol when supported.
+/// Lists registrations through the daemon control protocol.
 pub async fn registrations(name: &str) -> Result<Vec<RegistrationRecord>> {
     validate_name(name)?;
     let response = request_existing(ProtocolRequest::Registrations(RegistrationsRequest {
@@ -244,12 +244,7 @@ pub async fn registrations(name: &str) -> Result<Vec<RegistrationRecord>> {
     Ok(result
         .registrations
         .into_iter()
-        .map(|registration| RegistrationRecord {
-            id: registration.id,
-            route: registration.route,
-            readiness: readiness_status_name(registration.readiness.status).to_string(),
-            detail: registration.readiness.detail,
-        })
+        .map(registration_record)
         .collect())
 }
 
@@ -267,6 +262,15 @@ fn instance_state_name(state: InstanceState) -> &'static str {
     match state {
         InstanceState::Running => "running",
         InstanceState::Stopping => "stopping",
+    }
+}
+
+fn registration_record(registration: RegistrationResult) -> RegistrationRecord {
+    RegistrationRecord {
+        id: registration.id,
+        route: registration.route,
+        readiness: readiness_status_name(registration.readiness.status).to_string(),
+        detail: registration.readiness.detail,
     }
 }
 
@@ -452,6 +456,7 @@ fn protocol_error(error: ProtocolError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::protocol::ReadinessResult;
 
     #[test]
     fn maps_protocol_errors_to_stable_typed_messages() {
@@ -481,5 +486,30 @@ mod tests {
         assert_eq!(record.host, "127.0.0.1");
         assert_eq!(record.port, 8010);
         assert_eq!(record.address, "http://127.0.0.1:8010");
+    }
+
+    #[test]
+    fn maps_readiness_status_and_detail() {
+        let record = registration_record(RegistrationResult {
+            name: "work".into(),
+            id: "demo".into(),
+            route: "/demo".into(),
+            address: "http://127.0.0.1:8010".into(),
+            path: "/acp".into(),
+            health_endpoint: true,
+            readyz_endpoint: true,
+            max_processes: 1,
+            readiness: ReadinessResult {
+                status: ReadinessStatus::NotReady,
+                attempts: 2,
+                failures: 1,
+                detail: Some("spawn failed".into()),
+            },
+        });
+
+        assert_eq!(record.id, "demo");
+        assert_eq!(record.route, "/demo");
+        assert_eq!(record.readiness, "not_ready");
+        assert_eq!(record.detail.as_deref(), Some("spawn failed"));
     }
 }

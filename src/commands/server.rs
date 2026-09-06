@@ -125,11 +125,6 @@ mod tests {
         assert!(status.contains("host:    127.0.0.1"));
         assert!(status.contains("port:    8010"));
         assert!(status.contains("address: http://127.0.0.1:8010"));
-        assert!(!status.contains("pid:"));
-        assert!(!status.contains("version:"));
-        assert!(!status.contains("starting"));
-        assert!(!status.contains("stale"));
-        assert!(!status.contains("stopped"));
 
         let mut registrations = Vec::new();
         write_registrations(
