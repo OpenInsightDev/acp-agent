@@ -4,24 +4,17 @@
 //! command handling and rendering; this module owns the wire contract, endpoint
 //! discovery, and bounded framing.
 
-#![allow(dead_code)]
-
 use std::{
-    collections::HashMap,
     env,
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::Mutex,
-};
 
 /// The control-protocol version, independent of the package version.
 ///
@@ -169,6 +162,7 @@ pub(crate) fn bind_daemon_socket() -> Result<(UnixListener, PathBuf)> {
 }
 
 #[cfg(unix)]
+#[expect(dead_code, reason = "used by the B4 Unix-socket client")]
 /// Connect to the configured daemon Unix control socket.
 pub(crate) async fn connect_daemon_socket() -> Result<UnixStream> {
     let path = daemon_socket_path()?;
@@ -401,31 +395,6 @@ pub(crate) enum ErrorCode {
 pub(crate) struct ProtocolError {
     pub(crate) code: ErrorCode,
     pub(crate) message: String,
-}
-
-/// Shared in-memory daemon state. The mutex is held only around short state
-/// transitions; listener and route work must happen after releasing the guard.
-#[derive(Debug, Default)]
-pub(crate) struct DaemonState {
-    pub(crate) instances: HashMap<String, Arc<Instance>>,
-}
-
-pub(crate) type SharedDaemonState = Arc<Mutex<DaemonState>>;
-
-impl DaemonState {
-    pub(crate) fn shared() -> SharedDaemonState {
-        Arc::new(Mutex::new(Self::default()))
-    }
-}
-
-/// Minimal instance state owned by the daemon state foundation. Later lifecycle
-/// work can attach listener, cancellation, and route-runtime fields here.
-#[derive(Debug)]
-pub(crate) struct Instance {
-    pub(crate) name: String,
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) state: InstanceState,
 }
 
 #[cfg(test)]
