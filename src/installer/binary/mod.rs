@@ -108,46 +108,23 @@ mod recovery;
 mod staging;
 mod validation;
 
-pub(crate) use archive::{
-    extract_archive_blocking, extract_archive_with_cleanup, extract_tar, extract_zip_symlink,
-    extract_zip_with_limits,
-};
-pub(crate) use download::{
-    download_archive, download_archive_with_limits, hex_encode, parse_sha256,
-};
 pub use install::cache_binary_target;
-pub(crate) use install::{
-    cache_binary_target_in, cache_binary_target_in_mode, refresh_binary_target_in,
-};
-pub(crate) use log::{
-    append_install_log, append_install_log_inner, install_log_lock_path, record_install_log,
-    record_install_log_in, truncate_install_log, utc_timestamp,
-};
-pub(crate) use paths::{resolve_cmd_path, validate_archive_component, validate_archive_path};
-pub(crate) use publication::{
-    promote_prepared_cache, unique_backup_dir_name, unique_work_dir_name,
-};
+pub(crate) use install::refresh_binary_target_in;
 pub use recovery::clean_stale_staging_entries;
-pub(crate) use recovery::{clean_stale_staging_entries_in, work_dir_cache_key};
-pub(crate) use staging::{cleanup_dir, prepare_staging_directory};
-pub(crate) use validation::{
-    hash_file_sha256_blocking, hash_payload_entry, hash_payload_sha256_blocking,
-    make_executable_blocking, validate_cached_binary_blocking, validate_cached_binary_with_lease,
-};
-
-#[cfg(test)]
-pub(crate) use archive::{extract_archive, extract_archive_with_limits, extract_zip};
-#[cfg(test)]
-pub(crate) use download::verify_sha256;
-#[cfg(test)]
-pub(crate) use publication::promote_staged_cache;
-#[cfg(test)]
-pub(crate) use staging::PreparedStaging;
-#[cfg(test)]
-pub(crate) use validation::{hash_payload_sha256, make_executable, validate_cached_binary};
 
 #[cfg(test)]
 mod tests {
+    use super::archive::{extract_archive_blocking, extract_zip, extract_zip_with_limits};
+    use super::download::{
+        download_archive, download_archive_with_limits, hex_encode, verify_sha256,
+    };
+    use super::install::cache_binary_target_in_mode;
+    use super::log::{append_install_log_inner, install_log_lock_path, utc_timestamp};
+    use super::paths::resolve_cmd_path;
+    use super::publication::{promote_prepared_cache, promote_staged_cache};
+    use super::recovery::clean_stale_staging_entries_in;
+    use super::staging::PreparedStaging;
+    use super::validation::{hash_payload_sha256, make_executable, validate_cached_binary};
     use super::*;
     use crate::installer::cache::BinaryCacheMetadata;
     use crate::installer::cache::binary_cache_paths;

@@ -1,4 +1,5 @@
 use super::staging::PreparedStaging;
+use super::validation::validate_cached_binary_blocking;
 use super::*;
 /// Publishes a prepared cache in one blocking transaction.
 ///

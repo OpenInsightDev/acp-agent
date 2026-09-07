@@ -1,4 +1,6 @@
 use super::archive::check_extraction_cancelled;
+use super::download::hex_encode;
+use super::paths::resolve_cmd_path;
 use super::*;
 pub(crate) fn hash_file_sha256_blocking(path: &Path, cancel: &AtomicBool) -> Result<String> {
     let mut file = std::fs::File::open(path)

@@ -1,3 +1,8 @@
+use super::download::parse_sha256;
+use super::log::{record_install_log, record_install_log_in};
+use super::publication::promote_prepared_cache;
+use super::staging::prepare_staging_directory;
+use super::validation::validate_cached_binary_with_lease;
 use super::*;
 /// Ensures the current binary target exists in the stable local cache.
 ///

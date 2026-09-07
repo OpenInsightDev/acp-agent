@@ -1,4 +1,10 @@
 use super::archive::check_extraction_cancelled;
+use super::archive::extract_archive_with_cleanup;
+use super::download::download_archive;
+use super::paths::resolve_cmd_path;
+use super::validation::{
+    hash_file_sha256_blocking, hash_payload_sha256_blocking, make_executable_blocking,
+};
 use super::*;
 pub(crate) async fn prepare_staging_directory(
     staging: tempfile::TempDir,

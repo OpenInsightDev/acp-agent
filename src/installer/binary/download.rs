@@ -1,3 +1,4 @@
+use super::paths::validate_archive_component;
 use super::*;
 pub(crate) async fn download_archive(target: &BinaryTarget, temp_dir: &Path) -> Result<PathBuf> {
     download_archive_with_limits(target, temp_dir, ArchiveLimits::default()).await
