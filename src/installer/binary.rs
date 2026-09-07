@@ -43,21 +43,21 @@ const INSTALL_LOG_TAIL_BYTES: u64 = 256 * 1024;
 
 /// Hard resource limits applied to binary downloads and archive extraction.
 #[derive(Debug, Clone, Copy)]
-pub struct ArchiveLimits {
+pub(crate) struct ArchiveLimits {
     /// Maximum compressed response bytes accepted from the network.
-    pub max_download_bytes: u64,
+    max_download_bytes: u64,
     /// Maximum total uncompressed entry bytes written from an archive.
-    pub max_expanded_bytes: u64,
+    max_expanded_bytes: u64,
     /// Maximum archive entries, including directories and symlinks.
-    pub max_entries: u64,
+    max_entries: u64,
     /// Maximum non-directory entries created from an archive.
-    pub max_files: u64,
+    max_files: u64,
     /// Maximum time spent establishing the HTTP connection.
-    pub connect_timeout: Duration,
+    connect_timeout: Duration,
     /// Maximum idle interval while reading the HTTP response.
-    pub read_timeout: Duration,
+    read_timeout: Duration,
     /// Maximum end-to-end HTTP request duration.
-    pub total_timeout: Duration,
+    total_timeout: Duration,
 }
 
 impl Default for ArchiveLimits {
@@ -655,11 +655,7 @@ fn parse_sha256(value: &str) -> Result<[u8; 32]> {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    let mut hex = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    hex
+    hex::encode(bytes)
 }
 
 #[cfg(test)]

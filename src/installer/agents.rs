@@ -6,10 +6,12 @@
 
 use std::ffi::OsString;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures::{FutureExt, StreamExt, stream};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::process::Command;
@@ -492,40 +494,44 @@ where
         .filter(|id| seen.insert((*id).clone()))
         .cloned()
         .collect::<Vec<_>>();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(OPERATION_CONCURRENCY));
     let operation = Arc::new(operation);
-    let mut tasks = tokio::task::JoinSet::new();
 
-    for id in &ids {
-        let id = id.clone();
-        let operation = Arc::clone(&operation);
-        let semaphore = Arc::clone(&semaphore);
-        tasks.spawn(async move {
-            let _permit = semaphore
-                .acquire()
-                .await
-                .expect("semaphore is never closed");
-            let task_id = id.clone();
-            match tokio::spawn(async move { (task_id.clone(), operation(task_id).await) }).await {
-                Ok(result) => result,
-                Err(error) => (
-                    id.clone(),
-                    Err(anyhow!("operation for agent \"{id}\" panicked: {error}")),
-                ),
+    let results = stream::iter(ids.iter().cloned())
+        .map(|id| {
+            let operation = Arc::clone(&operation);
+            async move {
+                let result = AssertUnwindSafe(operation(id.clone())).catch_unwind().await;
+                match result {
+                    Ok(result) => (id, result),
+                    Err(panic) => {
+                        let message = match panic.downcast_ref::<String>() {
+                            Some(message) => message.clone(),
+                            None => panic
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .unwrap_or("unknown panic")
+                                .to_owned(),
+                        };
+                        (
+                            id.clone(),
+                            Err(anyhow!("operation for agent \"{id}\" panicked: {message}")),
+                        )
+                    }
+                }
             }
-        });
-    }
+        })
+        .buffer_unordered(OPERATION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
 
-    let mut results = std::collections::HashMap::with_capacity(ids.len());
-    while let Some(task) = tasks.join_next().await {
-        let (id, result) = task.expect("outer concurrent task does not panic");
-        results.insert(id, result);
-    }
+    let mut results_by_id = results
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
     ids.into_iter()
         .map(|id| {
-            let result = results
+            let result = results_by_id
                 .remove(&id)
-                .expect("every spawned task returns a result");
+                .expect("every concurrent operation returns a result");
             (id, result)
         })
         .collect()

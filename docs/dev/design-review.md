@@ -12,7 +12,7 @@ The process-lifecycle finding has been applied as a destructive change.
 4. Medium: Share registry snapshots across batch operations.
 5. Completed: Consolidate repeated route configuration and distinguish mount prefixes from public route prefixes.
 6. Completed: Centralize distribution priority and remove duplicate runner enums.
-7. Low: Narrow `ArchiveLimits` visibility and consider standard codecs/concurrency helpers only when their additional semantics are needed.
+7. Completed: Narrow `ArchiveLimits` visibility and replace the protocol framing, batch concurrency, and hex helpers with established utilities.
 
 ## Findings
 
@@ -154,11 +154,13 @@ The duplicate types require synchronized changes and duplicate display or format
 
 `InstallMethod` has been removed. Installation and uninstall outcomes retain `PackageRunner`, whose `install_name()` supplies the package-manager display name where it differs from the executable name.
 
-`ArchiveLimits` remains a separate follow-up from the requested issues.
+`ArchiveLimits` is now crate-visible, and its fields are private because production installation uses only the default limits.
 
 ### 10. `ArchiveLimits` Is Public Without a Public Configuration Path
 
 **Priority:** Low.
+
+**Status:** Completed.
 
 **Locations:** `src/installer/binary.rs:44-75` and the download/extraction entry points around `src/installer/binary.rs:534-677`.
 
@@ -172,19 +174,23 @@ This suggests configurability that library users cannot actually use and unneces
 
 **Priority:** Low.
 
+**Status:** Completed.
+
 **Location:** `src/server/protocol.rs:174-225`.
 
 The daemon protocol manually implements four-byte length framing, frame-size checks, exact reads and writes, and JSON serialization boundaries.
 
 `tokio_util::codec::LengthDelimitedCodec` could provide the framing layer while `serde_json` remains responsible for the payload.
 
-The current implementation is small, explicit, and tested, so replacing it only to remove a few dozen lines has limited value.
+The framing now uses `tokio_util::codec::LengthDelimitedCodec` with the existing four-byte big-endian wire format and maximum frame limit. JSON serialization remains explicit at the protocol boundary.
 
-**Recommendation:** Revisit this if the protocol evolves toward multiple requests per connection or a streaming `Framed` implementation.
+**Recommendation:** Preserve the codec configuration if the protocol evolves toward multiple requests per connection or a streaming `Framed` implementation.
 
 ### 12. Batch Concurrency Infrastructure Could Use Existing Futures Utilities
 
 **Priority:** Low.
+
+**Status:** Completed.
 
 **Location:** `src/installer/agents.rs:409`.
 
@@ -192,21 +198,23 @@ The custom `run_concurrently` helper combines deduplication, a semaphore, spawne
 
 The existing `futures` dependency could express part of this with `buffer_unordered` or `FuturesUnordered`.
 
-A replacement must preserve the current panic isolation, cancellation, deduplication, and result-order semantics.
+The helper now uses `futures::stream::buffer_unordered` for bounded batch execution while retaining panic isolation through per-operation tasks, deduplication, cancellation, and input-order restoration.
 
-**Recommendation:** Treat this as a maintainability refactor only, and do not replace it without focused regression tests.
+**Recommendation:** Keep the focused regression test covering these semantics.
 
 ### 13. Handwritten Hex Encoding Is a Low-Value Replacement Candidate
 
 **Priority:** Low.
 
+**Status:** Completed.
+
 **Location:** `src/installer/binary.rs:644-657`.
 
 The SHA-256 parsing and hexadecimal encoding helpers could use the established `hex` crate.
 
-The current implementation is small, and adding a dependency would provide limited benefit by itself.
+The helper now delegates hexadecimal encoding to the established `hex` crate, which is already present in the dependency graph.
 
-**Recommendation:** Consider this only if the project adopts a shared hexadecimal utility elsewhere.
+**Recommendation:** Use `hex` for future digest rendering in this crate.
 
 ## Complexity That Should Be Preserved
 
@@ -250,5 +258,5 @@ The protocol layer should be simplified only when its compatibility and frame-si
 4. Remove `stale_cache_entries_removed`.
 5. Completed: Share registry snapshots and centralize distribution resolution.
 6. Consolidate route configuration and cache-lock plumbing.
-7. Merge the duplicate runner enums and narrow `ArchiveLimits` visibility.
-8. Defer codec, concurrency-helper, and hex utility replacements until they solve a concrete maintenance problem.
+7. Completed: Merge the duplicate runner enums and narrow `ArchiveLimits` visibility.
+8. Completed: Adopt standard codec, concurrency, and hex utilities while preserving the existing protocol and batch semantics.

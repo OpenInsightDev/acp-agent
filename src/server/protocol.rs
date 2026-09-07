@@ -10,9 +10,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::LengthDelimitedCodec;
 
 use crate::serve::RouteConfig;
 use tokio::net::{UnixListener, UnixStream};
@@ -167,24 +169,30 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
-    let mut header = [0; 4];
-    reader
-        .read_exact(&mut header)
-        .await
-        .context("failed to read protocol frame length")?;
-    let length = u32::from_be_bytes(header) as usize;
-    if length == 0 {
+    let mut framed = LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_FRAME_SIZE)
+        .new_read(reader);
+    let payload = match framed.next().await {
+        Some(payload) => payload,
+        None if framed.read_buffer().is_empty() => {
+            bail!("failed to read protocol frame: connection closed")
+        }
+        None => bail!("truncated protocol frame payload"),
+    }
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof
+            || error.to_string() == "bytes remaining on stream"
+        {
+            anyhow!("truncated protocol frame payload")
+        } else if error.kind() == std::io::ErrorKind::InvalidData {
+            anyhow!("protocol frame payload exceeds {MAX_FRAME_SIZE} bytes")
+        } else {
+            anyhow!("failed to read protocol frame: {error}")
+        }
+    })?;
+    if payload.is_empty() {
         bail!("protocol frame has an empty payload")
     }
-    if length > MAX_FRAME_SIZE {
-        bail!("protocol frame payload exceeds {MAX_FRAME_SIZE} bytes")
-    }
-
-    let mut payload = vec![0; length];
-    reader
-        .read_exact(&mut payload)
-        .await
-        .context("truncated protocol frame payload")?;
     serde_json::from_slice(&payload).context("invalid protocol JSON payload")
 }
 
@@ -198,19 +206,13 @@ where
     if payload.len() > MAX_FRAME_SIZE {
         bail!("protocol frame payload exceeds {MAX_FRAME_SIZE} bytes")
     }
-    let length = u32::try_from(payload.len()).expect("MAX_FRAME_SIZE fits in a u32");
-    writer
-        .write_all(&length.to_be_bytes())
+    let mut framed = LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_FRAME_SIZE)
+        .new_write(writer);
+    framed
+        .send(payload.into())
         .await
-        .context("failed to write protocol frame length")?;
-    writer
-        .write_all(&payload)
-        .await
-        .context("failed to write protocol frame payload")?;
-    writer
-        .flush()
-        .await
-        .context("failed to flush protocol frame")?;
+        .context("failed to write protocol frame")?;
     Ok(())
 }
 
@@ -402,7 +404,7 @@ pub(crate) struct ProtocolError {
 mod tests {
     use super::*;
     use std::{os::unix::fs::PermissionsExt, path::Path};
-    use tokio::io::duplex;
+    use tokio::io::{AsyncWriteExt, duplex};
 
     fn sample_request() -> RequestEnvelope {
         RequestEnvelope {
