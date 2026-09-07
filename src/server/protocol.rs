@@ -7,6 +7,7 @@
 use std::{
     env,
     ffi::OsString,
+    fs::File,
     path::{Path, PathBuf},
 };
 
@@ -146,12 +147,90 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Bind the daemon's Unix control socket without stale-endpoint recovery.
+/// Bind the daemon's Unix control socket, recovering a socket left behind by
+/// a daemon that exited without cleaning up its endpoint.
 pub(crate) fn bind_daemon_socket() -> Result<(UnixListener, PathBuf)> {
     let path = daemon_socket_path()?;
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("failed to bind daemon socket {}", path.display()))?;
-    Ok((listener, path))
+    bind_daemon_socket_at(&path)
+}
+
+fn bind_daemon_socket_at(path: &Path) -> Result<(UnixListener, PathBuf)> {
+    let _bind_lock = acquire_socket_bind_lock(path)?;
+    match UnixListener::bind(path) {
+        Ok(listener) => Ok((listener, path.to_path_buf())),
+        Err(bind_error) if bind_error.kind() == std::io::ErrorKind::AddrInUse => {
+            if !remove_stale_socket(path)? {
+                return Err(bind_error).with_context(|| {
+                    format!("daemon socket is already in use: {}", path.display())
+                });
+            }
+            let listener = UnixListener::bind(path)
+                .with_context(|| format!("failed to bind daemon socket {}", path.display()))?;
+            Ok((listener, path.to_path_buf()))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to bind daemon socket {}", path.display()))
+        }
+    }
+}
+
+fn acquire_socket_bind_lock(path: &Path) -> Result<File> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("daemon socket path is not valid UTF-8")?;
+    let lock_path = path
+        .parent()
+        .context("daemon socket path has no parent directory")?
+        .join(format!(".{file_name}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open daemon socket lock {}", lock_path.display()))?;
+    lock.lock()
+        .with_context(|| format!("failed to lock daemon socket {}", path.display()))?;
+    Ok(lock)
+}
+
+/// Removes an endpoint only when it is an actual Unix socket with no listener.
+/// A live daemon or an unrelated filesystem entry is left untouched.
+fn remove_stale_socket(path: &Path) -> Result<bool> {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixStream as BlockingUnixStream;
+
+    match BlockingUnixStream::connect(path) {
+        Ok(_) => Ok(false),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to inspect daemon socket {}", path.display())
+                    });
+                }
+            };
+            if !metadata.file_type().is_socket() {
+                return Ok(false);
+            }
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error).with_context(|| {
+                    format!("failed to remove stale daemon socket {}", path.display())
+                }),
+            }
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 #[expect(dead_code, reason = "used by the Unix-socket client")]
@@ -477,6 +556,44 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    #[tokio::test]
+    async fn bind_recovers_a_stale_socket_without_touching_regular_files() {
+        let directory = tempfile::Builder::new()
+            .prefix("a")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let stale_listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        drop(stale_listener);
+        assert!(socket.exists());
+
+        let (listener, bound_path) = bind_daemon_socket_at(&socket).unwrap();
+        assert_eq!(bound_path, socket);
+        drop(listener);
+        let _ = std::fs::remove_file(&socket);
+
+        std::fs::write(&socket, b"not a socket").unwrap();
+        let error = bind_daemon_socket_at(&socket).unwrap_err();
+        assert!(error.to_string().contains("already in use"));
+        assert_eq!(std::fs::read(&socket).unwrap(), b"not a socket");
+    }
+
+    #[tokio::test]
+    async fn bind_does_not_remove_an_active_socket() {
+        let directory = tempfile::Builder::new()
+            .prefix("a")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let error = bind_daemon_socket_at(&socket).unwrap_err();
+        assert!(error.to_string().contains("already in use"));
+        assert!(socket.exists());
+        drop(listener);
+        let _ = std::fs::remove_file(&socket);
     }
 
     #[test]

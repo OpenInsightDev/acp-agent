@@ -317,7 +317,10 @@ async fn request_existing(command: ProtocolRequest) -> Result<ProtocolResponse> 
     let mut stream = tokio::net::UnixStream::connect(&path)
         .await
         .map_err(|source| {
-            if source.kind() == std::io::ErrorKind::NotFound {
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) {
                 anyhow::Error::new(MissingDaemonEndpoint { path, source })
             } else {
                 anyhow::Error::new(DaemonEndpointError { path, source })
