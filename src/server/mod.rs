@@ -1,8 +1,12 @@
 //! Named ACP servers with dynamically registered in-process agent routers.
 
 mod client;
+mod control;
 mod daemon;
+mod projection;
 mod protocol;
+mod routes;
+mod validation;
 
 pub use client::{list, register, registrations, start, status, stop, unregister};
 
@@ -125,7 +129,10 @@ pub struct UnregisterResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::daemon::{route_matches, validate_name, validate_route};
+    use crate::server::{
+        routes::route_matches,
+        validation::{validate_name, validate_route},
+    };
 
     #[test]
     fn start_options_default_to_the_cli_server_defaults() {

@@ -1,10 +1,10 @@
-use super::daemon::{validate_name, validate_route};
 use super::protocol::{
     self, CreateInstanceRequest, ErrorCode, InstanceResult, InstanceState, ProtocolError,
     ReadinessStatus, RegisterRequest, RegistrationResult, RegistrationsRequest,
     Request as ProtocolRequest, RequestEnvelope, Response as ProtocolResponse, ResponseEnvelope,
     StatusRequest, StopInstanceRequest, UnregisterRequest,
 };
+use super::validation::{validate_name, validate_route};
 use super::{
     RegisterOptions, RegisterResult, RegistrationRecord, ServerRecord, StartOptions, StartResult,
     StopResult, UnregisterResult,

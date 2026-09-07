@@ -1,44 +1,28 @@
-use super::protocol::{
-    self, CreateInstanceRequest, ErrorCode, HealthResult, InstanceResult, InstanceState,
-    ListResult, ProtocolError, ReadinessResult, ReadinessStatus, RegisterRequest,
-    RegistrationResult, RegistrationsResult, Request as ProtocolRequest, RequestEnvelope,
-    Response as ProtocolResponse, ResponseEnvelope, StopInstanceResult, UnregisterResult,
-};
-use anyhow::{Context, Result, bail};
-use axum::{
-    Router,
-    body::Body,
-    extract::State,
-    http::{Request, StatusCode, Uri},
-    response::{IntoResponse, Response},
-};
-use std::path::PathBuf;
-use std::{
-    collections::HashMap,
-    hash::{Hash, Hasher},
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use super::control;
+
+use super::protocol::{self, CreateInstanceRequest, ErrorCode, InstanceResult, InstanceState};
+use super::{projection, routes};
+use anyhow::Result;
+use axum::Router;
+
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
-use tower::ServiceExt;
 
 const INSTANCE_STOP_GRACE: Duration = super::SHUTDOWN_GRACE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DaemonPhase {
+pub(super) enum DaemonPhase {
     Running,
     ShuttingDown,
 }
 
-struct SupervisorState {
-    instances: HashMap<String, Arc<DaemonInstance>>,
-    phase: DaemonPhase,
+pub(super) struct SupervisorState {
+    pub(super) instances: HashMap<String, Arc<DaemonInstance>>,
+    pub(super) phase: DaemonPhase,
 }
 
-type SharedSupervisorState = Arc<AsyncMutex<SupervisorState>>;
+pub(super) type SharedSupervisorState = Arc<AsyncMutex<SupervisorState>>;
 
 impl SupervisorState {
     fn shared() -> SharedSupervisorState {
@@ -49,45 +33,17 @@ impl SupervisorState {
     }
 }
 
-/// Route key and the metadata needed by control-plane inspection.
-///
-/// Equality and hashing intentionally use only `(id, route)`: the remaining
-/// fields describe the committed route and are returned to clients, while an
-/// agent id or public route cannot be registered twice in one instance.
-#[derive(Debug, Clone)]
-struct RouteKey {
-    id: String,
-    /// Public route prefix used to select this runtime.
-    public_route: String,
-    config: crate::serve::RouteConfig,
-}
-
-impl PartialEq for RouteKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.public_route == other.public_route
-    }
-}
-
-impl Eq for RouteKey {}
-
-impl Hash for RouteKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
-        self.public_route.hash(state);
-    }
-}
-
-struct DaemonInstance {
-    name: String,
-    requested_host: String,
-    requested_port: u16,
-    address: SocketAddr,
-    state: AsyncMutex<InstanceState>,
+pub(super) struct DaemonInstance {
+    pub(super) name: String,
+    pub(super) requested_host: String,
+    pub(super) requested_port: u16,
+    pub(super) address: SocketAddr,
+    pub(super) state: AsyncMutex<InstanceState>,
     shutdown: watch::Sender<bool>,
-    cancel: watch::Sender<bool>,
+    pub(super) cancel: watch::Sender<bool>,
     listener_task: AsyncMutex<Option<tokio::task::JoinHandle<Result<()>>>>,
-    stop_lock: AsyncMutex<()>,
-    routes: RwLock<HashMap<RouteKey, Arc<crate::serve::RouteRuntime>>>,
+    pub(super) stop_lock: AsyncMutex<()>,
+    pub(super) routes: RwLock<HashMap<routes::RouteKey, Arc<crate::serve::RouteRuntime>>>,
 }
 
 impl DaemonInstance {
@@ -96,7 +52,7 @@ impl DaemonInstance {
             name: self.name.clone(),
             host: self.requested_host.clone(),
             port: self.address.port(),
-            address: public_address(self.address),
+            address: projection::public_address(self.address),
             state,
         }
     }
@@ -112,170 +68,17 @@ async fn run_supervisor() -> Result<()> {
     let state = SupervisorState::shared();
     let (shutdown, shutdown_rx) = watch::channel(false);
     tokio::spawn(crate::serve::await_termination_signal(shutdown.clone()));
-    run_supervisor_loop(listener, socket_path, state, shutdown, shutdown_rx).await
-}
-
-async fn run_supervisor_loop(
-    listener: UnixListener,
-    socket_path: PathBuf,
-    state: SharedSupervisorState,
-    shutdown: watch::Sender<bool>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    let result = loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = match accepted {
-                    Ok(connection) => connection,
-                    Err(error) => break Err(error).context("failed to accept daemon connection"),
-                };
-                let state = state.clone();
-                let shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle_protocol_connection(stream, state, shutdown).await {
-                        eprintln!("daemon request failed: {error:#}");
-                    }
-                });
-            }
-            () = crate::serve::wait_for_shutdown(&mut shutdown_rx) => {
-                state.lock().await.phase = DaemonPhase::ShuttingDown;
-                break Ok(());
-            }
-        }
-    };
-
-    state.lock().await.phase = DaemonPhase::ShuttingDown;
-    stop_all_instances(&state).await;
-    match tokio::fs::remove_file(&socket_path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("failed to remove daemon socket {}", socket_path.display())
-            });
-        }
-    }
-    result
-}
-
-async fn handle_protocol_connection(
-    mut stream: UnixStream,
-    state: SharedSupervisorState,
-    shutdown: watch::Sender<bool>,
-) -> Result<()> {
-    let request = match protocol::read_frame::<_, RequestEnvelope>(&mut stream).await {
-        Ok(request) => request,
-        Err(error) => {
-            let response = error_response(ErrorCode::InvalidInput, error.to_string());
-            let _ = protocol::write_frame(&mut stream, &response).await;
-            return Err(error);
-        }
-    };
-    let shutdown_requested = request.version == protocol::PROTOCOL_VERSION
-        && matches!(&request.command, ProtocolRequest::Shutdown);
-    let response = if request.version != protocol::PROTOCOL_VERSION {
-        error_response(
-            ErrorCode::InvalidInput,
-            format!(
-                "unsupported protocol version {}; expected {}",
-                request.version,
-                protocol::PROTOCOL_VERSION
-            ),
-        )
-    } else {
-        handle_request(request.command, state).await
-    };
-    let result = protocol::write_frame(&mut stream, &response).await;
-    if shutdown_requested {
-        shutdown.send_replace(true);
-    }
-    result
-}
-
-async fn handle_request(
-    command: ProtocolRequest,
-    state: SharedSupervisorState,
-) -> ResponseEnvelope {
-    let mutation = matches!(
-        &command,
-        ProtocolRequest::CreateInstance(_)
-            | ProtocolRequest::StopInstance(_)
-            | ProtocolRequest::Register(_)
-            | ProtocolRequest::Unregister(_)
-    );
-    if mutation && state.lock().await.phase != DaemonPhase::Running {
-        return error_response(ErrorCode::Operation, "daemon is shutting down");
-    }
-
-    match command {
-        ProtocolRequest::Health => success(ProtocolResponse::Health(HealthResult {
-            protocol_version: protocol::PROTOCOL_VERSION,
-        })),
-        ProtocolRequest::CreateInstance(request) => match create_instance(&state, request).await {
-            Ok(instance) => success(ProtocolResponse::CreateInstance(instance)),
-            Err(error) => error_response(error.code, error.message),
-        },
-        ProtocolRequest::StopInstance(request) => {
-            match stop_instance(&state, &request.name).await {
-                Ok(()) => success(ProtocolResponse::StopInstance(StopInstanceResult {
-                    name: request.name,
-                })),
-                Err(error) => error_response(error.code, error.message),
-            }
-        }
-        ProtocolRequest::Register(request) => match register(&state, request).await {
-            Ok(result) => success(ProtocolResponse::Register(result)),
-            Err(error) => error_response(error.code, error.message),
-        },
-        ProtocolRequest::Unregister(request) => match unregister(&state, request).await {
-            Ok(result) => success(ProtocolResponse::Unregister(result)),
-            Err(error) => error_response(error.code, error.message),
-        },
-        ProtocolRequest::List => success(ProtocolResponse::List(ListResult {
-            instances: list_instances(&state).await,
-        })),
-        ProtocolRequest::Status(request) => match status_instance(&state, &request.name).await {
-            Ok(instance) => success(ProtocolResponse::Status(instance)),
-            Err(error) => error_response(error.code, error.message),
-        },
-        ProtocolRequest::Registrations(request) => {
-            match registrations(&state, &request.name).await {
-                Ok(result) => success(ProtocolResponse::Registrations(result)),
-                Err(error) => error_response(error.code, error.message),
-            }
-        }
-        ProtocolRequest::Shutdown => {
-            state.lock().await.phase = DaemonPhase::ShuttingDown;
-            success(ProtocolResponse::Shutdown)
-        }
-    }
-}
-
-fn success(result: ProtocolResponse) -> ResponseEnvelope {
-    ResponseEnvelope::Success {
-        version: protocol::PROTOCOL_VERSION,
-        result,
-    }
-}
-
-fn error_response(code: ErrorCode, message: impl Into<String>) -> ResponseEnvelope {
-    ResponseEnvelope::Error {
-        version: protocol::PROTOCOL_VERSION,
-        error: ProtocolError {
-            code,
-            message: message.into(),
-        },
-    }
+    control::run_supervisor_loop(listener, socket_path, state, shutdown, shutdown_rx).await
 }
 
 #[derive(Debug)]
-struct DaemonOperationError {
-    code: ErrorCode,
-    message: String,
+pub(super) struct DaemonOperationError {
+    pub(super) code: ErrorCode,
+    pub(super) message: String,
 }
 
 impl DaemonOperationError {
-    fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+    pub(super) fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -283,7 +86,7 @@ impl DaemonOperationError {
     }
 }
 
-async fn create_instance(
+pub(super) async fn create_instance(
     state: &SharedSupervisorState,
     request: CreateInstanceRequest,
 ) -> std::result::Result<InstanceResult, DaemonOperationError> {
@@ -355,7 +158,7 @@ async fn create_instance(
         routes: RwLock::new(HashMap::new()),
     });
     let router = Router::new()
-        .fallback(dispatch_instance)
+        .fallback(routes::dispatch_instance)
         .with_state(instance.clone());
     let task = tokio::spawn(async move {
         crate::serve::serve_with_shutdown(
@@ -372,7 +175,7 @@ async fn create_instance(
     Ok(instance.result(InstanceState::Running))
 }
 
-async fn list_instances(state: &SharedSupervisorState) -> Vec<InstanceResult> {
+pub(super) async fn list_instances(state: &SharedSupervisorState) -> Vec<InstanceResult> {
     let instances = {
         let daemon = state.lock().await;
         daemon.instances.values().cloned().collect::<Vec<_>>()
@@ -386,7 +189,7 @@ async fn list_instances(state: &SharedSupervisorState) -> Vec<InstanceResult> {
     result
 }
 
-async fn status_instance(
+pub(super) async fn status_instance(
     state: &SharedSupervisorState,
     name: &str,
 ) -> std::result::Result<InstanceResult, DaemonOperationError> {
@@ -395,7 +198,7 @@ async fn status_instance(
     Ok(instance.result(current))
 }
 
-async fn stop_instance(
+pub(super) async fn stop_instance(
     state: &SharedSupervisorState,
     name: &str,
 ) -> std::result::Result<(), DaemonOperationError> {
@@ -433,7 +236,7 @@ async fn stop_instance(
     })
 }
 
-async fn stop_all_instances(state: &SharedSupervisorState) {
+pub(super) async fn stop_all_instances(state: &SharedSupervisorState) {
     let names = {
         let daemon = state.lock().await;
         daemon.instances.keys().cloned().collect::<Vec<_>>()
@@ -443,7 +246,7 @@ async fn stop_all_instances(state: &SharedSupervisorState) {
     }
 }
 
-async fn instance_for(
+pub(super) async fn instance_for(
     state: &SharedSupervisorState,
     name: &str,
 ) -> std::result::Result<Arc<DaemonInstance>, DaemonOperationError> {
@@ -461,206 +264,32 @@ async fn instance_for(
         })
 }
 
-async fn register(
-    state: &SharedSupervisorState,
-    request: RegisterRequest,
-) -> std::result::Result<RegistrationResult, DaemonOperationError> {
-    validate_name(&request.name)
-        .map_err(|error| DaemonOperationError::new(ErrorCode::InvalidInput, error.to_string()))?;
-    validate_agent_id(&request.id)?;
-    validate_route(&request.route)
-        .map_err(|error| DaemonOperationError::new(ErrorCode::InvalidInput, error.to_string()))?;
-    let instance = instance_for(state, &request.name).await?;
-    ensure_running(&instance).await?;
+use super::validation::validate_name;
 
-    let options = route_config(&request)
-        .map_err(|error| DaemonOperationError::new(ErrorCode::InvalidInput, error.to_string()))?;
-    let registry = crate::registry::fetch_registry().await.map_err(|error| {
-        DaemonOperationError::new(
-            ErrorCode::Unavailable,
-            format!("failed to fetch agent registry: {error:#}"),
-        )
-    })?;
-    let agent = registry.find_agent(&request.id).ok_or_else(|| {
-        DaemonOperationError::new(
-            ErrorCode::NotFound,
-            format!("agent {} was not found in the registry", request.id),
-        )
-    })?;
-    let args = crate::yolo::resolve_args(&request.id, request.yolo, request.args.clone())
-        .await
-        .map_err(|error| DaemonOperationError::new(ErrorCode::InvalidInput, error.to_string()))?;
-    let resolved = crate::runner::resolve_agent_config_from_registry_agent(agent, &args)
-        .await
-        .map_err(|error| {
-            DaemonOperationError::new(
-                ErrorCode::Unavailable,
-                format!("failed to resolve agent {}: {error:#}", request.id),
-            )
-        })?;
-    let runtime = crate::serve::RouteRuntime::new(resolved, &options, instance.cancel.subscribe())
-        .map_err(|error| {
-            DaemonOperationError::new(
-                ErrorCode::InvalidInput,
-                format!("failed to construct route runtime: {error:#}"),
-            )
-        })?;
-    let route_key = RouteKey {
-        id: request.id,
-        public_route: request.route,
-        config: options,
-    };
-    let runtime = Arc::new(runtime);
+#[cfg(test)]
+use super::control::{run_supervisor_loop, success};
+#[cfg(test)]
+use super::projection::{public_address, readiness_result};
+#[cfg(test)]
+use super::routes::dispatch_instance;
+#[cfg(test)]
+use super::routes::{rewrite_route_prefix, route_matches};
+#[cfg(test)]
+use super::validation::validate_route;
 
-    let _stop_guard = instance.stop_lock.lock().await;
-    ensure_running(&instance).await?;
-    let daemon = state.lock().await;
-    if daemon.phase != DaemonPhase::Running {
-        return Err(DaemonOperationError::new(
-            ErrorCode::Operation,
-            "daemon is shutting down",
-        ));
-    }
-    let mut routes = instance.routes.write().await;
-    if routes.keys().any(|existing| existing.id == route_key.id) {
-        return Err(DaemonOperationError::new(
-            ErrorCode::Conflict,
-            format!("agent id {} is already registered", route_key.id),
-        ));
-    }
-    if routes
-        .keys()
-        .any(|existing| existing.public_route == route_key.public_route)
-    {
-        return Err(DaemonOperationError::new(
-            ErrorCode::Conflict,
-            format!("route {} is already registered", route_key.public_route),
-        ));
-    }
-    let result = registration_result(&instance.name, &instance.address, &route_key, &runtime);
-    routes.insert(route_key.clone(), runtime);
-    Ok(result)
-}
-
-async fn unregister(
-    state: &SharedSupervisorState,
-    request: super::protocol::UnregisterRequest,
-) -> std::result::Result<UnregisterResult, DaemonOperationError> {
-    validate_name(&request.name)
-        .map_err(|error| DaemonOperationError::new(ErrorCode::InvalidInput, error.to_string()))?;
-    validate_agent_id(&request.id)?;
-    let instance = instance_for(state, &request.name).await?;
-    let _stop_guard = instance.stop_lock.lock().await;
-    ensure_running(&instance).await?;
-    let daemon = state.lock().await;
-    if daemon.phase != DaemonPhase::Running {
-        return Err(DaemonOperationError::new(
-            ErrorCode::Operation,
-            "daemon is shutting down",
-        ));
-    }
-    let mut routes = instance.routes.write().await;
-    let route = routes
-        .keys()
-        .find(|route| route.id == request.id)
-        .cloned()
-        .ok_or_else(|| {
-            DaemonOperationError::new(
-                ErrorCode::NotFound,
-                format!("agent {} is not registered", request.id),
-            )
-        })?;
-    routes.remove(&route);
-    Ok(UnregisterResult {
-        name: request.name,
-        id: request.id,
-    })
-}
-
-async fn registrations(
-    state: &SharedSupervisorState,
-    name: &str,
-) -> std::result::Result<RegistrationsResult, DaemonOperationError> {
-    let instance = instance_for(state, name).await?;
-    let routes = {
-        let routes = instance.routes.read().await;
-        routes
-            .iter()
-            .map(|(route, runtime)| (route.clone(), runtime.clone()))
-            .collect::<Vec<_>>()
-    };
-    let mut registrations = routes
-        .iter()
-        .map(|(route, runtime)| registration_result(name, &instance.address, route, runtime))
-        .collect::<Vec<_>>();
-    registrations.sort_by(|left, right| {
-        left.route
-            .cmp(&right.route)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    Ok(RegistrationsResult {
-        name: name.to_string(),
-        registrations,
-    })
-}
-
-fn registration_result(
-    name: &str,
-    address: &SocketAddr,
-    route_key: &RouteKey,
-    runtime: &crate::serve::RouteRuntime,
-) -> RegistrationResult {
-    RegistrationResult {
-        name: name.to_string(),
-        id: route_key.id.clone(),
-        route: route_key.public_route.clone(),
-        path: route_key.config.path.clone(),
-        health_endpoint: route_key.config.health_endpoint,
-        readyz_endpoint: route_key.config.readyz_endpoint,
-        address: public_address(*address),
-        max_processes: route_key.config.max_processes,
-        readiness: readiness_result(
-            route_key.config.readyz_endpoint,
-            runtime.readiness_snapshot(),
-        ),
-    }
-}
-
-fn public_address(address: SocketAddr) -> String {
-    let host = match address.ip() {
-        std::net::IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
-        std::net::IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_string(),
-        ip => match ip {
-            std::net::IpAddr::V4(ip) => ip.to_string(),
-            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-        },
-    };
-    format!("http://{host}:{}", address.port())
-}
-
-fn readiness_result(
-    readyz_endpoint: bool,
-    snapshot: crate::serve::ReadinessSnapshot,
-) -> ReadinessResult {
-    let (status, detail) = if !readyz_endpoint {
-        (ReadinessStatus::Disabled, None)
-    } else if snapshot.last_attempt_failed {
-        (
-            ReadinessStatus::NotReady,
-            snapshot.last_failure.map(|failure| failure.detail),
-        )
+#[cfg(test)]
+fn validate_agent_id(id: &str) -> std::result::Result<(), DaemonOperationError> {
+    if super::validation::validate_agent_id(id) {
+        Ok(())
     } else {
-        (ReadinessStatus::Ready, None)
-    };
-    ReadinessResult {
-        status,
-        attempts: snapshot.attempts,
-        failures: snapshot.failures,
-        detail,
+        Err(DaemonOperationError::new(
+            ErrorCode::InvalidInput,
+            "agent id must not be empty",
+        ))
     }
 }
 
-async fn ensure_running(
+pub(super) async fn ensure_running(
     instance: &DaemonInstance,
 ) -> std::result::Result<(), DaemonOperationError> {
     if *instance.state.lock().await != InstanceState::Running {
@@ -672,112 +301,21 @@ async fn ensure_running(
     Ok(())
 }
 
-fn route_config(request: &RegisterRequest) -> Result<crate::serve::RouteConfig> {
-    crate::serve::validate_route_config(&request.config)?;
-    Ok(request.config.clone())
-}
-
-async fn dispatch_instance(
-    State(instance): State<Arc<DaemonInstance>>,
-    request: Request<Body>,
-) -> Response {
-    // Hold the state lock through route selection so stop cannot transition the
-    // instance between the admission check and the runtime snapshot.
-    let state = instance.state.lock().await;
-    if *state != InstanceState::Running {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    let path = request.uri().path();
-    let route = {
-        let routes = instance.routes.read().await;
-        routes
-            .iter()
-            .filter(|(route, _)| route_matches(&route.public_route, path))
-            .max_by_key(|(route, _)| route.public_route.len())
-            .map(|(route, runtime)| (route.public_route.clone(), runtime.clone()))
-    };
-    drop(state);
-    let Some((route, runtime)) = route else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let request = match rewrite_route_prefix(request, &route) {
-        Ok(request) => request,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
-    };
-    runtime.router().oneshot(request).await.into_response()
-}
-
-fn rewrite_route_prefix(
-    mut request: Request<Body>,
-    route: &str,
-) -> std::result::Result<Request<Body>, String> {
-    let path = request.uri().path();
-    let suffix = path
-        .strip_prefix(route)
-        .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
-        .ok_or_else(|| format!("route {route} does not match request path {path}"))?;
-    let rewritten_path = if suffix.is_empty() { "/" } else { suffix };
-    let path_and_query = match request.uri().query() {
-        Some(query) => format!("{rewritten_path}?{query}"),
-        None => rewritten_path.to_string(),
-    };
-    let uri = Uri::builder()
-        .path_and_query(path_and_query)
-        .build()
-        .map_err(|error| format!("failed to rewrite request URI: {error}"))?;
-    *request.uri_mut() = uri;
-    Ok(request)
-}
-
-pub(super) fn route_matches(route: &str, path: &str) -> bool {
-    path == route
-        || path
-            .strip_prefix(route)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-pub(super) fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        bail!("server name must contain only letters, digits, '.', '-' or '_'");
-    }
-    Ok(())
-}
-
-fn validate_agent_id(id: &str) -> std::result::Result<(), DaemonOperationError> {
-    if id.trim().is_empty() {
-        return Err(DaemonOperationError::new(
-            ErrorCode::InvalidInput,
-            "agent id must not be empty",
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn validate_route(route: &str) -> Result<()> {
-    if !route.starts_with('/') || route == "/" || route.ends_with('/') {
-        bail!("agent route must start with '/', cannot be '/', and must not end with '/'");
-    }
-    if route.contains(['?', '#']) || route.split('/').any(|part| part == "..") {
-        bail!("agent route contains an invalid path segment");
-    }
-    let uri: Uri = route
-        .parse()
-        .context("agent route is not a valid URI path")?;
-    if uri.path() != route || uri.query().is_some() {
-        bail!("agent route is not a valid URI path");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use super::protocol::{
+        self, HealthResult, ProtocolError, ReadinessStatus, Request as ProtocolRequest,
+        RequestEnvelope, Response as ProtocolResponse, ResponseEnvelope, StopInstanceResult,
+    };
     use super::*;
     use axum::http::header;
+    use axum::{
+        body::Body,
+        extract::State,
+        http::{Request, StatusCode},
+    };
     use tempfile::TempDir;
+    use tokio::net::UnixStream;
     use tokio::net::{TcpStream, UnixListener};
     use tokio::time::timeout;
 
