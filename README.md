@@ -51,9 +51,9 @@ acp-agent run gemini --yolo
 acp-agent run claude-acp --yolo -- --model opus
 ```
 
-`--yolo` injects the agent's mapped startup flag, e.g. `--yolo` for Gemini, `--dangerously-skip-permissions` for Claude, `--dangerously-skip-sandbox-and-permissions` for Codex.
+`--yolo` injects the agent's mapped startup flag, e.g. `--yolo` for Gemini, `--dangerously-skip-permissions` for Claude, `--dangerously-skip-sandbox-and-permissions` for Codex. The catalog supports startup CLI flags only; ACP session modes and config options are not handled by this command.
 
-> The yolo-mode catalog can be fetched from the CDN (<https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json>).
+> The yolo-mode catalog can be fetched from the CDN (<https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json>). Each entry must contain a `flag` string; entries for unsupported protocol-level modes are invalid.
 
 ## Serve over HTTP
 
@@ -289,7 +289,7 @@ The server is implemented with [`agent-client-protocol-http` 2.0](https://docs.r
 
 ## Contribution
 
-If you know how to enable yolo mode for the acp agent you are using, you are welcome to add new entries to the `data/yolo-modes.json` list.
+If you know a startup CLI flag that enables yolo mode for the ACP agent you are using, you are welcome to add an entry to `data/yolo-modes.json`. The catalog accepts only entries such as `{ "flag": "--yolo" }`; protocol-level modes and config options do not belong in this file.
 
 ## License
 

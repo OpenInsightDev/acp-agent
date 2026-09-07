@@ -4,8 +4,9 @@ use std::io::Write;
 use anyhow::{Context, Result};
 
 use super::AgentOutputFormat;
-use crate::installer::agents::{InstallMethod, InstallOutcome, InstalledAgent, UninstallOutcome};
+use crate::installer::agents::{InstallOutcome, InstalledAgent, UninstallOutcome};
 use crate::registry::RegistryAgent;
+use crate::runner::PackageRunner;
 
 pub(super) fn write_installed_agents<W: Write>(
     writer: &mut W,
@@ -88,18 +89,14 @@ impl fmt::Display for InstallMessage<'_> {
             ),
             InstallOutcome::PackageManager {
                 agent_id,
-                method,
+                runner,
                 package,
-            } => match method {
-                InstallMethod::Npm => {
-                    write!(formatter, "Installed {agent_id} via npm: {package}")
-                }
-                InstallMethod::Deno => {
+            } => match runner {
+                PackageRunner::Npm => write!(formatter, "Installed {agent_id} via npm: {package}"),
+                PackageRunner::Deno => {
                     write!(formatter, "Prepared {agent_id} via deno cache: {package}")
                 }
-                InstallMethod::Uvx => {
-                    write!(formatter, "Installed {agent_id} via uv: {package}")
-                }
+                PackageRunner::Uvx => write!(formatter, "Installed {agent_id} via uv: {package}"),
             },
         }
     }
@@ -115,12 +112,12 @@ impl fmt::Display for UninstallMessage<'_> {
             }
             UninstallOutcome::PackageManager {
                 agent_id,
-                method,
+                runner,
                 package,
             } => write!(
                 formatter,
                 "Uninstalled {agent_id} via {}: {package}",
-                install_method(*method)
+                runner.install_name()
             ),
             UninstallOutcome::RunnerManaged { agent_id, runner } => write!(
                 formatter,
@@ -130,24 +127,8 @@ impl fmt::Display for UninstallMessage<'_> {
     }
 }
 
-fn install_method(method: InstallMethod) -> &'static str {
-    match method {
-        InstallMethod::Npm => "npm",
-        InstallMethod::Deno => "deno",
-        InstallMethod::Uvx => "uv",
-    }
-}
-
-pub(super) fn install_warnings(outcome: &InstallOutcome) -> impl Iterator<Item = String> {
-    let warning = match outcome {
-        InstallOutcome::Binary {
-            agent_id,
-            stale_cache_entries_removed: true,
-            ..
-        } => Some(format!("removed stale cached binaries for \"{agent_id}\"")),
-        _ => None,
-    };
-    warning.into_iter()
+pub(super) fn install_warnings(_outcome: &InstallOutcome) -> impl Iterator<Item = String> {
+    std::iter::empty()
 }
 
 pub(super) fn uninstall_warnings(outcome: &UninstallOutcome) -> impl Iterator<Item = String> {
@@ -236,7 +217,6 @@ mod tests {
             agent_id: "demo".into(),
             executable_path: "/cache/demo/bin".into(),
             cache_dir: "/cache/demo".into(),
-            stale_cache_entries_removed: true,
         };
         assert_eq!(
             InstallMessage(&update).to_string(),
@@ -244,7 +224,7 @@ mod tests {
         );
         assert_eq!(
             install_warnings(&update).collect::<Vec<_>>(),
-            vec!["removed stale cached binaries for \"demo\""]
+            Vec::<String>::new()
         );
 
         let uninstall = UninstallOutcome::Cache {
@@ -265,12 +245,11 @@ mod tests {
 
     #[test]
     fn renders_package_preparation_and_runner_managed_messages() {
-        use crate::installer::agents::InstallMethod;
         use crate::runner::PackageRunner;
 
         let npm = InstallOutcome::PackageManager {
             agent_id: "demo".into(),
-            method: InstallMethod::Npm,
+            runner: PackageRunner::Npm,
             package: "@acme/demo".into(),
         };
         assert_eq!(
@@ -282,7 +261,7 @@ mod tests {
         // npm cache that `deno x` reads, and the message says so.
         let deno = InstallOutcome::PackageManager {
             agent_id: "demo".into(),
-            method: InstallMethod::Deno,
+            runner: PackageRunner::Deno,
             package: "@acme/demo".into(),
         };
         assert_eq!(
@@ -292,7 +271,7 @@ mod tests {
 
         let uvx = InstallOutcome::PackageManager {
             agent_id: "demo".into(),
-            method: InstallMethod::Uvx,
+            runner: PackageRunner::Uvx,
             package: "acme-demo".into(),
         };
         assert_eq!(

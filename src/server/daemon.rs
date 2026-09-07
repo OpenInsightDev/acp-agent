@@ -57,16 +57,14 @@ impl SupervisorState {
 #[derive(Debug, Clone)]
 struct RouteId {
     id: String,
-    route: String,
-    path: String,
-    health_endpoint: bool,
-    readyz_endpoint: bool,
-    max_processes: usize,
+    /// Public route prefix used to select this runtime.
+    public_route: String,
+    config: crate::serve::RouteConfig,
 }
 
 impl PartialEq for RouteId {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.route == other.route
+        self.id == other.id && self.public_route == other.public_route
     }
 }
 
@@ -75,7 +73,7 @@ impl Eq for RouteId {}
 impl Hash for RouteId {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
-        self.route.hash(state);
+        self.public_route.hash(state);
     }
 }
 
@@ -475,7 +473,7 @@ async fn register(
     let instance = instance_for(state, &request.name).await?;
     ensure_running(&instance).await?;
 
-    let options = router_options(&request)
+    let options = route_config(&request)
         .map_err(|error| DaemonOperationError::new(ErrorCode::InvalidInput, error.to_string()))?;
     let registry = crate::registry::fetch_registry().await.map_err(|error| {
         DaemonOperationError::new(
@@ -509,11 +507,8 @@ async fn register(
         })?;
     let route_id = RouteId {
         id: request.id,
-        route: request.route,
-        path: request.path,
-        health_endpoint: request.health_endpoint,
-        readyz_endpoint: request.readyz_endpoint,
-        max_processes: request.max_processes,
+        public_route: request.route,
+        config: options,
     };
     let runtime = Arc::new(runtime);
 
@@ -535,11 +530,11 @@ async fn register(
     }
     if routes
         .keys()
-        .any(|existing| existing.route == route_id.route)
+        .any(|existing| existing.public_route == route_id.public_route)
     {
         return Err(DaemonOperationError::new(
             ErrorCode::Conflict,
-            format!("route {} is already registered", route_id.route),
+            format!("route {} is already registered", route_id.public_route),
         ));
     }
     let result = registration_result(&instance.name, &instance.address, &route_id, &runtime);
@@ -618,13 +613,13 @@ fn registration_result(
     RegistrationResult {
         name: name.to_string(),
         id: route.id.clone(),
-        route: route.route.clone(),
-        path: route.path.clone(),
-        health_endpoint: route.health_endpoint,
-        readyz_endpoint: route.readyz_endpoint,
+        route: route.public_route.clone(),
+        path: route.config.path.clone(),
+        health_endpoint: route.config.health_endpoint,
+        readyz_endpoint: route.config.readyz_endpoint,
         address: public_address(*address),
-        max_processes: route.max_processes,
-        readiness: readiness_result(route.readyz_endpoint, runtime.readiness_snapshot()),
+        max_processes: route.config.max_processes,
+        readiness: readiness_result(route.config.readyz_endpoint, runtime.readiness_snapshot()),
     }
 }
 
@@ -674,16 +669,9 @@ async fn ensure_running(
     Ok(())
 }
 
-fn router_options(request: &RegisterRequest) -> Result<crate::serve::AgentRouterOptions> {
-    let options = crate::serve::AgentRouterOptions {
-        path: request.path.clone(),
-        cors: crate::serve::cors_options(request.cors_origins.clone(), request.allow_any_origin)?,
-        health_endpoint: request.health_endpoint,
-        readyz_endpoint: request.readyz_endpoint,
-        max_processes: request.max_processes,
-    };
-    crate::serve::validate_router_options(&options)?;
-    Ok(options)
+fn route_config(request: &RegisterRequest) -> Result<crate::serve::RouteConfig> {
+    crate::serve::validate_route_config(&request.config)?;
+    Ok(request.config.clone())
 }
 
 async fn dispatch_instance(
@@ -701,9 +689,9 @@ async fn dispatch_instance(
         let routes = instance.routes.read().await;
         routes
             .iter()
-            .filter(|(route, _)| route_matches(&route.route, path))
-            .max_by_key(|(route, _)| route.route.len())
-            .map(|(route, runtime)| (route.route.clone(), runtime.clone()))
+            .filter(|(route, _)| route_matches(&route.public_route, path))
+            .max_by_key(|(route, _)| route.public_route.len())
+            .map(|(route, runtime)| (route.public_route.clone(), runtime.clone()))
     };
     drop(state);
     let Some((route, runtime)) = route else {

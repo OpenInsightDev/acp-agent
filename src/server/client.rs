@@ -9,6 +9,7 @@ use super::{
     RegisterOptions, RegisterResult, RegistrationRecord, ServerRecord, StartOptions, StartResult,
     StopResult, UnregisterResult,
 };
+
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     fmt,
@@ -170,12 +171,7 @@ pub async fn register(agent_id: &str, options: RegisterOptions) -> Result<Regist
         name: options.name,
         id: agent_id.to_string(),
         route: route.clone(),
-        path: options.path,
-        cors_origins: options.cors_origins,
-        allow_any_origin: options.allow_any_origin,
-        health_endpoint: options.health_endpoint,
-        readyz_endpoint: options.readyz_endpoint,
-        max_processes: options.max_processes,
+        config: options.config,
         yolo: options.yolo,
         args: options.args,
     }))

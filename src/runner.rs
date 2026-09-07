@@ -5,14 +5,17 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 
 use agent_client_protocol::AcpAgentConfig;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::process::Command;
 
 use crate::installer::binary::{CachedBinary, cache_binary_target};
 use crate::installer::cache::BinaryCacheLock;
 use crate::installer::environment::program_available;
 use crate::process;
-use crate::registry::{BinaryTarget, Environment, Platform, RegistryAgent, fetch_registry};
+use crate::registry::{
+    BinaryTarget, Environment, NpxDistribution, Platform, RegistryAgent, UvxDistribution,
+    fetch_registry,
+};
 
 #[derive(Debug, Clone)]
 struct CommandSpec {
@@ -50,6 +53,15 @@ impl PackageRunner {
             Self::Uvx => "uvx",
         }
     }
+
+    /// Name used when reporting installation or removal operations.
+    pub(crate) fn install_name(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Deno => "deno",
+            Self::Uvx => "uv",
+        }
+    }
 }
 
 impl std::fmt::Display for PackageRunner {
@@ -70,18 +82,48 @@ pub(crate) fn npm_package_runner() -> Result<PackageRunner> {
     }
 }
 
-/// Resolves the shared runner for an agent's package distribution, if any.
+/// The distribution selected for one registry agent on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedDistribution<'a> {
+    /// A binary target available for the current platform.
+    Binary {
+        platform: Platform,
+        target: &'a BinaryTarget,
+    },
+    /// An npm distribution and the runner that will execute it.
+    Npm {
+        distribution: &'a NpxDistribution,
+        runner: PackageRunner,
+    },
+    /// A Python distribution executed through `uvx`.
+    Uvx { distribution: &'a UvxDistribution },
+}
+
+/// Resolves one agent's effective distribution using the lifecycle priority.
 ///
-/// Binary distributions return `None`; the installer prepares those through
-/// the binary cache instead.
-pub(crate) fn package_runner_for(agent: &RegistryAgent) -> Result<Option<PackageRunner>> {
-    if agent.distribution.npx.is_some() {
-        return Ok(Some(npm_package_runner()?));
+/// The first usable current-platform binary wins, followed by npm (using npm
+/// when available and Deno otherwise), then uvx. Returning the typed result
+/// keeps run, serve, install, update, and uninstall on the same decision path.
+pub(crate) fn resolve_distribution(
+    agent: &RegistryAgent,
+) -> Result<Option<ResolvedDistribution<'_>>> {
+    let platform = Platform::current()?;
+    if let Some(binary) = &agent.distribution.binary {
+        if let Some(target) = binary.for_platform(platform) {
+            return Ok(Some(ResolvedDistribution::Binary { platform, target }));
+        }
     }
-    if agent.distribution.uvx.is_some() {
-        return Ok(Some(PackageRunner::Uvx));
+    if let Some(distribution) = &agent.distribution.npx {
+        return Ok(Some(ResolvedDistribution::Npm {
+            distribution,
+            runner: npm_package_runner()?,
+        }));
     }
-    Ok(None)
+    Ok(agent
+        .distribution
+        .uvx
+        .as_ref()
+        .map(|distribution| ResolvedDistribution::Uvx { distribution }))
 }
 
 /// Runs a registry agent locally with its standard streams attached to the terminal.
@@ -149,41 +191,36 @@ impl CommandSpec {
 }
 
 async fn resolve_agent_command(agent: &RegistryAgent, user_args: &[String]) -> Result<CommandSpec> {
-    if let Some(binary) = &agent.distribution.binary {
-        let platform = Platform::current()?;
-        if let Some(target) = binary.for_platform(platform) {
+    let distribution = resolve_distribution(agent)?.with_context(|| {
+        format!(
+            "agent \"{}\" does not have a runnable distribution",
+            agent.id
+        )
+    })?;
+    match distribution {
+        ResolvedDistribution::Binary { platform, target } => {
             let cached = cache_binary_target(agent, platform, target).await?;
-            return Ok(binary_command_spec(cached, target, user_args));
+            Ok(binary_command_spec(cached, target, user_args))
         }
-    }
-
-    if let Some(npx) = &agent.distribution.npx {
-        // The runner choice is shared with `install` (see `npm_package_runner`),
-        // so the cache an install prepares is the cache this command reads.
-        return Ok(npm_command_spec(
-            npm_package_runner()?,
-            &npx.package,
-            npx.args.as_deref(),
-            npx.env.as_ref(),
+        ResolvedDistribution::Npm {
+            distribution,
+            runner,
+        } => Ok(npm_command_spec(
+            runner,
+            &distribution.package,
+            distribution.args.as_deref(),
+            distribution.env.as_ref(),
             user_args,
-        ));
-    }
-
-    if let Some(uvx) = &agent.distribution.uvx {
-        return Ok(package_command_spec(
+        )),
+        ResolvedDistribution::Uvx { distribution } => Ok(package_command_spec(
             "uvx",
             &[],
-            &uvx.package,
-            uvx.args.as_deref(),
-            uvx.env.as_ref(),
+            &distribution.package,
+            distribution.args.as_deref(),
+            distribution.env.as_ref(),
             user_args,
-        ));
+        )),
     }
-
-    bail!(
-        "agent \"{}\" does not have a runnable distribution",
-        agent.id
-    )
 }
 
 fn npm_command_spec(
@@ -373,7 +410,7 @@ mod tests {
 
     #[test]
     fn package_runner_is_shared_between_install_and_run() {
-        // `package_runner_for` drives the installer's cache preparation, and
+        // `resolve_distribution` drives the installer's cache preparation, and
         // the runner builds its command from the same decision. Binary agents
         // have no package runner; uvx agents always run through uvx.
         let binary_agent = RegistryAgent {
@@ -385,13 +422,15 @@ mod tests {
             ..sample_npx_agent()
         };
         assert_eq!(
-            package_runner_for(&binary_agent).unwrap(),
+            resolve_distribution(&binary_agent).unwrap(),
             None,
             "binary distributions are prepared through the binary cache"
         );
         assert_eq!(
-            package_runner_for(&sample_uvx_agent()).unwrap(),
-            Some(PackageRunner::Uvx)
+            resolve_distribution(&sample_uvx_agent()).unwrap(),
+            Some(ResolvedDistribution::Uvx {
+                distribution: sample_uvx_agent().distribution.uvx.as_ref().unwrap(),
+            })
         );
         assert_eq!(PackageRunner::Uvx.program(), "uvx");
         assert_eq!(PackageRunner::Npm.to_string(), "npm");

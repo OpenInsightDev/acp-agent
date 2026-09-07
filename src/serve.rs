@@ -24,6 +24,7 @@ use axum::{
     routing::get,
     serve::Listener,
 };
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{
@@ -31,13 +32,16 @@ use tokio::sync::{
 };
 use tokio::time::{sleep, timeout};
 
-/// ACP HTTP router configuration shared by standalone and named servers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentRouterOptions {
+/// ACP route configuration shared by standalone and named servers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RouteConfig {
     /// Path serving ACP over HTTP/SSE and WebSocket.
     pub path: String,
-    /// Cross-origin browser access policy.
-    pub cors: CorsOptions,
+    /// Browser origins allowed to access the route.
+    pub cors_origins: Vec<String>,
+    /// Whether all browser origins are accepted.
+    pub allow_any_origin: bool,
     /// Whether to expose `GET /health`.
     pub health_endpoint: bool,
     /// Whether to expose `GET /readyz` with agent launch health.
@@ -82,7 +86,7 @@ impl RouteRuntime {
     /// Builds a reusable route runtime from a resolved agent configuration.
     pub(crate) fn new(
         resolved: crate::runner::ResolvedAgentConfig,
-        options: &AgentRouterOptions,
+        options: &RouteConfig,
         cancel: watch::Receiver<bool>,
     ) -> Result<Self> {
         route_runtime_with_stderr_and_lease(
@@ -113,11 +117,12 @@ tokio::task_local! {
     static RESERVED_PROCESS_PERMIT: RefCell<Option<OwnedSemaphorePermit>>;
 }
 
-impl Default for AgentRouterOptions {
+impl Default for RouteConfig {
     fn default() -> Self {
         Self {
             path: "/acp".to_string(),
-            cors: CorsOptions::disabled(),
+            cors_origins: Vec::new(),
+            allow_any_origin: false,
             health_endpoint: true,
             readyz_endpoint: true,
             max_processes: DEFAULT_MAX_PROCESSES,
@@ -132,11 +137,10 @@ pub struct ServeOptions {
     pub host: String,
     /// TCP port to bind. Port `0` lets the operating system choose a port.
     pub port: u16,
-    /// Optional URL prefix applied to all served endpoints. Defaults to the
-    /// server root when `None`.
-    pub subpath: Option<String>,
-    /// ACP router configuration.
-    pub router: AgentRouterOptions,
+    /// Optional mount prefix applied to all served endpoints.
+    pub mount_path: Option<String>,
+    /// ACP route configuration.
+    pub route: RouteConfig,
 }
 
 impl Default for ServeOptions {
@@ -144,8 +148,8 @@ impl Default for ServeOptions {
         Self {
             host: "127.0.0.1".to_string(),
             port: 0,
-            subpath: None,
-            router: AgentRouterOptions::default(),
+            mount_path: None,
+            route: RouteConfig::default(),
         }
     }
 }
@@ -176,11 +180,11 @@ async fn serve_config(
     options: ServeOptions,
 ) -> Result<()> {
     let (cancel, cancel_rx) = watch::channel(false);
-    let runtime = RouteRuntime::new(resolved, &options.router, cancel_rx)?;
+    let runtime = RouteRuntime::new(resolved, &options.route, cancel_rx)?;
     let mut router = runtime.router();
-    if let Some(subpath) = options.subpath.as_deref() {
-        validate_subpath(subpath)?;
-        router = Router::new().nest(subpath, router);
+    if let Some(mount_path) = options.mount_path.as_deref() {
+        validate_mount_path(mount_path)?;
+        router = Router::new().nest(mount_path, router);
     }
     let listener = TcpListener::bind((options.host.as_str(), options.port))
         .await
@@ -195,13 +199,13 @@ async fn serve_config(
         .context("failed to read ACP HTTP listener address")?;
     eprintln!(
         "Serving ACP agent at http://{address}{}{} (WebSocket available on the same endpoint)",
-        options.subpath.as_deref().unwrap_or(""),
-        options.router.path
+        options.mount_path.as_deref().unwrap_or(""),
+        options.route.path
     );
-    if options.router.readyz_endpoint {
+    if options.route.readyz_endpoint {
         eprintln!(
             "Agent readiness probe at http://{address}{}/readyz",
-            options.subpath.as_deref().unwrap_or("")
+            options.mount_path.as_deref().unwrap_or("")
         );
     }
     serve_listener(listener, router, cancel).await
@@ -212,7 +216,7 @@ async fn serve_config(
 #[allow(dead_code)]
 pub(crate) fn agent_router(
     config: AcpAgentConfig,
-    options: &AgentRouterOptions,
+    options: &RouteConfig,
     cancel: watch::Receiver<bool>,
 ) -> Result<Router> {
     agent_router_with_lease(config, options, cancel, None)
@@ -220,7 +224,7 @@ pub(crate) fn agent_router(
 
 pub(crate) fn agent_router_with_lease(
     config: AcpAgentConfig,
-    options: &AgentRouterOptions,
+    options: &RouteConfig,
     cancel: watch::Receiver<bool>,
     cache_use_lease: Option<Arc<crate::installer::cache::BinaryCacheLock>>,
 ) -> Result<Router> {
@@ -237,7 +241,7 @@ pub(crate) fn agent_router_with_lease(
 #[allow(dead_code)]
 fn agent_router_with_stderr(
     config: AcpAgentConfig,
-    options: &AgentRouterOptions,
+    options: &RouteConfig,
     stderr: AgentStderr,
     cancel: watch::Receiver<bool>,
 ) -> Result<Router> {
@@ -247,7 +251,7 @@ fn agent_router_with_stderr(
 
 fn route_runtime_with_stderr_and_lease(
     config: AcpAgentConfig,
-    options: &AgentRouterOptions,
+    options: &RouteConfig,
     stderr: AgentStderr,
     cancel: watch::Receiver<bool>,
     cache_use_lease: Option<Arc<crate::installer::cache::BinaryCacheLock>>,
@@ -589,7 +593,7 @@ impl AsyncWrite for ForceCloseIo {
     }
 }
 
-pub(crate) fn validate_router_options(options: &AgentRouterOptions) -> Result<()> {
+pub(crate) fn validate_route_config(options: &RouteConfig) -> Result<()> {
     validate_process_limit(options.max_processes)?;
     if !options.path.starts_with('/') {
         bail!("ACP endpoint path must start with '/'");
@@ -606,25 +610,25 @@ pub(crate) fn validate_router_options(options: &AgentRouterOptions) -> Result<()
     Ok(())
 }
 
-fn validate_subpath(subpath: &str) -> Result<()> {
-    if !subpath.starts_with('/') {
-        bail!("subpath must start with '/'");
+pub(crate) fn validate_mount_path(mount_path: &str) -> Result<()> {
+    if !mount_path.starts_with('/') {
+        bail!("mount path must start with '/'");
     }
-    if subpath.len() == 1 {
-        bail!("subpath cannot be '/'");
+    if mount_path.len() == 1 {
+        bail!("mount path cannot be '/'");
     }
-    if subpath.ends_with('/') {
-        bail!("subpath must not end with '/'");
+    if mount_path.ends_with('/') {
+        bail!("mount path must not end with '/'");
     }
 
     Ok(())
 }
 
-fn http_server_options(options: &AgentRouterOptions) -> Result<ServerOptions> {
-    validate_router_options(options)?;
+fn http_server_options(options: &RouteConfig) -> Result<ServerOptions> {
+    validate_route_config(options)?;
     Ok(ServerOptions {
         path: options.path.clone(),
-        cors: options.cors.clone(),
+        cors: cors_options(options.cors_origins.clone(), options.allow_any_origin)?,
         health_endpoint: options.health_endpoint,
     })
 }
@@ -1130,20 +1134,20 @@ mod tests {
             ("/health", "conflicts with the health endpoint"),
             ("/readyz", "conflicts with the readiness endpoint"),
         ] {
-            let error = http_server_options(&AgentRouterOptions {
+            let error = http_server_options(&RouteConfig {
                 path: path.to_string(),
-                ..AgentRouterOptions::default()
+                ..RouteConfig::default()
             })
             .unwrap_err();
             assert!(error.to_string().contains(expected), "{error:#}");
         }
 
-        for (subpath, expected) in [
+        for (mount_path, expected) in [
             ("myapp", "must start with '/'"),
             ("/", "cannot be '/'"),
             ("/myapp/", "must not end with '/'"),
         ] {
-            let error = validate_subpath(subpath).unwrap_err();
+            let error = validate_mount_path(mount_path).unwrap_err();
             assert!(error.to_string().contains(expected), "{error:#}");
         }
 
@@ -1190,7 +1194,7 @@ mod tests {
 
         let router = agent_router(
             AcpAgentConfig::new("unused-agent"),
-            &AgentRouterOptions::default(),
+            &RouteConfig::default(),
             watch::channel(false).1,
         )
         .unwrap();
@@ -1233,9 +1237,9 @@ mod tests {
 
     #[tokio::test]
     async fn agent_router_validates_router_options() {
-        let options = AgentRouterOptions {
+        let options = RouteConfig {
             path: "acp".to_string(),
-            ..AgentRouterOptions::default()
+            ..RouteConfig::default()
         };
 
         let error = agent_router(
@@ -1477,6 +1481,7 @@ mod tests {
             ACCEPT, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_METHOD, CONTENT_TYPE,
             ORIGIN,
         };
+
         use serde_json::{Value, json};
         use tokio::time::{sleep, timeout};
 
@@ -1527,14 +1532,14 @@ done"#,
                 let address = listener.local_addr().unwrap();
                 let mut router = agent_router_with_stderr(
                     config,
-                    &options.router,
+                    &options.route,
                     stderr,
                     watch::channel(false).1,
                 )
                 .unwrap();
-                if let Some(subpath) = options.subpath.as_deref() {
-                    validate_subpath(subpath).unwrap();
-                    router = Router::new().nest(subpath, router);
+                if let Some(mount_path) = options.mount_path.as_deref() {
+                    validate_mount_path(mount_path).unwrap();
+                    router = Router::new().nest(mount_path, router);
                 }
                 let task = tokio::spawn(async move {
                     serve_listener(listener, router, watch::channel(false).0)
@@ -1744,9 +1749,9 @@ done"#,
             assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
 
             let allowed_options = ServeOptions {
-                router: AgentRouterOptions {
-                    cors: cors_options(Vec::new(), true).unwrap(),
-                    ..AgentRouterOptions::default()
+                route: RouteConfig {
+                    allow_any_origin: true,
+                    ..RouteConfig::default()
                 },
                 ..ServeOptions::default()
             };
@@ -1819,9 +1824,9 @@ done"#,
         #[tokio::test]
         async fn process_limit_rejects_overload_but_keeps_probes_available() {
             let server = TestServer::start(ServeOptions {
-                router: AgentRouterOptions {
+                route: RouteConfig {
                     max_processes: 1,
-                    ..AgentRouterOptions::default()
+                    ..RouteConfig::default()
                 },
                 ..ServeOptions::default()
             })
@@ -1877,9 +1882,9 @@ done"#,
         #[tokio::test]
         async fn process_limit_rejects_websocket_handshake_while_saturated() {
             let server = TestServer::start(ServeOptions {
-                router: AgentRouterOptions {
+                route: RouteConfig {
                     max_processes: 1,
-                    ..AgentRouterOptions::default()
+                    ..RouteConfig::default()
                 },
                 ..ServeOptions::default()
             })
@@ -1914,9 +1919,9 @@ done"#,
         #[tokio::test]
         async fn concurrent_websocket_handshakes_have_deterministic_admission() {
             let server = TestServer::start(ServeOptions {
-                router: AgentRouterOptions {
+                route: RouteConfig {
                     max_processes: 1,
-                    ..AgentRouterOptions::default()
+                    ..RouteConfig::default()
                 },
                 ..ServeOptions::default()
             })
@@ -1945,9 +1950,9 @@ done"#,
         #[tokio::test]
         async fn concurrent_initialize_requests_yield_one_success_and_one_overload() {
             let server = TestServer::start(ServeOptions {
-                router: AgentRouterOptions {
+                route: RouteConfig {
                     max_processes: 1,
-                    ..AgentRouterOptions::default()
+                    ..RouteConfig::default()
                 },
                 ..ServeOptions::default()
             })
@@ -2055,11 +2060,11 @@ done"#,
         #[tokio::test]
         async fn honors_custom_path_health_and_cors_options() {
             let custom_options = ServeOptions {
-                router: AgentRouterOptions {
+                route: RouteConfig {
                     path: "/rpc".to_string(),
-                    cors: cors_options(vec!["https://example.com".to_string()], false).unwrap(),
+                    cors_origins: vec!["https://example.com".to_string()],
                     health_endpoint: false,
-                    ..AgentRouterOptions::default()
+                    ..RouteConfig::default()
                 },
                 ..ServeOptions::default()
             };
@@ -2112,7 +2117,7 @@ done"#,
         #[tokio::test]
         async fn serves_all_endpoints_under_the_configured_subpath() {
             let custom_options = ServeOptions {
-                subpath: Some("/myapp".to_string()),
+                mount_path: Some("/myapp".to_string()),
                 ..ServeOptions::default()
             };
             let server = TestServer::start(custom_options).await;

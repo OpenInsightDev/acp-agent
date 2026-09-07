@@ -3,21 +3,15 @@
 //! ACP does not standardize a "yolo" mode: every agent names its
 //! auto-approve-everything mode differently (Claude uses `bypassPermissions`,
 //! Codex uses `agent-full-access`, Gemini uses `yolo`). This module resolves
-//! the correct command-line flag — or a helpful protocol-level hint — for a
-//! given registry agent id from a curated catalog. The catalog is fetched from
-//! the published CDN (the update source) and falls back to the copy bundled
-//! with this release when the network is unavailable.
+//! the correct command-line flag for a given registry agent id from a curated
+//! catalog. The catalog is fetched from the published CDN (the update source)
+//! and falls back to the copy bundled with this release when the network is
+//! unavailable.
 //!
 //! The catalog stores only yolo-specific information; everything else (name,
 //! description, distribution) already lives in the public ACP registry. Each
-//! entry may carry any of:
-//!
-//! - `flag`: a startup flag that activates yolo, which `--yolo` injects;
-//! - `mode`: the `modeId` accepted by ACP `session/set_mode`;
-//! - `option`: a config-option selector for ACP `session/set_config_option`.
-//!
-//! An empty object means the agent is confirmed to have no yolo mode; an
-//! absent entry means the mapping is unknown.
+//! entry contains a startup flag that `--yolo` injects. Agents without a
+//! supported startup flag are not included in the catalog.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -46,37 +40,13 @@ pub const EMBEDDED_YOLO_MODES: &str = include_str!("../data/yolo-modes.json");
 // Bound remote lookup so offline use reaches the embedded catalog promptly.
 const YOLO_MODES_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// ACP config-option selector for agents whose yolo mode lives in
-/// `session/set_config_option` rather than `session/set_mode`.
+/// Startup flag mapping for one registry agent.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct YoloConfigOption {
-    /// Identifier of the config option (for example `"mode"` or `"permissions"`).
-    #[serde(rename = "configId")]
-    pub config_id: String,
-    /// Value of that option that selects the yolo behavior, when known.
-    #[serde(default, rename = "value")]
-    pub value: Option<String>,
-}
-
-/// Minimal yolo-mode mapping for one registry agent.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct YoloModeInfo {
-    /// Startup flag (possibly with a value) that activates yolo, if any.
-    #[serde(default, rename = "flag")]
-    pub cli_flag: Option<String>,
-    /// The `modeId` accepted by `session/set_mode`, if any.
-    #[serde(default, rename = "mode")]
-    pub mode_id: Option<String>,
-    /// Config-option selector when yolo is set via `session/set_config_option`.
-    #[serde(default, rename = "option")]
-    pub config_option: Option<YoloConfigOption>,
-}
-
-impl YoloModeInfo {
-    /// Returns `true` when the agent is confirmed to have no yolo mode.
-    pub fn has_no_yolo(&self) -> bool {
-        self.cli_flag.is_none() && self.mode_id.is_none() && self.config_option.is_none()
-    }
+    /// Startup flag (possibly with a value) that activates yolo.
+    #[serde(rename = "flag")]
+    pub cli_flag: String,
 }
 
 /// The yolo-mode catalog keyed by registry agent id.
@@ -161,10 +131,7 @@ fn embedded_yolo_modes() -> &'static YoloModes {
 /// Resolves the command-line arguments that activate yolo for an agent.
 ///
 /// Returns the agent's startup flag (split into tokens so multi-token flags
-/// such as `--permission-mode bypass` work) when one exists. For agents that
-/// only support protocol-level yolo (`session/set_mode` or
-/// `session/set_config_option`) or none at all, it returns an error with
-/// guidance instead of silently skipping the requested auto-approve behavior.
+/// such as `--permission-mode bypass` work) when one exists.
 pub fn yolo_extra_args_from(catalog: &YoloModes, agent_id: &str) -> Result<Vec<String>> {
     let info = catalog.find(agent_id).ok_or_else(|| {
         anyhow!(
@@ -173,29 +140,11 @@ pub fn yolo_extra_args_from(catalog: &YoloModes, agent_id: &str) -> Result<Vec<S
         )
     })?;
 
-    if let Some(flag) = &info.cli_flag {
-        return Ok(flag.split_whitespace().map(str::to_string).collect());
-    }
-
-    if let Some(mode_id) = &info.mode_id {
-        return Err(anyhow!(
-            "agent \"{agent_id}\" enables yolo via ACP session/set_mode (modeId \"{mode_id}\") \
-             and exposes no CLI flag; run without --yolo and have the ACP client send \
-             session/set_mode, or pass the agent's own flag manually"
-        ));
-    }
-
-    if let Some(option) = &info.config_option {
-        let value = option.value.as_deref().unwrap_or("<yolo value>");
-        return Err(anyhow!(
-            "agent \"{agent_id}\" enables yolo via ACP config option {}={value} and exposes \
-             no CLI flag; run without --yolo and have the ACP client send \
-             session/set_config_option, or pass the agent's own flag manually",
-            option.config_id
-        ));
-    }
-
-    Err(anyhow!("agent \"{agent_id}\" has no yolo mode"))
+    Ok(info
+        .cli_flag
+        .split_whitespace()
+        .map(str::to_string)
+        .collect())
 }
 
 /// Fetches the catalog from the CDN and resolves the agent's yolo arguments.
@@ -220,11 +169,8 @@ mod tests {
     const SAMPLE: &str = r#"{
         "version": 1,
         "agents": {
-            "gemini": { "mode": "yolo", "flag": "--yolo" },
-            "devin": { "mode": "bypass", "flag": "--permission-mode bypass" },
-            "qwen-code": { "mode": "yolo" },
-            "amp-acp": { "option": { "configId": "permissions", "value": "bypass" } },
-            "opencode": {}
+            "gemini": { "flag": "--yolo" },
+            "devin": { "flag": "--permission-mode bypass" }
         }
     }"#;
 
@@ -245,27 +191,22 @@ mod tests {
     }
 
     #[test]
-    fn set_mode_agent_without_flag_errors() {
-        let error = yolo_extra_args_from(&sample_catalog(), "qwen-code")
-            .expect_err("qwen has no CLI yolo flag");
-        assert!(error.to_string().contains("session/set_mode"));
-        assert!(error.to_string().contains("yolo"));
+    fn unsupported_protocol_fields_are_rejected() {
+        let error = YoloModes::from_json(
+            r#"{
+                "version": 1,
+                "agents": { "qwen-code": { "mode": "yolo" } }
+            }"#,
+        )
+        .expect_err("protocol-level yolo fields are unsupported");
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
-    fn config_option_agent_errors_with_selector() {
-        let error = yolo_extra_args_from(&sample_catalog(), "amp-acp")
-            .expect_err("amp has no CLI yolo flag");
-        let message = error.to_string();
-        assert!(message.contains("config option permissions=bypass"));
-        assert!(message.contains("session/set_config_option"));
-    }
-
-    #[test]
-    fn agent_without_yolo_errors() {
+    fn agent_without_yolo_mapping_errors() {
         let error = yolo_extra_args_from(&sample_catalog(), "opencode")
-            .expect_err("opencode has no yolo mode");
-        assert!(error.to_string().contains("no yolo mode"));
+            .expect_err("opencode has no yolo mapping");
+        assert!(error.to_string().contains("no yolo mode mapping"));
     }
 
     #[test]

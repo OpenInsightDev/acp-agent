@@ -2,41 +2,22 @@
   "version": 1,
   "agents": {
     "claude-acp": {
-      "mode": "bypassPermissions",
       "flag": "--dangerously-skip-permissions"
     },
     "codex-acp": {
-      "mode": "agent-full-access",
       "flag": "--dangerously-skip-sandbox-and-permissions"
     },
     "cursor": {
       "flag": "--yolo"
     },
     "gemini": {
-      "mode": "yolo",
       "flag": "--yolo"
     },
     "qwen-code": {
-      "mode": "yolo",
       "flag": "--yolo"
     },
     "devin": {
-      "mode": "bypass",
       "flag": "--permission-mode bypass"
-    },
-    "goose": {
-      "mode": "auto"
-    },
-    "amp-acp": {
-      "option": {
-        "configId": "permissions",
-        "value": "bypass"
-      }
-    },
-    "kimi": {
-      "option": {
-        "configId": "mode"
-      }
     },
     "dirac": {
       "flag": "--yolo"

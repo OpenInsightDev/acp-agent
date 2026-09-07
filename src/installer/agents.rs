@@ -18,21 +18,10 @@ use crate::installer::binary::{cache_binary_target, refresh_binary_target_in};
 use crate::installer::cache::{cache_root_dir, list_cached_agents, remove_cached_agent};
 use crate::installer::environment::program_available;
 use crate::process;
-use crate::registry::{BinaryTarget, Platform, Registry, RegistryAgent, fetch_registry};
-use crate::runner::PackageRunner;
+use crate::registry::{Platform, Registry, RegistryAgent, fetch_registry};
+use crate::runner::{PackageRunner, ResolvedDistribution, resolve_distribution};
 
 const OPERATION_CONCURRENCY: usize = 4;
-
-/// Package runner that prepared or removed an agent package distribution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallMethod {
-    /// npm installed an npm distribution globally; `npm exec` finds the launcher.
-    Npm,
-    /// Deno warmed its npm cache for an npm distribution; `deno x` reads it.
-    Deno,
-    /// uv installed a uvx tool; `uvx` prefers the installed tool.
-    Uvx,
-}
 
 /// Result of installing or updating an agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,17 +34,13 @@ pub enum InstallOutcome {
         executable_path: PathBuf,
         /// Cache directory that owns the payload.
         cache_dir: PathBuf,
-        /// Whether an update removed older cache entries for this platform.
-        /// Digest-keyed updates retain older entries, so this is false until a
-        /// dedicated garbage-collection operation is introduced.
-        stale_cache_entries_removed: bool,
     },
     /// A package manager installed a wrapper for the agent.
     PackageManager {
         /// Registry ID of the agent.
         agent_id: String,
-        /// Package-manager strategy used.
-        method: InstallMethod,
+        /// Package runner used to prepare the distribution.
+        runner: PackageRunner,
         /// Registry package requirement passed to the installer.
         package: String,
     },
@@ -76,8 +61,8 @@ pub enum UninstallOutcome {
     PackageManager {
         /// Registry ID of the agent.
         agent_id: String,
-        /// Package-manager strategy used.
-        method: InstallMethod,
+        /// Package runner used to remove the distribution.
+        runner: PackageRunner,
         /// Package name passed to the uninstaller.
         package: String,
     },
@@ -170,24 +155,28 @@ pub async fn uninstall_agents(agent_ids: &[String]) -> Vec<(String, Result<Unins
 ///
 /// Binary distributions are downloaded into the platform cache. Package
 /// distributions share one runner decision with `run`/`serve` (see
-/// `runner::package_runner_for`) and are prepared through that runner's own
+/// `runner::resolve_distribution`) and are prepared through that runner's own
 /// cache — a global npm install, a uv tool install, or a Deno npm-cache
 /// warm-up — so the prepared artifacts are exactly what execution consumes,
 /// instead of a separate lifecycle that later runs ignore.
 pub async fn install_from_registry(agent: &RegistryAgent) -> Result<InstallOutcome> {
-    if let Some(binary) = &agent.distribution.binary {
-        let platform = Platform::current()?;
-        if let Some(target) = binary.for_platform(platform) {
-            return install_binary(agent, target).await;
-        }
-    }
-
-    match crate::runner::package_runner_for(agent)? {
-        Some(runner) => install_package(agent, runner).await,
-        None => Err(anyhow!(
+    let distribution = resolve_distribution(agent)?.with_context(|| {
+        format!(
             "agent \"{}\" does not have an installable distribution",
             agent.id
-        )),
+        )
+    })?;
+    match distribution {
+        ResolvedDistribution::Binary { platform, target } => {
+            install_binary(agent, platform, target).await
+        }
+        ResolvedDistribution::Npm {
+            distribution,
+            runner,
+        } => install_package(agent, runner, &distribution.package).await,
+        ResolvedDistribution::Uvx { distribution } => {
+            install_package(agent, PackageRunner::Uvx, &distribution.package).await
+        }
     }
 }
 
@@ -198,20 +187,29 @@ async fn update_from(
 ) -> Result<InstallOutcome> {
     let agent = registry.get_agent(agent_id)?;
 
-    if let Some(binary) = &agent.distribution.binary {
-        let platform = Platform::current()?;
-        if let Some(target) = binary.for_platform(platform) {
+    let distribution = resolve_distribution(agent)?.with_context(|| {
+        format!(
+            "agent \"{}\" does not have an installable distribution",
+            agent.id
+        )
+    })?;
+    match distribution {
+        ResolvedDistribution::Binary { platform, target } => {
             let cached = refresh_binary_target_in(root_dir, agent, platform, target).await?;
-            return Ok(InstallOutcome::Binary {
+            Ok(InstallOutcome::Binary {
                 agent_id: agent.id.clone(),
                 executable_path: cached.executable_path,
                 cache_dir: cached.cache_dir,
-                stale_cache_entries_removed: false,
-            });
+            })
+        }
+        ResolvedDistribution::Npm {
+            distribution,
+            runner,
+        } => install_package(agent, runner, &distribution.package).await,
+        ResolvedDistribution::Uvx { distribution } => {
+            install_package(agent, PackageRunner::Uvx, &distribution.package).await
         }
     }
-
-    install_from_registry(agent).await
 }
 
 async fn uninstall_from(
@@ -247,29 +245,36 @@ async fn uninstall_from(
         bail!("agent \"{agent_id}\" is not installed");
     };
 
-    if let Some(npx) = &agent.distribution.npx {
-        return uninstall_npx_package(agent_id, &npx.package).await;
+    let distribution = resolve_distribution(&agent)?
+        .with_context(|| format!("agent \"{agent_id}\" is not installed"))?;
+    match distribution {
+        ResolvedDistribution::Binary { .. } => bail!("agent \"{agent_id}\" is not installed"),
+        ResolvedDistribution::Npm {
+            distribution,
+            runner,
+        } => uninstall_npm_package(agent_id, runner, &distribution.package).await,
+        ResolvedDistribution::Uvx { distribution } => {
+            uninstall_uvx_package(agent_id, &distribution.package).await
+        }
     }
-    if let Some(uvx) = &agent.distribution.uvx {
-        return uninstall_uvx_package(agent_id, &uvx.package).await;
-    }
-    bail!("agent \"{agent_id}\" is not installed")
 }
 
-async fn install_binary(agent: &RegistryAgent, target: &BinaryTarget) -> Result<InstallOutcome> {
-    let platform = Platform::current()?;
+async fn install_binary(
+    agent: &RegistryAgent,
+    platform: Platform,
+    target: &crate::registry::BinaryTarget,
+) -> Result<InstallOutcome> {
     let cached_binary = cache_binary_target(agent, platform, target).await?;
     Ok(InstallOutcome::Binary {
         agent_id: agent.id.clone(),
         executable_path: cached_binary.executable_path,
         cache_dir: cached_binary.cache_dir,
-        stale_cache_entries_removed: false,
     })
 }
 
 /// Prepares a package distribution through the shared runner's own cache.
 ///
-/// The runner is decided by [`crate::runner::package_runner_for`], the same
+/// The runner is decided by [`crate::runner::resolve_distribution`], the same
 /// function `run`/`serve` use to build the execution command, so preparation
 /// and execution can never drift apart:
 ///
@@ -278,93 +283,69 @@ async fn install_binary(agent: &RegistryAgent, target: &BinaryTarget) -> Result<
 /// - `deno x` reads Deno's npm cache, so Deno warms exactly that cache;
 /// - `uvx` prefers tools installed with `uv tool install`, so uv installs the
 ///   tool.
-async fn install_package(agent: &RegistryAgent, runner: PackageRunner) -> Result<InstallOutcome> {
+async fn install_package(
+    agent: &RegistryAgent,
+    runner: PackageRunner,
+    package: &str,
+) -> Result<InstallOutcome> {
     match runner {
-        PackageRunner::Npm | PackageRunner::Deno => {
-            let distribution = agent.distribution.npx.as_ref().with_context(|| {
-                format!(
-                    "agent \"{}\" resolved the {} runner without an npm distribution",
-                    agent.id, runner
-                )
-            })?;
-            match runner {
-                PackageRunner::Npm => {
-                    run_command(
-                        "npm",
-                        ["install", "--global", distribution.package.as_str()],
-                        &format!("npm package {}", distribution.package),
-                    )
-                    .await?;
-                }
-                PackageRunner::Deno => {
-                    let package = deno_cache_args(&distribution.package);
-                    run_command(
-                        "deno",
-                        package,
-                        &format!("npm package {} via Deno", distribution.package),
-                    )
-                    .await?;
-                }
-                PackageRunner::Uvx => unreachable!("handled by the outer match"),
-            }
-            Ok(InstallOutcome::PackageManager {
-                agent_id: agent.id.clone(),
-                method: match runner {
-                    PackageRunner::Npm => InstallMethod::Npm,
-                    PackageRunner::Deno => InstallMethod::Deno,
-                    PackageRunner::Uvx => unreachable!("handled by the outer match"),
-                },
-                package: distribution.package.clone(),
-            })
-        }
-        PackageRunner::Uvx => {
-            let distribution = agent.distribution.uvx.as_ref().with_context(|| {
-                format!(
-                    "agent \"{}\" resolved the uvx runner without a uvx distribution",
-                    agent.id
-                )
-            })?;
+        PackageRunner::Npm => {
             run_command(
-                "uv",
-                ["tool", "install", distribution.package.as_str()],
-                &format!("uv package {}", distribution.package),
+                "npm",
+                ["install", "--global", package],
+                &format!("npm package {package}"),
             )
             .await?;
-            Ok(InstallOutcome::PackageManager {
-                agent_id: agent.id.clone(),
-                method: InstallMethod::Uvx,
-                package: distribution.package.clone(),
-            })
+        }
+        PackageRunner::Deno => {
+            run_command(
+                "deno",
+                deno_cache_args(package),
+                &format!("npm package {package} via Deno"),
+            )
+            .await?;
+        }
+        PackageRunner::Uvx => {
+            run_command(
+                "uv",
+                ["tool", "install", package],
+                &format!("uv package {package}"),
+            )
+            .await?;
         }
     }
+    Ok(InstallOutcome::PackageManager {
+        agent_id: agent.id.clone(),
+        runner,
+        package: package.to_string(),
+    })
 }
 
-async fn uninstall_npx_package(agent_id: &str, package: &str) -> Result<UninstallOutcome> {
+async fn uninstall_npm_package(
+    agent_id: &str,
+    runner: PackageRunner,
+    package: &str,
+) -> Result<UninstallOutcome> {
     let package = bare_package_name(package);
-    let npm_installed = if program_available("npm")? {
-        npm_package_installed(package).await?
-    } else {
-        false
-    };
-    if npm_installed {
-        run_command(
-            "npm",
-            ["uninstall", "--global", package],
-            &format!("npm package {package}"),
-        )
-        .await?;
-        return Ok(UninstallOutcome::PackageManager {
-            agent_id: agent_id.to_string(),
-            method: InstallMethod::Npm,
-            package: package.to_string(),
-        });
+    if runner == PackageRunner::Npm && program_available("npm")? {
+        if npm_package_installed(package).await? {
+            run_command(
+                "npm",
+                ["uninstall", "--global", package],
+                &format!("npm package {package}"),
+            )
+            .await?;
+            return Ok(UninstallOutcome::PackageManager {
+                agent_id: agent_id.to_string(),
+                runner,
+                package: package.to_string(),
+            });
+        }
     }
-    // The Deno fallback never creates a global launcher: `deno x` resolves the
-    // package from Deno's own npm cache, which Deno manages and
-    // garbage-collects, so there is nothing for `acp-agent` to remove.
+    // Deno owns its npm cache and does not create a global launcher.
     Ok(UninstallOutcome::RunnerManaged {
         agent_id: agent_id.to_string(),
-        runner: PackageRunner::Deno,
+        runner,
     })
 }
 
@@ -378,7 +359,7 @@ async fn uninstall_uvx_package(agent_id: &str, package: &str) -> Result<Uninstal
     .await?;
     Ok(UninstallOutcome::PackageManager {
         agent_id: agent_id.to_string(),
-        method: InstallMethod::Uvx,
+        runner: PackageRunner::Uvx,
         package: tool_name.to_string(),
     })
 }
@@ -530,7 +511,7 @@ mod tests {
 
     use super::*;
     use crate::installer::cache::{BinaryCacheMetadata, binary_cache_paths};
-    use crate::registry::{AgentDistribution, BinaryDistribution};
+    use crate::registry::{AgentDistribution, BinaryDistribution, BinaryTarget};
 
     fn sample_agent() -> RegistryAgent {
         RegistryAgent {

@@ -11,6 +11,8 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::serve::RouteConfig;
+
 const DEFAULT_NAME: &str = "default";
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
@@ -47,18 +49,8 @@ pub struct RegisterOptions {
     pub name: String,
     /// Public route prefix; defaults to `/<agent-id>`.
     pub route: Option<String>,
-    /// ACP endpoint path below the public route.
-    pub path: String,
-    /// Browser origins allowed by the agent router.
-    pub cors_origins: Vec<String>,
-    /// Whether all browser origins are accepted.
-    pub allow_any_origin: bool,
-    /// Whether the agent router exposes `/health`.
-    pub health_endpoint: bool,
-    /// Whether the agent router exposes `/readyz`.
-    pub readyz_endpoint: bool,
-    /// Maximum number of concurrent agent processes for this route.
-    pub max_processes: usize,
+    /// Shared ACP route configuration.
+    pub config: RouteConfig,
     /// Whether to inject the agent's yolo argument.
     pub yolo: bool,
     /// Arguments forwarded to the agent process on connection.

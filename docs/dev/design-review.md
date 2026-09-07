@@ -7,11 +7,12 @@ The process-lifecycle finding has been applied as a destructive change.
 ## Priority Summary
 
 1. Completed: Remove process-tree management and keep cancellation scoped to direct child processes on Unix.
-2. Medium: Remove unsupported YOLO protocol modes from the active model and replace whitespace splitting for multi-token flags.
-3. Medium: Share registry snapshots across batch operations and centralize distribution resolution.
-4. Medium: Consolidate repeated route configuration and cache-lock acquisition code.
-5. Low: Merge duplicate runner enums and narrow the visibility of `ArchiveLimits`.
-6. Low: Consider standard codecs and concurrency helpers only when their additional semantics are needed.
+2. Completed: Remove unsupported YOLO protocol modes from the active model.
+3. Medium: Replace whitespace splitting for multi-token YOLO flags.
+4. Medium: Share registry snapshots across batch operations.
+5. Completed: Consolidate repeated route configuration and distinguish mount prefixes from public route prefixes.
+6. Completed: Centralize distribution priority and remove duplicate runner enums.
+7. Low: Narrow `ArchiveLimits` visibility and consider standard codecs/concurrency helpers only when their additional semantics are needed.
 
 ## Findings
 
@@ -33,21 +34,13 @@ The crate is explicitly Unix-only, so no non-Unix lifecycle fallback is maintain
 
 **Priority:** Medium.
 
-**Locations:** `src/yolo.rs:49-80` and `src/yolo.rs:161-199`.
+**Status:** Completed.
 
-`YoloModeInfo` models CLI flags, ACP `session/set_mode`, and ACP `session/set_config_option` modes.
+**Locations:** `src/yolo.rs` and `data/yolo-modes.json`.
 
-The current `--yolo` call path only injects command-line arguments before starting the agent process.
+`YoloModeInfo` now models only the startup CLI flag injected by `--yolo`. The unsupported `mode` and `option` fields, `YoloConfigOption`, `has_no_yolo`, and the protocol-level error branches have been removed.
 
-The protocol-level fields therefore only produce an error message and never execute the modeled ACP operation.
-
-`has_no_yolo` also has no production caller.
-
-This expands the active data model and error surface for functionality that is not implemented by the current command path.
-
-**Recommendation:** Keep the current model limited to supported CLI flags until protocol-level YOLO behavior is actually implemented.
-
-If protocol-level support is added later, model it as a separate capability and execution path.
+The catalog uses `deny_unknown_fields`, so ACP `session/set_mode` and `session/set_config_option` entries are rejected instead of being silently accepted as future-compatible data. Entries without a supported CLI flag are not included in the catalog.
 
 ### 3. YOLO Arguments Are Parsed with `split_whitespace`
 
@@ -87,6 +80,8 @@ A future garbage-collection command can return its own cleanup result without ex
 
 **Priority:** Medium.
 
+**Status:** Completed.
+
 **Locations:** `src/serve.rs`, `src/commands/mod.rs`, `src/server/protocol.rs`, and `src/server/mod.rs`.
 
 The same route options are represented separately by standalone serve CLI fields, server-register CLI fields, wire protocol data, `RegisterOptions`, and service-layer options.
@@ -97,13 +92,17 @@ Adding a new route option requires updating several structures and manual mappin
 
 The standalone `serve --subpath` and `server register --subpath` compatibility alias also represent different routing concepts.
 
-**Recommendation:** Introduce one shared internal route configuration type, while keeping CLI and wire types responsible only for parsing and serialization.
+`RouteConfig` is now the shared internal route configuration for standalone serving and named registrations. It owns the ACP path, CORS inputs, health/readiness flags, and process limit. The CLI and daemon wire request remain parsing/serialization boundaries, while `RegisterOptions` and `RouteId` carry the shared configuration without repeating its fields.
 
-Give mount prefixes and public route prefixes distinct names if both behaviors remain supported.
+Standalone serving calls its prefix `mount_path` internally and accepts the legacy `--subpath` alias. Named server registration calls its public prefix `route` and no longer aliases it as `--subpath`.
 
 ### 6. Distribution Priority Is Reimplemented in Several Operations
 
 **Priority:** Medium.
+
+**Status:** Completed.
+
+**Locations:** `src/runner.rs` and `src/installer/agents.rs`.
 
 **Locations:** `src/runner.rs:151-187` and `src/installer/agents.rs:169-257`.
 
@@ -113,7 +112,7 @@ A new distribution type or priority change could therefore produce inconsistent 
 
 **Recommendation:** Resolve a registry agent once into a typed distribution such as `ResolvedDistribution::Binary`, `ResolvedDistribution::Npm`, or `ResolvedDistribution::Uvx`.
 
-Let each lifecycle operation consume that resolved result instead of repeating priority checks.
+`runner::resolve_distribution` now returns that typed result using the shared binary, npm/Deno, then uvx priority. Run, install, update, and uninstall consume the result; `PackageRunner` is also the single reporting/install strategy type, with `install_name()` covering the display-only distinction between `uvx` and `uv`.
 
 ### 7. Batch Operations Fetch the Registry Repeatedly
 
@@ -147,15 +146,17 @@ The surrounding acquisition protocol can nevertheless be centralized behind an i
 
 **Priority:** Low.
 
+**Status:** Completed.
+
 **Locations:** `src/runner.rs:31-52` and `src/installer/agents.rs:26-35`.
 
 Both enums contain `Npm`, `Deno`, and `Uvx`, and installation converts one into the other with a manual match.
 
 The duplicate types require synchronized changes and duplicate display or formatting logic.
 
-**Recommendation:** Keep one shared type unless the two concepts acquire genuinely different variants or semantics.
+`InstallMethod` has been removed. Installation and uninstall outcomes retain `PackageRunner`, whose `install_name()` supplies the package-manager display name where it differs from the executable name.
 
-Add a display-name method to the retained type instead of maintaining another one-to-one enum.
+`ArchiveLimits` remains a separate follow-up from the requested issues.
 
 ### 10. `ArchiveLimits` Is Public Without a Public Configuration Path
 
@@ -246,9 +247,10 @@ The protocol layer should be simplified only when its compatibility and frame-si
 ## Suggested Follow-Up Order
 
 1. Completed: Remove process-tree management and define direct-child cancellation as the Unix-only platform contract.
-2. Remove unreachable YOLO model fields and fix argument tokenization.
-3. Remove `stale_cache_entries_removed`.
-4. Share registry snapshots and centralize distribution resolution.
-5. Consolidate route configuration and cache-lock plumbing.
-6. Merge the duplicate runner enums and narrow `ArchiveLimits` visibility.
-7. Defer codec, concurrency-helper, and hex utility replacements until they solve a concrete maintenance problem.
+2. Completed: Remove unreachable YOLO protocol fields from the active model and catalog.
+3. Replace whitespace splitting for multi-token YOLO flags.
+4. Remove `stale_cache_entries_removed`.
+5. Share registry snapshots and centralize distribution resolution.
+6. Consolidate route configuration and cache-lock plumbing.
+7. Merge the duplicate runner enums and narrow `ArchiveLimits` visibility.
+8. Defer codec, concurrency-helper, and hex utility replacements until they solve a concrete maintenance problem.

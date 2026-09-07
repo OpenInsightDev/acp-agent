@@ -13,6 +13,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::serve::RouteConfig;
 use tokio::net::{UnixListener, UnixStream};
 
 /// The control-protocol version, independent of the package version.
@@ -252,16 +254,8 @@ pub(crate) struct RegisterRequest {
     pub(crate) name: String,
     pub(crate) id: String,
     pub(crate) route: String,
-    pub(crate) path: String,
-    #[serde(default)]
-    pub(crate) cors_origins: Vec<String>,
-    #[serde(default)]
-    pub(crate) allow_any_origin: bool,
-    #[serde(default = "default_true")]
-    pub(crate) health_endpoint: bool,
-    #[serde(default = "default_true")]
-    pub(crate) readyz_endpoint: bool,
-    pub(crate) max_processes: usize,
+    #[serde(flatten)]
+    pub(crate) config: RouteConfig,
     #[serde(default)]
     pub(crate) yolo: bool,
     #[serde(default)]
@@ -282,10 +276,6 @@ pub(crate) struct StatusRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RegistrationsRequest {
     pub(crate) name: String,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// One typed response is sent for each request.
