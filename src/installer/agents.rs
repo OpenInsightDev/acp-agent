@@ -23,6 +23,20 @@ use crate::runner::{PackageRunner, ResolvedDistribution, resolve_distribution};
 
 const OPERATION_CONCURRENCY: usize = 4;
 
+enum RegistrySnapshot {
+    Available(Arc<Registry>),
+    Unavailable(String),
+}
+
+impl RegistrySnapshot {
+    fn from_result(registry: Result<Registry>) -> Self {
+        match registry {
+            Ok(registry) => Self::Available(Arc::new(registry)),
+            Err(error) => Self::Unavailable(format!("{error:#}")),
+        }
+    }
+}
+
 /// Result of installing or updating an agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallOutcome {
@@ -114,13 +128,31 @@ pub async fn installed_agents() -> Result<Vec<InstalledAgent>> {
 /// Installs an agent using its highest-priority supported distribution.
 pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome> {
     let registry = fetch_registry().await?;
-    let agent = registry.get_agent(agent_id)?;
-    install_from_registry(agent).await
+    install_from(agent_id, &registry).await
 }
 
 /// Installs distinct agent IDs concurrently, preserving first-request order.
 pub async fn install_agents(agent_ids: &[String]) -> Vec<(String, Result<InstallOutcome>)> {
-    run_concurrently(agent_ids, |id| async move { install_agent(&id).await }).await
+    if agent_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let registry = match fetch_registry().await {
+        Ok(registry) => Arc::new(registry),
+        Err(error) => {
+            let error = format!("{error:#}");
+            return run_concurrently(agent_ids, move |_id| {
+                let error = error.clone();
+                async move { Err(anyhow!(error)) }
+            })
+            .await;
+        }
+    };
+    run_concurrently(agent_ids, move |id| {
+        let registry = Arc::clone(&registry);
+        async move { install_from(&id, &registry).await }
+    })
+    .await
 }
 
 /// Updates an agent from the latest registry distribution.
@@ -136,19 +168,71 @@ pub async fn update_agent(agent_id: &str) -> Result<InstallOutcome> {
 
 /// Updates distinct agent IDs concurrently, preserving first-request order.
 pub async fn update_agents(agent_ids: &[String]) -> Vec<(String, Result<InstallOutcome>)> {
-    run_concurrently(agent_ids, |id| async move { update_agent(&id).await }).await
+    if agent_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let registry = match fetch_registry().await {
+        Ok(registry) => Arc::new(registry),
+        Err(error) => {
+            let error = format!("{error:#}");
+            return run_concurrently(agent_ids, move |_id| {
+                let error = error.clone();
+                async move { Err(anyhow!(error)) }
+            })
+            .await;
+        }
+    };
+    let root_dir = match cache_root_dir() {
+        Ok(root_dir) => Arc::new(root_dir),
+        Err(error) => {
+            let error = format!("{error:#}");
+            return run_concurrently(agent_ids, move |_id| {
+                let error = error.clone();
+                async move { Err(anyhow!(error)) }
+            })
+            .await;
+        }
+    };
+    run_concurrently(agent_ids, move |id| {
+        let registry = Arc::clone(&registry);
+        let root_dir = Arc::clone(&root_dir);
+        async move { update_from(&id, &registry, &root_dir).await }
+    })
+    .await
 }
 
 /// Removes cached binaries or a package-manager wrapper for an agent.
 pub async fn uninstall_agent(agent_id: &str) -> Result<UninstallOutcome> {
-    let registry = fetch_registry().await;
+    let registry = RegistrySnapshot::from_result(fetch_registry().await);
     let root_dir = cache_root_dir()?;
-    uninstall_from(agent_id, registry, &root_dir).await
+    uninstall_from(agent_id, &registry, &root_dir).await
 }
 
 /// Uninstalls distinct agent IDs concurrently, preserving first-request order.
 pub async fn uninstall_agents(agent_ids: &[String]) -> Vec<(String, Result<UninstallOutcome>)> {
-    run_concurrently(agent_ids, |id| async move { uninstall_agent(&id).await }).await
+    if agent_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let registry = Arc::new(RegistrySnapshot::from_result(fetch_registry().await));
+    let root_dir = match cache_root_dir() {
+        Ok(root_dir) => Arc::new(root_dir),
+        Err(error) => {
+            let error = format!("{error:#}");
+            return run_concurrently(agent_ids, move |_id| {
+                let error = error.clone();
+                async move { Err(anyhow!(error)) }
+            })
+            .await;
+        }
+    };
+    run_concurrently(agent_ids, move |id| {
+        let registry = Arc::clone(&registry);
+        let root_dir = Arc::clone(&root_dir);
+        async move { uninstall_from(&id, &registry, &root_dir).await }
+    })
+    .await
 }
 
 /// Installs a registry agent according to binary, npm, then uvx priority.
@@ -160,6 +244,15 @@ pub async fn uninstall_agents(agent_ids: &[String]) -> Vec<(String, Result<Unins
 /// warm-up — so the prepared artifacts are exactly what execution consumes,
 /// instead of a separate lifecycle that later runs ignore.
 pub async fn install_from_registry(agent: &RegistryAgent) -> Result<InstallOutcome> {
+    install_from_agent(agent).await
+}
+
+async fn install_from(agent_id: &str, registry: &Registry) -> Result<InstallOutcome> {
+    let agent = registry.get_agent(agent_id)?;
+    install_from_agent(agent).await
+}
+
+async fn install_from_agent(agent: &RegistryAgent) -> Result<InstallOutcome> {
     let distribution = resolve_distribution(agent)?.with_context(|| {
         format!(
             "agent \"{}\" does not have an installable distribution",
@@ -214,21 +307,21 @@ async fn update_from(
 
 async fn uninstall_from(
     agent_id: &str,
-    registry: Result<Registry>,
+    registry: &RegistrySnapshot,
     root_dir: &Path,
 ) -> Result<UninstallOutcome> {
     let cache_removed = remove_cached_agent(root_dir, agent_id).await?;
 
     let agent = match registry {
-        Ok(registry) => registry.find_agent(agent_id).cloned(),
-        Err(error) if cache_removed => {
+        RegistrySnapshot::Available(registry) => registry.find_agent(agent_id),
+        RegistrySnapshot::Unavailable(error) if cache_removed => {
             return Ok(UninstallOutcome::Cache {
                 agent_id: agent_id.to_string(),
-                registry_error: Some(format!("{error:#}")),
+                registry_error: Some(error.clone()),
             });
         }
-        Err(error) => {
-            return Err(error).with_context(|| {
+        RegistrySnapshot::Unavailable(error) => {
+            return Err(anyhow!(error.clone())).with_context(|| {
                 format!("could not determine how agent \"{agent_id}\" was installed")
             });
         }
@@ -245,7 +338,7 @@ async fn uninstall_from(
         bail!("agent \"{agent_id}\" is not installed");
     };
 
-    let distribution = resolve_distribution(&agent)?
+    let distribution = resolve_distribution(agent)?
         .with_context(|| format!("agent \"{agent_id}\" is not installed"))?;
     match distribution {
         ResolvedDistribution::Binary { .. } => bail!("agent \"{agent_id}\" is not installed"),
@@ -594,7 +687,8 @@ mod tests {
         };
         let temp_dir = tempdir().unwrap();
 
-        let error = uninstall_from("demo", Ok(registry), temp_dir.path())
+        let registry = RegistrySnapshot::from_result(Ok(registry));
+        let error = uninstall_from("demo", &registry, temp_dir.path())
             .await
             .unwrap_err();
 
@@ -659,9 +753,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            uninstall_from("demo", Err(anyhow!("offline")), &root)
-                .await
-                .unwrap(),
+            uninstall_from(
+                "demo",
+                &RegistrySnapshot::from_result(Err(anyhow!("offline"))),
+                &root,
+            )
+            .await
+            .unwrap(),
             UninstallOutcome::Cache {
                 agent_id: "demo".to_string(),
                 registry_error: Some("offline".to_string())

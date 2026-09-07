@@ -118,15 +118,13 @@ A new distribution type or priority change could therefore produce inconsistent 
 
 **Priority:** Medium.
 
-**Locations:** `src/installer/agents.rs:129-166`.
+**Status:** Completed.
 
-Batch install, update, and uninstall call single-agent functions that independently fetch the registry.
+**Locations:** `src/installer/agents.rs:134-236`.
 
-A command operating on several agents can therefore issue one network request per agent and use inconsistent registry snapshots.
+Batch install, update, and uninstall now fetch one registry snapshot at the batch boundary and share it across all distinct agent operations. This limits each batch to one registry request and ensures every operation uses the same catalog data.
 
-**Recommendation:** Fetch one registry snapshot at the batch boundary and pass it to internal per-agent operations.
-
-Preserve the existing uninstall fallback for registry failures when cached binaries were already removed.
+Registry-fetch failures are reported for each requested agent without starting distribution work. Uninstall preserves the existing fallback: if cached binaries were removed, it still succeeds and records the registry error so package-manager distributions can be inspected later.
 
 ### 8. Cache Lock Acquisition Contains Mechanical Duplication
 
@@ -250,7 +248,7 @@ The protocol layer should be simplified only when its compatibility and frame-si
 2. Completed: Remove unreachable YOLO protocol fields from the active model and catalog.
 3. Replace whitespace splitting for multi-token YOLO flags.
 4. Remove `stale_cache_entries_removed`.
-5. Share registry snapshots and centralize distribution resolution.
+5. Completed: Share registry snapshots and centralize distribution resolution.
 6. Consolidate route configuration and cache-lock plumbing.
 7. Merge the duplicate runner enums and narrow `ArchiveLimits` visibility.
 8. Defer codec, concurrency-helper, and hex utility replacements until they solve a concrete maintenance problem.
