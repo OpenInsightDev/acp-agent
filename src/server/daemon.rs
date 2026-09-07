@@ -49,28 +49,28 @@ impl SupervisorState {
     }
 }
 
-/// Route identity and the metadata needed by control-plane inspection.
+/// Route key and the metadata needed by control-plane inspection.
 ///
 /// Equality and hashing intentionally use only `(id, route)`: the remaining
 /// fields describe the committed route and are returned to clients, while an
 /// agent id or public route cannot be registered twice in one instance.
 #[derive(Debug, Clone)]
-struct RouteId {
+struct RouteKey {
     id: String,
     /// Public route prefix used to select this runtime.
     public_route: String,
     config: crate::serve::RouteConfig,
 }
 
-impl PartialEq for RouteId {
+impl PartialEq for RouteKey {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id && self.public_route == other.public_route
     }
 }
 
-impl Eq for RouteId {}
+impl Eq for RouteKey {}
 
-impl Hash for RouteId {
+impl Hash for RouteKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
         self.public_route.hash(state);
@@ -87,7 +87,7 @@ struct DaemonInstance {
     cancel: watch::Sender<bool>,
     listener_task: AsyncMutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     stop_lock: AsyncMutex<()>,
-    routes: RwLock<HashMap<RouteId, Arc<crate::serve::RouteRuntime>>>,
+    routes: RwLock<HashMap<RouteKey, Arc<crate::serve::RouteRuntime>>>,
 }
 
 impl DaemonInstance {
@@ -505,7 +505,7 @@ async fn register(
                 format!("failed to construct route runtime: {error:#}"),
             )
         })?;
-    let route_id = RouteId {
+    let route_key = RouteKey {
         id: request.id,
         public_route: request.route,
         config: options,
@@ -522,23 +522,23 @@ async fn register(
         ));
     }
     let mut routes = instance.routes.write().await;
-    if routes.keys().any(|existing| existing.id == route_id.id) {
+    if routes.keys().any(|existing| existing.id == route_key.id) {
         return Err(DaemonOperationError::new(
             ErrorCode::Conflict,
-            format!("agent id {} is already registered", route_id.id),
+            format!("agent id {} is already registered", route_key.id),
         ));
     }
     if routes
         .keys()
-        .any(|existing| existing.public_route == route_id.public_route)
+        .any(|existing| existing.public_route == route_key.public_route)
     {
         return Err(DaemonOperationError::new(
             ErrorCode::Conflict,
-            format!("route {} is already registered", route_id.public_route),
+            format!("route {} is already registered", route_key.public_route),
         ));
     }
-    let result = registration_result(&instance.name, &instance.address, &route_id, &runtime);
-    routes.insert(route_id, runtime);
+    let result = registration_result(&instance.name, &instance.address, &route_key, &runtime);
+    routes.insert(route_key.clone(), runtime);
     Ok(result)
 }
 
@@ -607,19 +607,22 @@ async fn registrations(
 fn registration_result(
     name: &str,
     address: &SocketAddr,
-    route: &RouteId,
+    route_key: &RouteKey,
     runtime: &crate::serve::RouteRuntime,
 ) -> RegistrationResult {
     RegistrationResult {
         name: name.to_string(),
-        id: route.id.clone(),
-        route: route.public_route.clone(),
-        path: route.config.path.clone(),
-        health_endpoint: route.config.health_endpoint,
-        readyz_endpoint: route.config.readyz_endpoint,
+        id: route_key.id.clone(),
+        route: route_key.public_route.clone(),
+        path: route_key.config.path.clone(),
+        health_endpoint: route_key.config.health_endpoint,
+        readyz_endpoint: route_key.config.readyz_endpoint,
         address: public_address(*address),
-        max_processes: route.config.max_processes,
-        readiness: readiness_result(route.config.readyz_endpoint, runtime.readiness_snapshot()),
+        max_processes: route_key.config.max_processes,
+        readiness: readiness_result(
+            route_key.config.readyz_endpoint,
+            runtime.readiness_snapshot(),
+        ),
     }
 }
 

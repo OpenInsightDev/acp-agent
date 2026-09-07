@@ -43,7 +43,7 @@ const YOLO_MODES_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Startup arguments mapping for one registry agent.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct YoloModeInfo {
+pub struct YoloMode {
     /// Arguments that activate yolo, preserving each argument boundary.
     pub args: Vec<String>,
 }
@@ -54,7 +54,7 @@ pub struct YoloModes {
     /// Catalog schema version.
     pub version: u64,
     /// Agent id → yolo-mode mapping.
-    pub agents: BTreeMap<String, YoloModeInfo>,
+    pub agents: BTreeMap<String, YoloMode>,
 }
 
 impl YoloModes {
@@ -65,7 +65,7 @@ impl YoloModes {
     }
 
     /// Looks up the yolo-mode mapping for a registry agent id.
-    pub fn find(&self, agent_id: &str) -> Option<&YoloModeInfo> {
+    pub fn find(&self, agent_id: &str) -> Option<&YoloMode> {
         self.agents.get(agent_id)
     }
 }

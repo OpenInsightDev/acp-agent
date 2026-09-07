@@ -4,7 +4,7 @@ use std::io::Write;
 use anyhow::{Context, Result};
 
 use super::AgentOutputFormat;
-use crate::installer::agents::{InstallOutcome, InstalledAgent, UninstallOutcome};
+use crate::installer::lifecycle::{InstallOutcome, InstalledAgent, UninstallOutcome};
 use crate::registry::RegistryAgent;
 use crate::runner::PackageRunner;
 
@@ -144,7 +144,7 @@ pub(super) fn uninstall_warnings(outcome: &UninstallOutcome) -> impl Iterator<It
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::installer::agents::InstalledAgent;
+    use crate::installer::lifecycle::InstalledAgent;
     use crate::registry::Registry;
     use serde_json::json;
 

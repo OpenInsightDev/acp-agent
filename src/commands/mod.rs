@@ -4,7 +4,7 @@ use std::process::ExitStatus;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-mod agents;
+mod agent_output;
 mod environment;
 mod server;
 
@@ -48,19 +48,19 @@ enum Commands {
     Install {
         /// IDs of the agents to install.
         #[arg(value_name = "AGENT_ID", required = true)]
-        agent_id: Vec<String>,
+        agent_ids: Vec<String>,
     },
     /// Remove one or more installed agents from the local cache and/or package managers.
     Uninstall {
         /// IDs of the agents to uninstall.
         #[arg(value_name = "AGENT_ID", required = true)]
-        agent_id: Vec<String>,
+        agent_ids: Vec<String>,
     },
     /// Update one or more installed agents to the registry's latest distribution.
     Update {
         /// IDs of the agents to update.
         #[arg(value_name = "AGENT_ID", required = true)]
-        agent_id: Vec<String>,
+        agent_ids: Vec<String>,
     },
     /// Install Deno or uv when no compatible local toolchain exists.
     InstallEnv {
@@ -285,16 +285,16 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 AgentOutputFormat::Tsv
             };
             if installed {
-                let installed = crate::installer::agents::installed_agents()
+                let installed = crate::installer::lifecycle::installed_agents()
                     .await
                     .context("failed to list installed agents")?;
-                agents::write_installed_agents(writer, installed, format)
+                agent_output::write_installed_agents(writer, installed, format)
                     .context("failed to list installed agents")?;
             } else {
                 let registry = crate::registry::fetch_registry()
                     .await
                     .context("failed to list registry agents")?;
-                agents::write_registry_agents(
+                agent_output::write_registry_agents(
                     writer,
                     registry.list_agents().iter().collect(),
                     format,
@@ -303,29 +303,29 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             }
             Ok(CliExit::Success)
         }
-        Commands::Install { agent_id } => {
-            let outcomes = crate::installer::agents::install_agents(&agent_id).await;
+        Commands::Install { agent_ids } => {
+            let outcomes = crate::installer::lifecycle::install_agents(&agent_ids).await;
             report_batch_outcome(writer, &outcomes, "install", |outcome| {
-                agents::InstallMessage(outcome).to_string()
+                agent_output::InstallMessage(outcome).to_string()
             })
         }
-        Commands::Uninstall { agent_id } => {
-            let outcomes = crate::installer::agents::uninstall_agents(&agent_id).await;
+        Commands::Uninstall { agent_ids } => {
+            let outcomes = crate::installer::lifecycle::uninstall_agents(&agent_ids).await;
             for (_, outcome) in &outcomes {
                 if let Ok(outcome) = outcome {
-                    for warning in agents::uninstall_warnings(outcome) {
+                    for warning in agent_output::uninstall_warnings(outcome) {
                         eprintln!("{warning}");
                     }
                 }
             }
             report_batch_outcome(writer, &outcomes, "uninstall", |outcome| {
-                agents::UninstallMessage(outcome).to_string()
+                agent_output::UninstallMessage(outcome).to_string()
             })
         }
-        Commands::Update { agent_id } => {
-            let outcomes = crate::installer::agents::update_agents(&agent_id).await;
+        Commands::Update { agent_ids } => {
+            let outcomes = crate::installer::lifecycle::update_agents(&agent_ids).await;
             report_batch_outcome(writer, &outcomes, "update", |outcome| {
-                agents::InstallMessage(outcome).to_string()
+                agent_output::InstallMessage(outcome).to_string()
             })
         }
         Commands::InstallEnv { yes } => {
@@ -496,7 +496,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             let registry = crate::registry::fetch_registry()
                 .await
                 .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
-            agents::write_registry_agents(writer, registry.search_agents(&query), format)
+            agent_output::write_registry_agents(writer, registry.search_agents(&query), format)
                 .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
             Ok(CliExit::Success)
         }

@@ -4,7 +4,7 @@ use anyhow::Result;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::installer::environment::{
-    EnvironmentReport, InstallationPlan, InstallationResult, ToolAvailability,
+    EnvironmentReport, InstallationPlan, InstalledTool, ToolAvailability,
 };
 
 pub(super) fn write_detection_report<W: Write>(
@@ -66,7 +66,7 @@ pub(super) fn write_installation_start<W: Write>(writer: &mut W) -> Result<()> {
 
 pub(super) fn write_installation_complete<W: Write>(
     writer: &mut W,
-    results: &[InstallationResult],
+    results: &[InstalledTool],
 ) -> Result<()> {
     writeln!(writer)?;
     for result in results {

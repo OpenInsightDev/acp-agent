@@ -138,7 +138,7 @@ impl InstallTarget {
 
 /// Verified result of installing one local toolchain.
 #[derive(Debug, Clone)]
-pub struct InstallationResult {
+pub struct InstalledTool {
     /// Installed toolchain.
     pub target: InstallTarget,
     /// Verified executable path.
@@ -173,17 +173,17 @@ fn detect_tools(programs: &[&'static str]) -> Result<Vec<ToolAvailability>> {
 /// Targets run sequentially in plan order so the installers never modify user
 /// directories or shell profiles concurrently, and the first failure aborts
 /// the remaining targets with an explicit error.
-pub async fn install_plan(plan: &InstallationPlan) -> Result<Vec<InstallationResult>> {
+pub async fn install_plan(plan: &InstallationPlan) -> Result<Vec<InstalledTool>> {
     install_plan_with(plan, install_and_verify).await
 }
 
 async fn install_plan_with<F, Fut>(
     plan: &InstallationPlan,
     install: F,
-) -> Result<Vec<InstallationResult>>
+) -> Result<Vec<InstalledTool>>
 where
     F: Fn(InstallTarget) -> Fut,
-    Fut: Future<Output = Result<InstallationResult>>,
+    Fut: Future<Output = Result<InstalledTool>>,
 {
     let mut results = Vec::with_capacity(plan.targets.len());
     for target in &plan.targets {
@@ -192,7 +192,7 @@ where
     Ok(results)
 }
 
-async fn install_and_verify(target: InstallTarget) -> Result<InstallationResult> {
+async fn install_and_verify(target: InstallTarget) -> Result<InstalledTool> {
     run_installer(target).await?;
     verify_installation(target).await
 }
@@ -229,7 +229,7 @@ fn ensure_installer_prerequisites(target: InstallTarget) -> Result<()> {
     Ok(())
 }
 
-async fn verify_installation(target: InstallTarget) -> Result<InstallationResult> {
+async fn verify_installation(target: InstallTarget) -> Result<InstalledTool> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("unable to determine the home directory"))?;
     let on_path = resolve_program(target.program())?;
     let on_path_available = on_path.is_some();
@@ -249,7 +249,7 @@ async fn verify_installation(target: InstallTarget) -> Result<InstallationResult
     };
 
     verify_program_version(&path, target.label()).await?;
-    Ok(InstallationResult {
+    Ok(InstalledTool {
         target,
         path,
         on_path: on_path_available,
@@ -413,7 +413,7 @@ mod tests {
             let executed = Arc::clone(&executed);
             async move {
                 executed.lock().unwrap().push(target);
-                Ok(InstallationResult {
+                Ok(InstalledTool {
                     target,
                     path: PathBuf::from(format!("/tmp/{}", target.label())),
                     on_path: false,
@@ -446,7 +446,7 @@ mod tests {
                 if target == InstallTarget::Deno {
                     Err(anyhow!("deno installer failed"))
                 } else {
-                    Ok(InstallationResult {
+                    Ok(InstalledTool {
                         target,
                         path: PathBuf::from("/tmp/uv"),
                         on_path: false,
