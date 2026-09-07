@@ -71,7 +71,7 @@ enum Commands {
     /// Run an agent locally over stdio.
     Run {
         agent_id: String,
-        /// Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).
+        /// Activate the agent's yolo/auto-approve mode (injects mapped startup arguments).
         #[arg(long)]
         yolo: bool,
         /// Arguments passed to the agent process. Hyphen-prefixed arguments
@@ -121,7 +121,7 @@ enum Commands {
         /// Maximum number of concurrent agent processes for this route.
         #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_PROCESSES)]
         max_processes: usize,
-        /// Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).
+        /// Activate the agent's yolo/auto-approve mode (injects mapped startup arguments).
         #[arg(long)]
         yolo: bool,
         /// Arguments passed to the agent process.
@@ -305,13 +305,6 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
         }
         Commands::Install { agent_id } => {
             let outcomes = crate::installer::agents::install_agents(&agent_id).await;
-            for (_, outcome) in &outcomes {
-                if let Ok(outcome) = outcome {
-                    for warning in agents::install_warnings(outcome) {
-                        eprintln!("{warning}");
-                    }
-                }
-            }
             report_batch_outcome(writer, &outcomes, "install", |outcome| {
                 agents::InstallMessage(outcome).to_string()
             })
@@ -331,13 +324,6 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
         }
         Commands::Update { agent_id } => {
             let outcomes = crate::installer::agents::update_agents(&agent_id).await;
-            for (_, outcome) in &outcomes {
-                if let Ok(outcome) = outcome {
-                    for warning in agents::install_warnings(outcome) {
-                        eprintln!("{warning}");
-                    }
-                }
-            }
             report_batch_outcome(writer, &outcomes, "update", |outcome| {
                 agents::InstallMessage(outcome).to_string()
             })

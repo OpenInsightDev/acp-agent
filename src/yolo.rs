@@ -3,15 +3,15 @@
 //! ACP does not standardize a "yolo" mode: every agent names its
 //! auto-approve-everything mode differently (Claude uses `bypassPermissions`,
 //! Codex uses `agent-full-access`, Gemini uses `yolo`). This module resolves
-//! the correct command-line flag for a given registry agent id from a curated
+//! the correct command-line arguments for a given registry agent id from a curated
 //! catalog. The catalog is fetched from the published CDN (the update source)
 //! and falls back to the copy bundled with this release when the network is
 //! unavailable.
 //!
 //! The catalog stores only yolo-specific information; everything else (name,
 //! description, distribution) already lives in the public ACP registry. Each
-//! entry contains a startup flag that `--yolo` injects. Agents without a
-//! supported startup flag are not included in the catalog.
+//! entry contains startup arguments that `--yolo` injects. Agents without a
+//! supported startup argument mapping are not included in the catalog.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -40,13 +40,12 @@ pub const EMBEDDED_YOLO_MODES: &str = include_str!("../data/yolo-modes.json");
 // Bound remote lookup so offline use reaches the embedded catalog promptly.
 const YOLO_MODES_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Startup flag mapping for one registry agent.
+/// Startup arguments mapping for one registry agent.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct YoloModeInfo {
-    /// Startup flag (possibly with a value) that activates yolo.
-    #[serde(rename = "flag")]
-    pub cli_flag: String,
+    /// Arguments that activate yolo, preserving each argument boundary.
+    pub args: Vec<String>,
 }
 
 /// The yolo-mode catalog keyed by registry agent id.
@@ -130,21 +129,16 @@ fn embedded_yolo_modes() -> &'static YoloModes {
 
 /// Resolves the command-line arguments that activate yolo for an agent.
 ///
-/// Returns the agent's startup flag (split into tokens so multi-token flags
-/// such as `--permission-mode bypass` work) when one exists.
+/// Returns the agent's startup arguments when a mapping exists.
 pub fn yolo_extra_args_from(catalog: &YoloModes, agent_id: &str) -> Result<Vec<String>> {
     let info = catalog.find(agent_id).ok_or_else(|| {
         anyhow!(
             "no yolo mode mapping known for agent \"{agent_id}\"; \
-             add an entry to data/yolo-modes.json or pass the agent's own flag explicitly"
+             add an entry to data/yolo-modes.json or pass the agent's own arguments explicitly"
         )
     })?;
 
-    Ok(info
-        .cli_flag
-        .split_whitespace()
-        .map(str::to_string)
-        .collect())
+    Ok(info.args.clone())
 }
 
 /// Fetches the catalog from the CDN and resolves the agent's yolo arguments.
@@ -167,10 +161,10 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"{
-        "version": 1,
+        "version": 2,
         "agents": {
-            "gemini": { "flag": "--yolo" },
-            "devin": { "flag": "--permission-mode bypass" }
+            "gemini": { "args": ["--yolo"] },
+            "devin": { "args": ["--permission-mode", "allow all tools"] }
         }
     }"#;
 
@@ -179,15 +173,15 @@ mod tests {
     }
 
     #[test]
-    fn single_token_flag_is_injected() {
-        let args = yolo_extra_args_from(&sample_catalog(), "gemini").expect("gemini has a flag");
+    fn single_token_arguments_are_injected() {
+        let args = yolo_extra_args_from(&sample_catalog(), "gemini").expect("gemini has arguments");
         assert_eq!(args, vec!["--yolo"]);
     }
 
     #[test]
-    fn multi_token_flag_is_split() {
-        let args = yolo_extra_args_from(&sample_catalog(), "devin").expect("devin has a flag");
-        assert_eq!(args, vec!["--permission-mode", "bypass"]);
+    fn argument_boundaries_are_preserved() {
+        let args = yolo_extra_args_from(&sample_catalog(), "devin").expect("devin has arguments");
+        assert_eq!(args, vec!["--permission-mode", "allow all tools"]);
     }
 
     #[test]
@@ -195,7 +189,7 @@ mod tests {
         let error = YoloModes::from_json(
             r#"{
                 "version": 1,
-                "agents": { "qwen-code": { "mode": "yolo" } }
+                "agents": { "qwen-code": { "flag": "--yolo" } }
             }"#,
         )
         .expect_err("protocol-level yolo fields are unsupported");
@@ -219,16 +213,16 @@ mod tests {
     #[test]
     fn embedded_catalog_decodes_and_covers_released_agents() {
         let catalog = embedded_yolo_modes();
-        assert!(catalog.version >= 1);
+        assert!(catalog.version >= 2);
         assert!(catalog.find("codex-acp").is_some());
         assert!(catalog.find("gemini").is_some());
         assert!(catalog.find("claude-acp").is_some());
     }
 
     #[test]
-    fn embedded_catalog_resolves_flags() {
+    fn embedded_catalog_resolves_arguments() {
         let args = yolo_extra_args_from(embedded_yolo_modes(), "codex-acp")
-            .expect("codex-acp has a yolo flag");
+            .expect("codex-acp has yolo arguments");
         assert_eq!(args, vec!["--dangerously-skip-sandbox-and-permissions"]);
     }
 

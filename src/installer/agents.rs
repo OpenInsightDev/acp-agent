@@ -422,20 +422,21 @@ async fn uninstall_npm_package(
     package: &str,
 ) -> Result<UninstallOutcome> {
     let package = bare_package_name(package);
-    if runner == PackageRunner::Npm && program_available("npm")? {
-        if npm_package_installed(package).await? {
-            run_command(
-                "npm",
-                ["uninstall", "--global", package],
-                &format!("npm package {package}"),
-            )
-            .await?;
-            return Ok(UninstallOutcome::PackageManager {
-                agent_id: agent_id.to_string(),
-                runner,
-                package: package.to_string(),
-            });
-        }
+    if runner == PackageRunner::Npm
+        && program_available("npm")?
+        && npm_package_installed(package).await?
+    {
+        run_command(
+            "npm",
+            ["uninstall", "--global", package],
+            &format!("npm package {package}"),
+        )
+        .await?;
+        return Ok(UninstallOutcome::PackageManager {
+            agent_id: agent_id.to_string(),
+            runner,
+            package: package.to_string(),
+        });
     }
     // Deno owns its npm cache and does not create a global launcher.
     Ok(UninstallOutcome::RunnerManaged {

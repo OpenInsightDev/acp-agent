@@ -108,10 +108,10 @@ pub(crate) fn resolve_distribution(
     agent: &RegistryAgent,
 ) -> Result<Option<ResolvedDistribution<'_>>> {
     let platform = Platform::current()?;
-    if let Some(binary) = &agent.distribution.binary {
-        if let Some(target) = binary.for_platform(platform) {
-            return Ok(Some(ResolvedDistribution::Binary { platform, target }));
-        }
+    if let Some(binary) = &agent.distribution.binary
+        && let Some(target) = binary.for_platform(platform)
+    {
+        return Ok(Some(ResolvedDistribution::Binary { platform, target }));
     }
     if let Some(distribution) = &agent.distribution.npx {
         return Ok(Some(ResolvedDistribution::Npm {

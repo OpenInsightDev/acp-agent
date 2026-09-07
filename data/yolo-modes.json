@@ -1,32 +1,32 @@
 {
-  "version": 1,
+  "version": 2,
   "agents": {
     "claude-acp": {
-      "flag": "--dangerously-skip-permissions"
+      "args": ["--dangerously-skip-permissions"]
     },
     "codex-acp": {
-      "flag": "--dangerously-skip-sandbox-and-permissions"
+      "args": ["--dangerously-skip-sandbox-and-permissions"]
     },
     "cursor": {
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "gemini": {
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "qwen-code": {
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "devin": {
-      "flag": "--permission-mode bypass"
+      "args": ["--permission-mode", "bypass"]
     },
     "dirac": {
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "github-copilot-cli": {
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "grok-build": {
-      "flag": "--always-approve"
+      "args": ["--always-approve"]
     }
   }
 }

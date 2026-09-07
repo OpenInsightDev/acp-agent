@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 
@@ -56,12 +57,20 @@ pub(crate) fn binary_cache_use_lock_path(paths: &BinaryCachePaths) -> PathBuf {
     ))
 }
 
-/// Acquires an exclusive advisory lock for one cache key.
-///
-/// `fd-lock` may block while another process publishes or removes the entry,
-/// so the blocking operation is isolated on a Tokio blocking worker.
-pub(crate) async fn acquire_binary_cache_lock(paths: &BinaryCachePaths) -> Result<BinaryCacheLock> {
-    let lock_path = binary_cache_lock_path(paths);
+#[derive(Clone, Copy)]
+enum CacheLockMode {
+    Read,
+    Write,
+    TryWrite,
+}
+
+/// Runs the blocking file-lock operation on a Tokio blocking worker and keeps
+/// the OS guard alive until the async owner drops its release token.
+async fn acquire_cache_lock(
+    lock_path: PathBuf,
+    mode: CacheLockMode,
+    lock_name: &'static str,
+) -> Result<Option<BinaryCacheLock>> {
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std_mpsc::channel::<()>();
     tokio::task::spawn_blocking(move || {
@@ -78,27 +87,65 @@ pub(crate) async fn acquire_binary_cache_lock(paths: &BinaryCachePaths) -> Resul
                 return;
             }
         };
-        let mut lock = fd_lock::RwLock::new(file);
-        let guard = match lock.write() {
-            Ok(guard) => guard,
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
-                return;
-            }
-        };
-        if ready_tx.send(Ok(())).is_err() {
-            return;
+        match mode {
+            CacheLockMode::Read => match file.lock_shared() {
+                Ok(()) => hold_cache_lock(file, ready_tx, release_rx),
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
+            },
+            CacheLockMode::Write => match file.lock() {
+                Ok(()) => hold_cache_lock(file, ready_tx, release_rx),
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
+            },
+            CacheLockMode::TryWrite => match file.try_lock() {
+                Ok(()) => hold_cache_lock(file, ready_tx, release_rx),
+                Err(TryLockError::WouldBlock) => {
+                    let _ = ready_tx.send(Ok(false));
+                }
+                Err(TryLockError::Error(error)) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
+            },
         }
-        let _ = release_rx.recv();
-        drop(guard);
     });
+
     match ready_rx.await {
-        Ok(Ok(())) => Ok(BinaryCacheLock {
+        Ok(Ok(true)) => Ok(Some(BinaryCacheLock {
             release: Some(release_tx),
-        }),
-        Ok(Err(error)) => Err(anyhow!("failed to acquire cache lock: {error}")),
-        Err(_) => Err(anyhow!("cache lock task terminated unexpectedly")),
+        })),
+        Ok(Ok(false)) => Ok(None),
+        Ok(Err(error)) => Err(anyhow!("failed to acquire {lock_name}: {error}")),
+        Err(_) => Err(anyhow!("{lock_name} task terminated unexpectedly")),
     }
+}
+
+fn hold_cache_lock(
+    file: File,
+    ready_tx: tokio::sync::oneshot::Sender<Result<bool, String>>,
+    release_rx: std_mpsc::Receiver<()>,
+) {
+    if ready_tx.send(Ok(true)).is_ok() {
+        let _ = release_rx.recv();
+    }
+    drop(file);
+}
+
+/// Acquires an exclusive advisory lock for one cache key.
+///
+/// The standard-library file lock may block while another process publishes or
+/// removes the entry, so the blocking operation is isolated on a Tokio blocking
+/// worker.
+pub(crate) async fn acquire_binary_cache_lock(paths: &BinaryCachePaths) -> Result<BinaryCacheLock> {
+    acquire_cache_lock(
+        binary_cache_lock_path(paths),
+        CacheLockMode::Write,
+        "cache lock",
+    )
+    .await?
+    .ok_or_else(|| anyhow!("cache lock was not acquired"))
 }
 
 /// Acquires a shared cache-key lease for a process that will execute the
@@ -107,44 +154,13 @@ pub(crate) async fn acquire_binary_cache_lock(paths: &BinaryCachePaths) -> Resul
 pub(crate) async fn acquire_binary_cache_use_read_lock(
     paths: &BinaryCachePaths,
 ) -> Result<BinaryCacheLock> {
-    let lock_path = binary_cache_use_lock_path(paths);
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std_mpsc::channel::<()>();
-    tokio::task::spawn_blocking(move || {
-        let file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
-                return;
-            }
-        };
-        let lock = fd_lock::RwLock::new(file);
-        let guard = match lock.read() {
-            Ok(guard) => guard,
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
-                return;
-            }
-        };
-        if ready_tx.send(Ok(())).is_err() {
-            return;
-        }
-        let _ = release_rx.recv();
-        drop(guard);
-    });
-    match ready_rx.await {
-        Ok(Ok(())) => Ok(BinaryCacheLock {
-            release: Some(release_tx),
-        }),
-        Ok(Err(error)) => Err(anyhow!("failed to acquire cache use lock: {error}")),
-        Err(_) => Err(anyhow!("cache use-lock task terminated unexpectedly")),
-    }
+    acquire_cache_lock(
+        binary_cache_use_lock_path(paths),
+        CacheLockMode::Read,
+        "cache use lock",
+    )
+    .await?
+    .ok_or_else(|| anyhow!("cache use lock was not acquired"))
 }
 
 /// Acquires the exclusive payload-use lock used before replacing or deleting
@@ -152,44 +168,13 @@ pub(crate) async fn acquire_binary_cache_use_read_lock(
 pub(crate) async fn acquire_binary_cache_use_write_lock(
     paths: &BinaryCachePaths,
 ) -> Result<BinaryCacheLock> {
-    let lock_path = binary_cache_use_lock_path(paths);
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std_mpsc::channel::<()>();
-    tokio::task::spawn_blocking(move || {
-        let file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
-                return;
-            }
-        };
-        let mut lock = fd_lock::RwLock::new(file);
-        let guard = match lock.write() {
-            Ok(guard) => guard,
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
-                return;
-            }
-        };
-        if ready_tx.send(Ok(())).is_err() {
-            return;
-        }
-        let _ = release_rx.recv();
-        drop(guard);
-    });
-    match ready_rx.await {
-        Ok(Ok(())) => Ok(BinaryCacheLock {
-            release: Some(release_tx),
-        }),
-        Ok(Err(error)) => Err(anyhow!("failed to acquire cache use lock: {error}")),
-        Err(_) => Err(anyhow!("cache use-lock task terminated unexpectedly")),
-    }
+    acquire_cache_lock(
+        binary_cache_use_lock_path(paths),
+        CacheLockMode::Write,
+        "cache use lock",
+    )
+    .await?
+    .ok_or_else(|| anyhow!("cache use lock was not acquired"))
 }
 
 /// Attempts to acquire a cache key without waiting for another process.
@@ -198,49 +183,12 @@ pub(crate) async fn acquire_binary_cache_use_write_lock(
 pub(crate) async fn try_acquire_binary_cache_lock(
     paths: &BinaryCachePaths,
 ) -> Result<Option<BinaryCacheLock>> {
-    let lock_path = binary_cache_lock_path(paths);
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std_mpsc::channel::<()>();
-    tokio::task::spawn_blocking(move || {
-        let file = match std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
-                return;
-            }
-        };
-        let mut lock = fd_lock::RwLock::new(file);
-        let guard = match lock.try_write() {
-            Ok(guard) => guard,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                let _ = ready_tx.send(Ok(false));
-                return;
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
-                return;
-            }
-        };
-        if ready_tx.send(Ok(true)).is_err() {
-            return;
-        }
-        let _ = release_rx.recv();
-        drop(guard);
-    });
-    match ready_rx.await {
-        Ok(Ok(true)) => Ok(Some(BinaryCacheLock {
-            release: Some(release_tx),
-        })),
-        Ok(Ok(false)) => Ok(None),
-        Ok(Err(error)) => Err(anyhow!("failed to acquire cache lock: {error}")),
-        Err(_) => Err(anyhow!("cache lock task terminated unexpectedly")),
-    }
+    acquire_cache_lock(
+        binary_cache_lock_path(paths),
+        CacheLockMode::TryWrite,
+        "cache lock",
+    )
+    .await
 }
 
 pub(crate) struct BinaryCacheLock {

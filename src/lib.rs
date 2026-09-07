@@ -32,5 +32,5 @@ pub mod runner;
 pub mod serve;
 /// Live named ACP instances managed by the foreground daemon over a user-scoped Unix socket.
 pub mod server;
-/// Embedded yolo-mode catalog and per-agent flag resolution for `--yolo`.
+/// Embedded yolo-mode catalog and per-agent argument resolution for `--yolo`.
 pub mod yolo;

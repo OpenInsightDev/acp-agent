@@ -457,8 +457,7 @@ fn append_install_log_inner(path: &Path, line: &str) -> std::io::Result<()> {
         .write(true)
         .truncate(false)
         .open(install_log_lock_path(path))?;
-    let mut lock = fd_lock::RwLock::new(lock_file);
-    let _guard = lock.write()?;
+    lock_file.lock()?;
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)

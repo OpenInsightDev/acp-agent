@@ -8,8 +8,8 @@ The process-lifecycle finding has been applied as a destructive change.
 
 1. Completed: Remove process-tree management and keep cancellation scoped to direct child processes on Unix.
 2. Completed: Remove unsupported YOLO protocol modes from the active model.
-3. Medium: Replace whitespace splitting for multi-token YOLO flags.
-4. Medium: Share registry snapshots across batch operations.
+3. Completed: Preserve multi-token YOLO arguments with an array catalog schema.
+4. Completed: Share registry snapshots across batch operations.
 5. Completed: Consolidate repeated route configuration and distinguish mount prefixes from public route prefixes.
 6. Completed: Centralize distribution priority and remove duplicate runner enums.
 7. Completed: Narrow `ArchiveLimits` visibility and replace the protocol framing, batch concurrency, and hex helpers with established utilities.
@@ -38,43 +38,33 @@ The crate is explicitly Unix-only, so no non-Unix lifecycle fallback is maintain
 
 **Locations:** `src/yolo.rs` and `data/yolo-modes.json`.
 
-`YoloModeInfo` now models only the startup CLI flag injected by `--yolo`. The unsupported `mode` and `option` fields, `YoloConfigOption`, `has_no_yolo`, and the protocol-level error branches have been removed.
+`YoloModeInfo` now models only the startup arguments injected by `--yolo`. The unsupported `mode` and `option` fields, `YoloConfigOption`, `has_no_yolo`, and the protocol-level error branches have been removed.
 
-The catalog uses `deny_unknown_fields`, so ACP `session/set_mode` and `session/set_config_option` entries are rejected instead of being silently accepted as future-compatible data. Entries without a supported CLI flag are not included in the catalog.
+The catalog uses `deny_unknown_fields`, so ACP `session/set_mode` and `session/set_config_option` entries are rejected instead of being silently accepted as future-compatible data. Entries without a supported startup argument mapping are not included in the catalog.
 
-### 3. YOLO Arguments Are Parsed with `split_whitespace`
-
-**Priority:** Medium.
-
-**Location:** `src/yolo.rs:161-177`.
-
-The current parser splits a catalog string with `split_whitespace`.
-
-This cannot preserve quoted or escaped argument values such as `--prompt "allow all tools"`.
-
-The parser can therefore produce incorrect process arguments for valid shell-like catalog entries.
-
-**Recommendation:** Prefer an array schema such as `{ "args": ["--prompt", "allow all tools"] }`.
-
-Use a dedicated shell-token parser only as a compatibility layer for the existing string schema, and never execute catalog values through a shell.
-
-### 4. `stale_cache_entries_removed` Represents an Unreachable Production State
+### 3. YOLO Arguments Were Parsed with `split_whitespace`
 
 **Priority:** Medium.
 
-**Locations:** `src/installer/agents.rs:39-52`, `src/installer/agents.rs:201-210`, `src/installer/agents.rs:259-267`, and `src/commands/agents.rs` warning handling.
+**Status:** Completed.
 
-`InstallOutcome::Binary` exposes `stale_cache_entries_removed`, but current production constructors always set it to `false`.
+**Locations:** `src/yolo.rs` and `data/yolo-modes.json`.
 
-The implementation explicitly defers cache cleanup to a future garbage-collection operation.
+The catalog now stores startup arguments as an array, so values containing whitespace retain one argument boundary and no shell-like parser is needed.
 
-The field nevertheless propagates through the result model and CLI warning logic.
+The decoder rejects the old string field through `deny_unknown_fields`, keeping the catalog schema explicit.
 
-This is an unsupported future state embedded in every binary installation result.
+### 4. `stale_cache_entries_removed` Represented an Unreachable Production State
 
-**Recommendation:** Remove the field and its warning branch until a real cache garbage-collection operation exists.
+**Priority:** Medium.
 
-A future garbage-collection command can return its own cleanup result without expanding every install result.
+**Status:** Completed.
+
+**Locations:** `src/installer/agents.rs` and `src/commands/agents.rs`.
+
+`InstallOutcome::Binary` contains only the binary installation result that production actually produces.
+
+The unused cache-cleanup field and its warning path have been removed until a real garbage-collection operation exists.
 
 ### 5. Route Configuration Is Repeated Across Layers
 
@@ -126,19 +116,17 @@ Batch install, update, and uninstall now fetch one registry snapshot at the batc
 
 Registry-fetch failures are reported for each requested agent without starting distribution work. Uninstall preserves the existing fallback: if cached binaries were removed, it still succeeds and records the registry error so package-manager distributions can be inspected later.
 
-### 8. Cache Lock Acquisition Contains Mechanical Duplication
+### 8. Cache Lock Acquisition Contained Mechanical Duplication
 
 **Priority:** Medium.
 
-**Locations:** `src/installer/cache.rs:63-244`.
+**Status:** Completed.
 
-The blocking worker, readiness channel, release channel, guard lifetime, and error handling are repeated by exclusive, shared, write-use, and try-lock functions.
+**Locations:** `src/installer/cache.rs` and `src/installer/binary.rs`.
 
-These lock modes have different correctness purposes and should not be collapsed into one generic mutex abstraction.
+The async-to-blocking bridge is now shared by publish locks, read leases, write leases, and try-lock cleanup while preserving their distinct modes.
 
-The surrounding acquisition protocol can nevertheless be centralized behind an internal helper parameterized by lock mode and try-lock behavior.
-
-**Recommendation:** Extract the common async-to-blocking lock bridge while preserving the distinct publish, read-lease, write-lease, and cleanup semantics.
+The implementation uses the Rust standard library file-lock API, so the crate no longer depends on `fd-lock`.
 
 ### 9. `PackageRunner` and `InstallMethod` Duplicate the Same Enum
 
@@ -254,9 +242,9 @@ The protocol layer should be simplified only when its compatibility and frame-si
 
 1. Completed: Remove process-tree management and define direct-child cancellation as the Unix-only platform contract.
 2. Completed: Remove unreachable YOLO protocol fields from the active model and catalog.
-3. Replace whitespace splitting for multi-token YOLO flags.
-4. Remove `stale_cache_entries_removed`.
+3. Completed: Preserve multi-token YOLO arguments with an array catalog schema.
+4. Completed: Remove `stale_cache_entries_removed`.
 5. Completed: Share registry snapshots and centralize distribution resolution.
-6. Consolidate route configuration and cache-lock plumbing.
+6. Completed: Consolidate route configuration and cache-lock plumbing.
 7. Completed: Merge the duplicate runner enums and narrow `ArchiveLimits` visibility.
 8. Completed: Adopt standard codec, concurrency, and hex utilities while preserving the existing protocol and batch semantics.

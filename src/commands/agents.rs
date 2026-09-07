@@ -127,10 +127,6 @@ impl fmt::Display for UninstallMessage<'_> {
     }
 }
 
-pub(super) fn install_warnings(_outcome: &InstallOutcome) -> impl Iterator<Item = String> {
-    std::iter::empty()
-}
-
 pub(super) fn uninstall_warnings(outcome: &UninstallOutcome) -> impl Iterator<Item = String> {
     let warning = match outcome {
         UninstallOutcome::Cache {
@@ -221,10 +217,6 @@ mod tests {
         assert_eq!(
             InstallMessage(&update).to_string(),
             "Installed demo binary at /cache/demo/bin (cache: /cache/demo)"
-        );
-        assert_eq!(
-            install_warnings(&update).collect::<Vec<_>>(),
-            Vec::<String>::new()
         );
 
         let uninstall = UninstallOutcome::Cache {
