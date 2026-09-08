@@ -1,5 +1,20 @@
+use std::fs::File;
+use std::future::Future;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context as TaskContext, Poll};
+
+use anyhow::{Context, Result, anyhow, bail};
+use bzip2::read::BzDecoder;
+use flate2::read::GzDecoder;
+
+use zip::ZipArchive;
+
 use super::paths::{validate_archive_component, validate_archive_path};
-use super::*;
+use super::{ArchiveLimits, BinaryCacheLock};
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) async fn extract_archive(archive_path: PathBuf, destination: PathBuf) -> Result<()> {

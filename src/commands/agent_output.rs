@@ -143,8 +143,11 @@ pub(super) fn uninstall_warnings(outcome: &UninstallOutcome) -> impl Iterator<It
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::installer::lifecycle::InstalledAgent;
+    use super::{
+        AgentOutputFormat, InstallMessage, UninstallMessage, uninstall_warnings,
+        write_installed_agents, write_registry_agents,
+    };
+    use crate::installer::lifecycle::{InstallOutcome, InstalledAgent, UninstallOutcome};
     use crate::registry::Registry;
     use serde_json::json;
 

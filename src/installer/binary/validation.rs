@@ -1,7 +1,19 @@
+use std::io::{self, Read};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use tokio::fs;
+
+use anyhow::{Context, Result, anyhow, bail};
+use sha2::{Digest, Sha256};
+
 use super::archive::check_extraction_cancelled;
 use super::download::hex_encode;
 use super::paths::resolve_cmd_path;
-use super::*;
+use crate::installer::cache::{BinaryCacheLock, BinaryCacheMetadata, BinaryCachePaths};
+
+use super::CachedBinary;
 pub(crate) fn hash_file_sha256_blocking(path: &Path, cancel: &AtomicBool) -> Result<String> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("failed to open executable {}", path.display()))?;

@@ -306,8 +306,9 @@ fn registry_decode_error(reason: impl std::fmt::Display) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::{BinaryDistribution, BinaryTarget, Platform, Registry};
 
     #[test]
     fn decodes_registry_with_binary_distribution() {

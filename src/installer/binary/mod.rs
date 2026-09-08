@@ -1,33 +1,8 @@
-use std::collections::BTreeMap;
-use std::fs::File;
-use std::future::Future;
-use std::io;
-use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
-use std::pin::Pin;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
-use bzip2::read::BzDecoder;
-use flate2::read::GzDecoder;
-use futures::StreamExt;
-use serde_json::to_vec_pretty;
-use sha2::{Digest, Sha256};
-use time::OffsetDateTime;
-use tokio::fs;
-use zip::ZipArchive;
-
-use crate::installer::cache::{
-    AGENTS_DIR, BinaryCacheLock, BinaryCacheMetadata, BinaryCachePaths, EXTRACTED_DIR_NAME,
-    METADATA_FILE_NAME, acquire_binary_cache_lock, acquire_binary_cache_use_read_lock,
-    acquire_binary_cache_use_write_lock, binary_cache_paths_with_digest, cache_root_dir,
-    platform_cache_key, safe_path_component, try_acquire_binary_cache_lock,
-};
-use crate::registry::{BinaryTarget, Platform, RegistryAgent};
+use crate::installer::cache::BinaryCacheLock;
 
 /// Name of the human-readable install log written into the cache root.
 ///
@@ -114,6 +89,15 @@ pub use recovery::clean_stale_staging_entries;
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use sha2::{Digest, Sha256};
+    use tokio::fs;
+
     use super::archive::{extract_archive_blocking, extract_zip, extract_zip_with_limits};
     use super::download::{
         download_archive, download_archive_with_limits, hex_encode, verify_sha256,
@@ -125,10 +109,15 @@ mod tests {
     use super::recovery::clean_stale_staging_entries_in;
     use super::staging::PreparedStaging;
     use super::validation::{hash_payload_sha256, make_executable, validate_cached_binary};
-    use super::*;
-    use crate::installer::cache::BinaryCacheMetadata;
-    use crate::installer::cache::binary_cache_paths;
-    use crate::registry::{AgentDistribution, BinaryDistribution};
+    use super::{ArchiveLimits, CachedBinary, INSTALL_LOG_MAX_BYTES};
+    use crate::installer::cache::{
+        BinaryCacheMetadata, EXTRACTED_DIR_NAME, METADATA_FILE_NAME, acquire_binary_cache_lock,
+        acquire_binary_cache_use_read_lock, acquire_binary_cache_use_write_lock,
+        binary_cache_paths, binary_cache_paths_with_digest,
+    };
+    use crate::registry::{
+        AgentDistribution, BinaryDistribution, BinaryTarget, Platform, RegistryAgent,
+    };
     use std::time::Duration;
     use tempfile::tempdir;
 

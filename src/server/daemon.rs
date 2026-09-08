@@ -267,17 +267,6 @@ pub(super) async fn instance_for(
 use super::validation::validate_name;
 
 #[cfg(test)]
-use super::control::{run_supervisor_loop, success};
-#[cfg(test)]
-use super::projection::{public_address, readiness_result};
-#[cfg(test)]
-use super::routes::dispatch_instance;
-#[cfg(test)]
-use super::routes::{rewrite_route_prefix, route_matches};
-#[cfg(test)]
-use super::validation::validate_route;
-
-#[cfg(test)]
 fn validate_agent_id(id: &str) -> std::result::Result<(), DaemonOperationError> {
     if super::validation::validate_agent_id(id) {
         Ok(())
@@ -303,20 +292,31 @@ pub(super) async fn ensure_running(
 
 #[cfg(test)]
 mod tests {
+    use super::super::control::{run_supervisor_loop, success};
+    use super::super::projection::{public_address, readiness_result};
+    use super::super::routes::{dispatch_instance, rewrite_route_prefix, route_matches};
+    use super::super::validation::{validate_name, validate_route};
     use super::protocol::{
-        self, HealthResult, ProtocolError, ReadinessStatus, Request as ProtocolRequest,
-        RequestEnvelope, Response as ProtocolResponse, ResponseEnvelope, StopInstanceResult,
+        self, CreateInstanceRequest, ErrorCode, HealthResult, InstanceResult, InstanceState,
+        ProtocolError, ReadinessStatus, Request as ProtocolRequest, RequestEnvelope,
+        Response as ProtocolResponse, ResponseEnvelope, StopInstanceResult,
     };
-    use super::*;
+    use super::{
+        SharedSupervisorState, SupervisorState, create_instance, instance_for, stop_instance,
+        validate_agent_id,
+    };
+    use anyhow::Result;
     use axum::http::header;
     use axum::{
         body::Body,
         extract::State,
         http::{Request, StatusCode},
     };
+    use std::time::Duration;
     use tempfile::TempDir;
     use tokio::net::UnixStream;
-    use tokio::net::{TcpStream, UnixListener};
+    use tokio::net::{TcpListener, TcpStream, UnixListener};
+    use tokio::sync::watch;
     use tokio::time::timeout;
 
     fn create_request(name: &str, host: &str, port: u16) -> CreateInstanceRequest {

@@ -86,7 +86,8 @@ fn write_json<W: Write, T: serde::Serialize + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{write_registrations, write_server_list, write_status};
+    use crate::server::{RegistrationRecord, ServerRecord};
 
     fn running_server() -> ServerRecord {
         ServerRecord {

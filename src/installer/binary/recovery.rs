@@ -1,4 +1,13 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use tokio::fs;
+
+use crate::installer::cache::{
+    AGENTS_DIR, BinaryCachePaths, EXTRACTED_DIR_NAME, METADATA_FILE_NAME, cache_root_dir,
+    try_acquire_binary_cache_lock,
+};
 /// Removes staging and backup directories left behind by interrupted installs.
 ///
 /// [`cache_binary_target`] stages new caches in a `tempfile` directory that is

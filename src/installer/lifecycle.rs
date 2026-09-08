@@ -609,9 +609,15 @@ mod tests {
     use tempfile::tempdir;
     use tokio::fs;
 
-    use super::*;
+    use super::{
+        RegistrySnapshot, UninstallOutcome, bare_package_name, deno_cache_args,
+        install_from_registry, npm_list_contains, run_concurrently, uninstall_from, update_from,
+        uv_tool_name,
+    };
     use crate::installer::cache::{BinaryCacheMetadata, binary_cache_paths};
-    use crate::registry::{AgentDistribution, BinaryDistribution, BinaryTarget};
+    use crate::registry::{
+        AgentDistribution, BinaryDistribution, BinaryTarget, Platform, Registry, RegistryAgent,
+    };
 
     fn sample_agent() -> RegistryAgent {
         RegistryAgent {

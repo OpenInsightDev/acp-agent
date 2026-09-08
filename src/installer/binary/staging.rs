@@ -1,11 +1,25 @@
-use super::archive::check_extraction_cancelled;
-use super::archive::extract_archive_with_cleanup;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context as TaskContext, Poll};
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::to_vec_pretty;
+use tokio::fs;
+
+use super::ArchiveLimits;
+use super::archive::{check_extraction_cancelled, extract_archive_with_cleanup};
 use super::download::download_archive;
 use super::paths::resolve_cmd_path;
 use super::validation::{
     hash_file_sha256_blocking, hash_payload_sha256_blocking, make_executable_blocking,
 };
-use super::*;
+use crate::installer::cache::{
+    BinaryCacheLock, BinaryCacheMetadata, EXTRACTED_DIR_NAME, METADATA_FILE_NAME,
+};
+use crate::registry::BinaryTarget;
 pub(crate) async fn prepare_staging_directory(
     staging: tempfile::TempDir,
     target: &BinaryTarget,

@@ -304,9 +304,15 @@ async fn run_command(spec: CommandSpec, agent_id: &str) -> Result<ExitStatus> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::registry::{AgentDistribution, NpxDistribution, UvxDistribution};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        CommandSpec, PackageRunner, ResolvedDistribution, npm_command_spec, npm_package_runner,
+        resolve_agent_config_from_registry_agent, resolve_distribution,
+    };
+    use crate::registry::{
+        AgentDistribution, Environment, NpxDistribution, RegistryAgent, UvxDistribution,
+    };
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()

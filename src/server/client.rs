@@ -442,8 +442,11 @@ fn protocol_error(error: ProtocolError) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::server::protocol::ReadinessResult;
+    use super::{
+        DaemonClientError, ErrorCode, InstanceResult, InstanceState, ReadinessStatus,
+        RegistrationResult, protocol_error, registration_record, server_record,
+    };
+    use crate::server::protocol::{ProtocolError, ReadinessResult};
 
     #[test]
     fn maps_protocol_errors_to_stable_typed_messages() {

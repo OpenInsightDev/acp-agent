@@ -1,4 +1,11 @@
-use super::*;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use time::OffsetDateTime;
+
+use super::{CachedBinary, INSTALL_LOG_FILE_NAME, INSTALL_LOG_MAX_BYTES, INSTALL_LOG_TAIL_BYTES};
+use crate::installer::cache::{cache_root_dir, platform_cache_key};
+use crate::registry::{Platform, RegistryAgent};
 /// Appends one line per binary install attempt to `agent-install.log`.
 ///
 /// Successes are logged too (cache hits included): a `ready` line is the only

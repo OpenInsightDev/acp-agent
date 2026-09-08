@@ -532,7 +532,8 @@ fn signal_exit_code(status: ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Cli, CliExit, Commands, ServerCommands, report_batch_outcome, resolve_mount_path};
+    use clap::Parser;
 
     #[test]
     fn batch_outcome_is_all_or_nothing_success() {

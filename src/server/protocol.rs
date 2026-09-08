@@ -481,8 +481,13 @@ pub(crate) struct ProtocolError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::{os::unix::fs::PermissionsExt, path::Path};
+    use super::{
+        CreateInstanceRequest, ErrorCode, MAX_FRAME_SIZE, MAX_SOCKET_PATH_BYTES, PROTOCOL_VERSION,
+        ProtocolError, ReadinessResult, ReadinessStatus, RegistrationResult, RegistrationsResult,
+        Request, RequestEnvelope, Response, ResponseEnvelope, bind_daemon_socket_at,
+        default_socket_path, read_frame, socket_path_from, write_frame,
+    };
+    use std::{ffi::OsString, os::unix::fs::PermissionsExt, path::Path};
     use tokio::io::{AsyncWriteExt, duplex};
 
     fn sample_request() -> RequestEnvelope {

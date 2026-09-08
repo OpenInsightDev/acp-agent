@@ -126,8 +126,8 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use super::*;
-    use tokio::io::AsyncRead;
+    use super::prompt_for_installation;
+    use tokio::io::{AsyncBufRead, AsyncRead};
 
     #[tokio::test]
     async fn prompts_default_to_yes_on_empty_input() {

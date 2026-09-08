@@ -552,8 +552,17 @@ async fn remove_empty_cache_parents(root_dir: &Path, cache_dir: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::Path;
+
+    use super::{
+        BinaryCacheMetadata, BinaryCachePaths, METADATA_FILE_NAME, acquire_binary_cache_lock,
+        acquire_binary_cache_use_read_lock, binary_cache_paths, binary_cache_paths_with_digest,
+        list_cached_agents, remove_cached_agent, remove_cached_platform_except,
+        safe_path_component,
+    };
+    use crate::registry::Platform;
     use tempfile::tempdir;
+    use tokio::fs;
 
     #[test]
     fn builds_binary_cache_paths_under_namespace() {

@@ -1,4 +1,6 @@
-use super::*;
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Result, anyhow, bail};
 
 pub(crate) fn validate_archive_path(path: &Path) -> Result<()> {
     let text = path

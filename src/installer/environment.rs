@@ -332,8 +332,15 @@ fn display_status(status: ExitStatus) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
+    use super::{
+        EnvironmentReport, InstallTarget, InstallationPlan, InstalledTool, JS_TOOLS, PYTHON_TOOLS,
+        ToolAvailability, install_plan_with, plan_installation, resolve_program,
+        verify_installation,
+    };
     use crate::installer::test_support::ENV_LOCK;
+    use anyhow::anyhow;
 
     fn report(js_available: &[&str], python_available: &[&str]) -> EnvironmentReport {
         EnvironmentReport {

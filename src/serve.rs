@@ -1124,7 +1124,20 @@ async fn readyz(State(health): State<AgentHealth>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        AdmissionState, AgentHealth, AgentStderr, LaunchGuard, LaunchState, RouteConfig, Router,
+        STDERR_TAIL_BYTES, ServeOptions, agent_router, agent_router_with_stderr, cors_options,
+        http_server_options, recover_lock, serve_config, serve_listener, validate_mount_path,
+    };
+
+    use agent_client_protocol::AcpAgentConfig;
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::sync::watch;
+    use tokio::time::timeout;
 
     #[test]
     fn rejects_invalid_endpoint_and_cors_configuration() {
@@ -1483,9 +1496,13 @@ mod tests {
         };
 
         use serde_json::{Value, json};
+        use std::sync::atomic::Ordering;
         use tokio::time::{sleep, timeout};
 
-        use super::*;
+        use super::{
+            AcpAgentConfig, AgentStderr, RouteConfig, Router, ServeOptions, StatusCode,
+            TcpListener, agent_router_with_stderr, serve_listener, validate_mount_path, watch,
+        };
 
         const CONNECTION_ID: &str = "acp-connection-id";
         const INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#;

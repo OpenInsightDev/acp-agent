@@ -1,5 +1,13 @@
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use futures::StreamExt;
+use sha2::{Digest, Sha256};
+
+use super::ArchiveLimits;
 use super::paths::validate_archive_component;
-use super::*;
+use crate::registry::BinaryTarget;
 pub(crate) async fn download_archive(target: &BinaryTarget, temp_dir: &Path) -> Result<PathBuf> {
     download_archive_with_limits(target, temp_dir, ArchiveLimits::default()).await
 }

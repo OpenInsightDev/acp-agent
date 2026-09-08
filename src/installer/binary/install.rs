@@ -1,9 +1,20 @@
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, anyhow};
+use tokio::fs;
+
+use super::CachedBinary;
 use super::download::parse_sha256;
 use super::log::{record_install_log, record_install_log_in};
 use super::publication::promote_prepared_cache;
 use super::staging::prepare_staging_directory;
 use super::validation::validate_cached_binary_with_lease;
-use super::*;
+use crate::installer::cache::{
+    BinaryCacheMetadata, acquire_binary_cache_lock, acquire_binary_cache_use_read_lock,
+    acquire_binary_cache_use_write_lock, binary_cache_paths_with_digest, cache_root_dir,
+};
+use crate::registry::{BinaryTarget, Platform, RegistryAgent};
 /// Ensures the current binary target exists in the stable local cache.
 ///
 /// Every attempt (cache hit, fresh install, or failure) is appended to the

@@ -158,7 +158,7 @@ pub async fn resolve_args(agent_id: &str, enabled: bool, args: Vec<String>) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{YoloModes, embedded_yolo_modes, resolve_args, yolo_extra_args_from};
 
     const SAMPLE: &str = r#"{
         "version": 2,

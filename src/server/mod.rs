@@ -128,7 +128,7 @@ pub struct UnregisterResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{ServerRecord, StartOptions};
     use crate::server::{
         routes::route_matches,
         validation::{validate_name, validate_route},
