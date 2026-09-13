@@ -24,7 +24,7 @@ acp-agent search codex
 acp-agent install-env --yes
 acp-agent install codex-acp
 # install several agents concurrently
-acp-agent install codex-acp claude dev
+acp-agent install codex-acp claude-acp devin
 ```
 
 `install-env` installs Deno or uv when a compatible JavaScript or Python toolchain is unavailable.
@@ -204,31 +204,26 @@ The daemon and registered agents write diagnostics to standard error. Run `acp-a
 
 ## Local Cache
 
-Binary agents are cached and managed by `acp-agent`. `npx` and `uvx` agents are executed on demand by their respective runners (`npm exec`, `deno x`, and `uvx`); `install` prepares the same runner cache that `run`/`serve` will read, so installation and execution share one lifecycle:
+Binary agents are cached and managed by `acp-agent`. Package-based agents are installed and run through the same runner resolution used by `run` and `serve`: npm distributions use `npm install --global` and `npm exec` when npm is available, falling back to Deno's npm cache and `deno x` when npm is unavailable; uvx distributions use `uv tool install` and `uvx`.
 
-- **npm** — the package is installed globally, which `npm exec` finds first;
-- **uv** — the tool is installed with `uv tool install`, which `uvx` prefers;
-- **Deno** (when npm is unavailable) — the package is fetched into Deno's npm cache with `deno cache`, which `deno x` reads.
+Binary agents are stored below the platform cache directory returned by the operating system (`~/Library/Caches/acp-agent` on macOS by default, `$XDG_CACHE_HOME/acp-agent` or `$HOME/.cache/acp-agent` on Linux, `%LOCALAPPDATA%\acp-agent` on Windows, and `/cache/acp-agent` inside the Docker image).
 
-Binary agents are stored in the platform cache directory (`$HOME/.cache/acp-agent` on macOS and Linux, `%LOCALAPPDATA%\acp-agent` on Windows, `/cache/acp-agent` inside the Docker image).
-
-List agents installed locally:
+List cached binary agents locally:
 
 ```sh
 acp-agent list --installed
 ```
 
-- Add `--json` to return the installed records as structured JSON, including their cache and executable paths.
+- Add `--json` to return the cached binary records as structured JSON, including their cache and executable paths. Package-manager installations are not included.
 
-Remove an agent from the local cache, and uninstall any npm/uv launcher that `install` created. Deno-managed packages have nothing to remove: their cache belongs to Deno, which garbage-collects it:
+Remove a cached binary, or uninstall a package-based agent through the package manager that installed it. For Deno-installed npm distributions, there is no global launcher to remove because Deno owns the npm cache:
 
 ```sh
 acp-agent uninstall codex-acp
-acp-agent uninstall codex-acp claude dev # uninstall multiple agents
+acp-agent uninstall codex-acp claude-acp devin # uninstall multiple agents
 ```
 
-Digest-keyed binary updates keep older validated cache entries in place so a running server can continue using the executable it already resolved.
-`uninstall` removes all cached versions for the agent.
+For binary distributions, `update` installs and verifies the replacement first, then removes older cached versions for the same agent and platform. Digest-keyed cache entries remain available until cleanup, while a running server can continue using the executable it already resolved. Package-based distributions are updated through their package manager:
 
 ```sh
 acp-agent update codex-acp
@@ -238,7 +233,7 @@ acp-agent update codex-acp
 
 The image contains the `acp-agent` CLI and its supported JavaScript/Python toolchains (`deno` and `uv`).
 No agent is preloaded into the image; the first `run` or `serve` command downloads or prepares the selected agent as needed.
-The final image is a small non-root runtime image, using `acp-agent` as the entrypoint.
+The final image is a small Debian runtime image that uses `acp-agent` as the entrypoint and runs as root by default.
 
 ```sh
 docker build -t acp-agent:latest .
@@ -255,10 +250,10 @@ Mount the cache dir `/cache` to a named volume or a fixed host temp dir so the s
 # named volume
 docker run --rm -v acp-agent-cache:/cache acp-agent:latest run codex-acp
 # fixed host dir (e.g. under a scratch dir)
-docker run --rm -v $HOME/.cache/acp-agent:/cache acp-agent:latest run codex-acp
+docker run --rm -v "$PWD/acp-agent-cache:/cache" acp-agent:latest run codex-acp
 ```
 
-The same form works for every CLI command.
+The same form works for one-shot CLI commands. Named servers are background daemons and should be managed from a host or a long-lived container; a `docker run --rm ... server start` container exits when the CLI returns and cannot keep the daemon alive.
 
 ```sh
 docker run --rm acp-agent:latest list
