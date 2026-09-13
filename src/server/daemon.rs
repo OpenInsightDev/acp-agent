@@ -1,7 +1,7 @@
 use super::control;
 
 use super::protocol::{self, CreateInstanceRequest, ErrorCode, InstanceResult, InstanceState};
-use super::{projection, routes};
+use super::{routes, validate_name};
 use anyhow::Result;
 use axum::Router;
 
@@ -10,6 +10,18 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, RwLock, watch};
 
 const INSTANCE_STOP_GRACE: Duration = super::SHUTDOWN_GRACE;
+
+pub(super) fn public_address(address: SocketAddr) -> String {
+    let host = match address.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_string(),
+        ip => match ip {
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        },
+    };
+    format!("http://{host}:{}", address.port())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DaemonPhase {
@@ -52,7 +64,7 @@ impl DaemonInstance {
             name: self.name.clone(),
             host: self.requested_host.clone(),
             port: self.address.port(),
-            address: projection::public_address(self.address),
+            address: public_address(self.address),
             state,
         }
     }
@@ -264,20 +276,6 @@ pub(super) async fn instance_for(
         })
 }
 
-use super::validation::validate_name;
-
-#[cfg(test)]
-fn validate_agent_id(id: &str) -> std::result::Result<(), DaemonOperationError> {
-    if super::validation::validate_agent_id(id) {
-        Ok(())
-    } else {
-        Err(DaemonOperationError::new(
-            ErrorCode::InvalidInput,
-            "agent id must not be empty",
-        ))
-    }
-}
-
 pub(super) async fn ensure_running(
     instance: &DaemonInstance,
 ) -> std::result::Result<(), DaemonOperationError> {
@@ -293,17 +291,18 @@ pub(super) async fn ensure_running(
 #[cfg(test)]
 mod tests {
     use super::super::control::{run_supervisor_loop, success};
-    use super::super::projection::{public_address, readiness_result};
-    use super::super::routes::{dispatch_instance, rewrite_route_prefix, route_matches};
-    use super::super::validation::{validate_name, validate_route};
+    use super::super::routes::{
+        dispatch_instance, readiness_result, rewrite_route_prefix, route_matches,
+    };
+    use super::super::{validate_agent_id, validate_name, validate_route};
     use super::protocol::{
         self, CreateInstanceRequest, ErrorCode, HealthResult, InstanceResult, InstanceState,
         ProtocolError, ReadinessStatus, Request as ProtocolRequest, RequestEnvelope,
         Response as ProtocolResponse, ResponseEnvelope, StopInstanceResult,
     };
+    use super::public_address;
     use super::{
         SharedSupervisorState, SupervisorState, create_instance, instance_for, stop_instance,
-        validate_agent_id,
     };
     use anyhow::Result;
     use axum::http::header;
@@ -754,7 +753,7 @@ mod tests {
         assert!(validate_route("/team/codex").is_ok());
         assert!(validate_route("/").is_err());
         assert!(validate_route("/bad/").is_err());
-        assert!(validate_agent_id("agent").is_ok());
-        assert!(validate_agent_id(" ").is_err());
+        assert!(validate_agent_id("agent"));
+        assert!(!validate_agent_id(" "));
     }
 }

@@ -2,11 +2,11 @@ use super::daemon::{
     DaemonInstance, DaemonOperationError, DaemonPhase, SharedSupervisorState, ensure_running,
     instance_for,
 };
-use super::projection::registration_result;
 use super::protocol::{
-    ErrorCode, RegisterRequest, RegistrationResult, RegistrationsResult, UnregisterResult,
+    ErrorCode, ReadinessResult, ReadinessStatus, RegisterRequest, RegistrationResult,
+    RegistrationsResult, UnregisterResult,
 };
-use super::validation::{validate_agent_id, validate_name, validate_route};
+use super::{validate_agent_id, validate_name, validate_route};
 use axum::{
     body::Body,
     extract::State,
@@ -15,6 +15,7 @@ use axum::{
 };
 use std::{
     hash::{Hash, Hasher},
+    net::SocketAddr,
     sync::Arc,
 };
 use tower::ServiceExt;
@@ -37,6 +38,50 @@ impl Hash for RouteKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
         self.public_route.hash(state);
+    }
+}
+
+pub(super) fn readiness_result(
+    readyz_endpoint: bool,
+    snapshot: crate::serve::ReadinessSnapshot,
+) -> ReadinessResult {
+    let (status, detail) = if !readyz_endpoint {
+        (ReadinessStatus::Disabled, None)
+    } else if snapshot.last_attempt_failed {
+        (
+            ReadinessStatus::NotReady,
+            snapshot.last_failure.map(|failure| failure.detail),
+        )
+    } else {
+        (ReadinessStatus::Ready, None)
+    };
+    ReadinessResult {
+        status,
+        attempts: snapshot.attempts,
+        failures: snapshot.failures,
+        detail,
+    }
+}
+
+pub(super) fn registration_result(
+    name: &str,
+    address: &SocketAddr,
+    route_key: &RouteKey,
+    runtime: &crate::serve::RouteRuntime,
+) -> RegistrationResult {
+    RegistrationResult {
+        name: name.to_string(),
+        id: route_key.id.clone(),
+        route: route_key.public_route.clone(),
+        path: route_key.config.path.clone(),
+        health_endpoint: route_key.config.health_endpoint,
+        readyz_endpoint: route_key.config.readyz_endpoint,
+        address: super::daemon::public_address(*address),
+        max_processes: route_key.config.max_processes,
+        readiness: readiness_result(
+            route_key.config.readyz_endpoint,
+            runtime.readiness_snapshot(),
+        ),
     }
 }
 

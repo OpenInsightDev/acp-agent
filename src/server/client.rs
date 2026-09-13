@@ -4,10 +4,9 @@ use super::protocol::{
     Request as ProtocolRequest, RequestEnvelope, Response as ProtocolResponse, ResponseEnvelope,
     StatusRequest, StopInstanceRequest, UnregisterRequest,
 };
-use super::validation::{validate_name, validate_route};
 use super::{
     RegisterOptions, RegisterResult, RegistrationRecord, ServerRecord, StartOptions, StartResult,
-    StopResult, UnregisterResult,
+    StopResult, UnregisterResult, validate_name, validate_route,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
