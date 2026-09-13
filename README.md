@@ -51,9 +51,9 @@ acp-agent run gemini --yolo
 acp-agent run claude-acp --yolo -- --model opus
 ```
 
-`--yolo` injects the agent's mapped startup flag, e.g. `--yolo` for Gemini, `--dangerously-skip-permissions` for Claude, `--dangerously-skip-sandbox-and-permissions` for Codex.
+`--yolo` injects the agent's mapped startup flag, e.g. `--yolo` for Gemini, `--dangerously-skip-permissions` for Claude, `--dangerously-skip-sandbox-and-permissions` for Codex. The catalog supports startup CLI flags only; ACP session modes and config options are not handled by this command.
 
-> The yolo-mode catalog can be fetched from the CDN (<https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json>).
+> The yolo-mode catalog can be fetched from the CDN (<https://cdn.jsdelivr.net/gh/OpenInsightDev/acp-agent@main/data/yolo-modes.json>). Each entry must contain a `flag` string; entries for unsupported protocol-level modes are invalid.
 
 ## Serve over HTTP
 
@@ -67,20 +67,21 @@ acp-agent serve codex-acp --host 127.0.0.1 --port 8010
 
 `serve` takes the following arguments:
 
-| Argument                 | Default     | Description                                                                  |
-| ------------------------ | ----------- | ---------------------------------------------------------------------------- |
-| `<agent-id>`             | _(required)_ | Agent to serve.                                                              |
-| `--host <host>`          | `127.0.0.1` | Hostname or IP address for the HTTP listener.                                |
-| `--port <port>`          | `0`         | TCP port for the HTTP listener. `0` lets the operating system pick a port.   |
-| [`--subpath <path>`](#serve-subpath)     | _(none)_    | URL prefix applied to all served endpoints (ACP, health, readyz).            |
-| [`--agent-sub-path`](#serve-subpath)     | `false`     | Use the agent id as the subpath (equivalent to `--subpath /<agent-id>`).     |
-| [`--path <path>`](#serve-subpath)        | `/acp`      | ACP HTTP/SSE and WebSocket endpoint path.                                    |
-| [`--cors-origin <origin>`](#cors)        | _(none)_    | Browser origin allowed to access the endpoint. May be repeated.              |
-| [`--allow-any-origin`](#cors)            | `false`     | Allow requests from every browser origin.                                    |
-| [`--no-health`](#health-and-readiness)   | `false`     | Disable the `GET /health` endpoint.                                          |
-| [`--no-readyz`](#health-and-readiness)   | `false`     | Disable the `GET /readyz` agent readiness endpoint.                          |
-| `--yolo`                 | `false`     | Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).|
-| [`-- <args>`](#arguments)    | _(none)_    | Arguments passed to the agent process.                                       |
+| Argument                               | Default      | Description                                                                    |
+| -------------------------------------- | ------------ | ------------------------------------------------------------------------------ |
+| `<agent-id>`                           | _(required)_ | Agent to serve.                                                                |
+| `--host <host>`                        | `127.0.0.1`  | Hostname or IP address for the HTTP listener.                                  |
+| `--port <port>`                        | `0`          | TCP port for the HTTP listener. `0` lets the operating system pick a port.     |
+| [`--subpath <path>`](#serve-subpath)   | _(none)_     | URL prefix applied to all served endpoints (ACP, health, readyz).              |
+| [`--agent-sub-path`](#serve-subpath)   | `false`      | Use the agent id as the subpath (equivalent to `--subpath /<agent-id>`).       |
+| [`--path <path>`](#serve-subpath)      | `/acp`       | ACP HTTP/SSE and WebSocket endpoint path.                                      |
+| [`--cors-origin <origin>`](#cors)      | _(none)_     | Browser origin allowed to access the endpoint. May be repeated.                |
+| [`--allow-any-origin`](#cors)          | `false`      | Allow requests from every browser origin.                                      |
+| [`--no-health`](#health-and-readiness) | `false`      | Disable the `GET /health` endpoint.                                            |
+| [`--no-readyz`](#health-and-readiness) | `false`      | Disable the `GET /readyz` agent readiness endpoint.                            |
+| `--max-processes <n>`                  | `16`         | Maximum concurrent agent processes for this served route.                      |
+| `--yolo`                               | `false`      | Activate the agent's yolo/auto-approve mode (injects the mapped startup flag). |
+| [`-- <args>`](#arguments)              | _(none)_     | Arguments passed to the agent process.                                         |
 
 The server exposes:
 
@@ -93,6 +94,7 @@ The server exposes:
 
 Both ACP transports use `/acp` by default.
 Each connection starts an independent agent process.
+When the process limit is exhausted, new initial connections receive HTTP `503` while health and readiness probes remain available.
 Use `--path` to change the ACP endpoint, `--no-health` to disable the health check, and `--no-readyz` to disable the readiness probe.
 
 Use [`--subpath`](#serve-subpath) to serve under a URL prefix, e.g. a reverse-proxy mount point or a shared host path:
@@ -132,7 +134,15 @@ acp-agent serve codex-acp --port 8010 -- --model gpt-5
 
 ## Named servers
 
-Start a background server and register one or more agents below it:
+Named servers are live in-memory instances owned by one foreground daemon. Start that daemon in one terminal:
+
+```sh
+acp-agent daemon
+```
+
+The daemon accepts CLI control requests on one user-scoped Unix socket. Server commands start the daemon automatically when no daemon is reachable, so running it explicitly is also useful under a service manager. Set `ACP_AGENT_DAEMON_SOCKET` to override the socket path.
+
+In another terminal, create an instance and register agents below it:
 
 ```sh
 acp-agent server start --host 127.0.0.1 --port 8010
@@ -140,32 +150,7 @@ acp-agent server register codex-acp
 acp-agent server register claude --route /reviewer -- --model opus
 ```
 
-`server` exposes the following subcommands and arguments:
-
-| Subcommand  | Argument                      | Default     | Description                                                              |
-| ----------- | ----------------------------- | ----------- | ------------------------------------------------------------------------ |
-| `start`     | `--name <name>`               | `default`   | Local server name used by later commands.                                |
-|             | `--host <host>`               | `127.0.0.1` | Hostname or IP address for the named server listener.                    |
-|             | `--port <port>`               | `8010`      | TCP port for the named server listener. Use `0` for an ephemeral port.   |
-| `stop`      | `--name <name>`               | `default`   | Local server name.                                                       |
-| `register`  | `<agent-id>`                  | _(required)_ | Agent to register under this server.                                    |
-|             | `--name <name>`               | `default`   | Target server name.                                                      |
-|             | `--route <path>` (`--subpath`) | `/<agent-id>` | Public route prefix.                                                    |
-|             | serve-like settings            | —           | [`--path`](#serve-parameters), repeated [`--cors-origin`](#serve-parameters), [`--allow-any-origin`](#serve-parameters), [`--no-health`](#serve-parameters), [`--no-readyz`](#serve-parameters), [`--yolo`](#serve-parameters), and trailing [`-- <args>`](#serve-parameters), as in the [serve parameter table](#serve-parameters). |
-| `unregister`| `<agent-id>`                  | _(required)_ | Agent to remove from the server.                                        |
-|             | `--name <name>`               | `default`   | Target server name.                                                      |
-| `list`      | —                             | —           | List every recorded named server and its lifecycle state.                |
-|             | `--json`                      | off         | Emit server records as structured JSON (deterministic field order).      |
-| `status`    | `--name <name>`               | `default`   | Show one server's state, configured and actual address, PID, and version.|
-|             | `--json`                      | off         | Emit the server record as structured JSON.                               |
-| `registrations`| `--name <name>`             | `default`   | List registered agent IDs, route prefixes, and readiness.                |
-|             | `--json`                      | off         | Emit registration records as structured JSON.                            |
-| `logs`      | `--name <name>`               | `default`   | Tail a named server's log.                                                |
-|             | `--lines <n>`                 | `50`        | Number of log lines to tail.                                             |
-|             | `--json`                      | off         | Emit `{name, lines}` with the tail.                                      |
-
-The server name defaults to `default`.
-Use `--name` on every command to manage another server independently:
+Each named instance owns its public TCP listener and route table inside the daemon. The management socket is separate from those public listeners; named instances expose registered ACP routes, not management operations. The default server name is `default`; use `--name` to manage another instance:
 
 ```sh
 acp-agent server start --name work --port 8020
@@ -174,75 +159,56 @@ acp-agent server unregister codex-acp --name work
 acp-agent server stop --name work
 ```
 
+`server` exposes these subcommands:
+
+| Subcommand      | Arguments                                                     | Description                                                                                   |
+| --------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `start`         | `--name <name>`, `--host <host>`, `--port <port>`             | Create or reuse a named instance and its public listener. Use port `0` for an ephemeral port. |
+| `stop`          | `--name <name>`                                               | Stop and remove a named instance from the daemon.                                             |
+| `register`      | `<agent-id>`, `--name <name>`, `--route <path>` (`--subpath`) | Register an agent route with a named instance.                                                |
+| `unregister`    | `<agent-id>`, `--name <name>`                                 | Remove an agent route from a named instance.                                                  |
+| `list`          | `--json`                                                      | List live named instances owned by the daemon.                                                |
+| `status`        | `--name <name>`, `--json`                                     | Show one live instance's state, listener address, and configuration.                          |
+| `registrations` | `--name <name>`, `--json`                                     | List routes and readiness reported by the daemon.                                             |
+
+The `register` command accepts the same endpoint and agent settings as [`serve`](#serve-parameters): `--path`, repeated [`--cors-origin`](#serve-parameters), [`--allow-any-origin`](#serve-parameters), [`--no-health`](#serve-parameters), [`--no-readyz`](#serve-parameters), [`--max-processes`](#serve-parameters), `--yolo`, and trailing agent arguments.
+
 ### Inspection
 
-`server list` reports every recorded server. Each server has one of four states:
-
-- `running` — the daemon answered its control endpoint.
-- `starting` — the state file exists and the recorded process is alive, but it has not answered yet.
-- `stale` — the state file exists but the recorded process is gone (crash or unclean shutdown); starting the server again replaces it.
-- `stopped` — no state file exists (`status` only).
+`server list`, `server status`, and `server registrations` read the daemon's current in-memory state. `server registrations` uses readiness snapshots maintained by each route runtime; it does not probe public routes from the CLI. Readiness is reported as `ready`, `not_ready` with a failure detail, or `disabled` when the route has no readiness endpoint.
 
 ```sh
 acp-agent server list
 acp-agent server status --name work
 acp-agent server registrations --name work
-acp-agent server logs --name work --lines 20
 ```
 
-`server registrations` probes each route's `/readyz` endpoint and reports `ready`, `not_ready` (with the failure detail), `disabled` (no readyz endpoint), or `unknown`.
-`server logs` tails the daemon's log file.
-Add `--json` to any of these commands for automation-friendly output with deterministic field ordering:
+Add `--json` to these commands for automation-friendly structured output:
 
 ```sh
-acp-agent server list --json | jq '.[] | select(.state == "stale") | .name'
+acp-agent server list --json | jq '.[] | .name'
 acp-agent server registrations --name work --json | jq '.[] | select(.readiness != "ready")'
-acp-agent server logs --name work --json | jq '.lines'
 ```
+
+Named instances and registrations exist only in the running daemon's memory. They are not restored after the daemon restarts; create and register them again.
 
 ### Routes
 
-By default, `server register <agent-id>` creates the public route `/<agent-id>`.
-Its ACP endpoint is `/<agent-id>/acp`, and its health endpoints are `/<agent-id>/health` and `/<agent-id>/readyz`.
-`--route` (also accepted as `--subpath`) changes the public route prefix.
-The register command accepts the same serve-like endpoint and agent settings as [`serve`](#serve-parameters): `--path`, repeated `--cors-origin`, `--allow-any-origin`, `--no-health`, `--no-readyz`, `--yolo`, and trailing agent arguments.
+By default, `server register <agent-id>` creates the public route `/<agent-id>`. Its ACP endpoint is `/<agent-id>/acp`, and its health endpoints are `/<agent-id>/health` and `/<agent-id>/readyz`. `--route` (also accepted as `--subpath`) changes the public route prefix.
 
-### Management API (advanced)
+Registered routes support ACP HTTP/SSE and WebSocket traffic. Unregistering removes the route for new connections; existing connections are allowed to end naturally.
 
-> This API is primarily intended for the CLI's internal use.
+### Logging
 
-The named server exposes `POST /api/agents` to add a route and `DELETE /api/agents` to remove one.
-POST accepts the agent ID, public route, and serve-like settings; it does not accept a target URL or PID:
-
-```json
-{
-  "id": "demo",
-  "route": "/demo",
-  "serve": {
-    "path": "/acp",
-    "cors_origins": [],
-    "allow_any_origin": false,
-    "health_endpoint": true,
-    "readyz_endpoint": true,
-    "yolo": false,
-    "args": ["--model", "gpt-5"]
-  }
-}
-```
-
-DELETE accepts `{"id":"demo"}`.
-Registered routes support ACP HTTP/SSE and WebSocket traffic.
-Unregistering removes the route for new connections; existing connections are allowed to end naturally.
-
-### State and logs
-
-Named server state and logs live below the platform cache directory.
-On Unix, the server directory is mode `0700` and its state and log files are mode `0600`;
-Windows uses the current user's cache-directory ACL.
+The daemon and registered agents write diagnostics to standard error. Run `acp-agent daemon` under a service manager to collect and retain those logs, or redirect the daemon's standard error when running it directly.
 
 ## Local Cache
 
-Binary agents are cached and managed by `acp-agent`, while `npx` and `uvx` agents are installed and managed on demand by their respective tools (`npm`/`npx` and `uv`/`uvx`).
+Binary agents are cached and managed by `acp-agent`. `npx` and `uvx` agents are executed on demand by their respective runners (`npm exec`, `deno x`, and `uvx`); `install` prepares the same runner cache that `run`/`serve` will read, so installation and execution share one lifecycle:
+
+- **npm** — the package is installed globally, which `npm exec` finds first;
+- **uv** — the tool is installed with `uv tool install`, which `uvx` prefers;
+- **Deno** (when npm is unavailable) — the package is fetched into Deno's npm cache with `deno cache`, which `deno x` reads.
 
 Binary agents are stored in the platform cache directory (`$HOME/.cache/acp-agent` on macOS and Linux, `%LOCALAPPDATA%\acp-agent` on Windows, `/cache/acp-agent` inside the Docker image).
 
@@ -254,14 +220,15 @@ acp-agent list --installed
 
 - Add `--json` to return the installed records as structured JSON, including their cache and executable paths.
 
-Remove an agent from the local cache, and uninstall its globally installed npm/uv wrapper when it ships as a package:
+Remove an agent from the local cache, and uninstall any npm/uv launcher that `install` created. Deno-managed packages have nothing to remove: their cache belongs to Deno, which garbage-collects it:
 
 ```sh
 acp-agent uninstall codex-acp
 acp-agent uninstall codex-acp claude dev # uninstall multiple agents
 ```
 
-Stale cached versions are discarded before the preferred distribution is (re)installed:
+Digest-keyed binary updates keep older validated cache entries in place so a running server can continue using the executable it already resolved.
+`uninstall` removes all cached versions for the agent.
 
 ```sh
 acp-agent update codex-acp
@@ -322,7 +289,7 @@ The server is implemented with [`agent-client-protocol-http` 2.0](https://docs.r
 
 ## Contribution
 
-If you know how to enable yolo mode for the acp agent you are using, you are welcome to add new entries to the `data/yolo-modes.json` list.
+If you know a startup CLI flag that enables yolo mode for the ACP agent you are using, you are welcome to add an entry to `data/yolo-modes.json`. The catalog accepts only entries such as `{ "flag": "--yolo" }`; protocol-level modes and config options do not belong in this file.
 
 ## License
 

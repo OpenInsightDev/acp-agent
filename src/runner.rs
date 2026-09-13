@@ -1,22 +1,129 @@
 //! Local ACP agent process execution.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 
 use agent_client_protocol::AcpAgentConfig;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::process::Command;
 
-use crate::installer::binary::cache_binary_target;
+use crate::installer::binary::{CachedBinary, cache_binary_target};
+use crate::installer::cache::BinaryCacheLock;
 use crate::installer::environment::program_available;
-use crate::registry::{BinaryTarget, Environment, Platform, RegistryAgent, fetch_registry};
+use crate::process;
+use crate::registry::{
+    BinaryTarget, Environment, NpxDistribution, Platform, RegistryAgent, UvxDistribution,
+    fetch_registry,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct CommandSpec {
     program: PathBuf,
     args: Vec<String>,
     env: Environment,
     current_dir: Option<PathBuf>,
+    cache_use_lease: Option<Arc<BinaryCacheLock>>,
+}
+
+pub(crate) struct ResolvedAgentConfig {
+    pub(crate) config: AcpAgentConfig,
+    pub(crate) cache_use_lease: Option<Arc<BinaryCacheLock>>,
+}
+
+/// Executable that runs a package-based distribution, decided once and shared
+/// by the installer (which prepares the runner's cache) and the runner (which
+/// executes the package) so the two commands can never choose different tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageRunner {
+    /// `npm` executes npm packages through `npm exec`.
+    Npm,
+    /// Deno executes npm packages through `deno x` when npm is unavailable.
+    Deno,
+    /// uv executes Python packages through `uvx`.
+    Uvx,
+}
+
+impl PackageRunner {
+    /// Executable that implements the runner.
+    pub fn program(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Deno => "deno",
+            Self::Uvx => "uvx",
+        }
+    }
+
+    /// Name used when reporting installation or removal operations.
+    pub(crate) fn install_name(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Deno => "deno",
+            Self::Uvx => "uv",
+        }
+    }
+}
+
+impl std::fmt::Display for PackageRunner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.program())
+    }
+}
+
+/// Chooses the runner for an npm distribution: `npm` when it is available,
+/// otherwise Deno's `deno x`. Both `install` and `run`/`serve` resolve through
+/// this function, so the cache an install prepares always matches the command
+/// that later executes the package.
+pub(crate) fn npm_package_runner() -> Result<PackageRunner> {
+    if program_available("npm")? {
+        Ok(PackageRunner::Npm)
+    } else {
+        Ok(PackageRunner::Deno)
+    }
+}
+
+/// The distribution selected for one registry agent on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolvedDistribution<'a> {
+    /// A binary target available for the current platform.
+    Binary {
+        platform: Platform,
+        target: &'a BinaryTarget,
+    },
+    /// An npm distribution and the runner that will execute it.
+    Npm {
+        distribution: &'a NpxDistribution,
+        runner: PackageRunner,
+    },
+    /// A Python distribution executed through `uvx`.
+    Uvx { distribution: &'a UvxDistribution },
+}
+
+/// Resolves one agent's effective distribution using the lifecycle priority.
+///
+/// The first usable current-platform binary wins, followed by npm (using npm
+/// when available and Deno otherwise), then uvx. Returning the typed result
+/// keeps run, serve, install, update, and uninstall on the same decision path.
+pub(crate) fn resolve_distribution(
+    agent: &RegistryAgent,
+) -> Result<Option<ResolvedDistribution<'_>>> {
+    let platform = Platform::current()?;
+    if let Some(binary) = &agent.distribution.binary
+        && let Some(target) = binary.for_platform(platform)
+    {
+        return Ok(Some(ResolvedDistribution::Binary { platform, target }));
+    }
+    if let Some(distribution) = &agent.distribution.npx {
+        return Ok(Some(ResolvedDistribution::Npm {
+            distribution,
+            runner: npm_package_runner()?,
+        }));
+    }
+    Ok(agent
+        .distribution
+        .uvx
+        .as_ref()
+        .map(|distribution| ResolvedDistribution::Uvx { distribution }))
 }
 
 /// Runs a registry agent locally with its standard streams attached to the terminal.
@@ -29,7 +136,7 @@ pub async fn run_agent(agent_id: &str, user_args: &[String]) -> Result<ExitStatu
 pub(crate) async fn resolve_agent_config(
     agent_id: &str,
     user_args: &[String],
-) -> Result<AcpAgentConfig> {
+) -> Result<ResolvedAgentConfig> {
     let registry = fetch_registry().await?;
     let agent = registry
         .get_agent(agent_id)
@@ -45,10 +152,10 @@ pub(crate) async fn resolve_agent_config(
 pub(crate) async fn resolve_agent_config_from_registry_agent(
     agent: &RegistryAgent,
     user_args: &[String],
-) -> Result<AcpAgentConfig> {
-    resolve_agent_command(agent, user_args)
+) -> Result<ResolvedAgentConfig> {
+    Ok(resolve_agent_command(agent, user_args)
         .await?
-        .into_acp_config()
+        .into_resolved_config())
 }
 
 async fn resolve_agent(agent_id: &str, user_args: &[String]) -> Result<CommandSpec> {
@@ -60,23 +167,13 @@ async fn resolve_agent(agent_id: &str, user_args: &[String]) -> Result<CommandSp
 }
 
 impl CommandSpec {
-    fn into_acp_config(self) -> Result<AcpAgentConfig> {
-        let (command, args) = match self.current_dir {
-            Some(current_dir) => {
-                let mut wrapper_args = vec![
-                    "__run-in-dir".to_string(),
-                    path_argument(&current_dir, "working directory")?,
-                    path_argument(&self.program, "executable path")?,
-                ];
-                wrapper_args.extend(self.args);
-                let current_exe = std::env::current_exe()
-                    .context("failed to locate acp-agent executable for binary agent wrapper")?;
-                (current_exe, wrapper_args)
-            }
-            None => (self.program, self.args),
-        };
-
-        Ok(AcpAgentConfig::new(command).args(args).envs(self.env))
+    fn into_resolved_config(self) -> ResolvedAgentConfig {
+        ResolvedAgentConfig {
+            config: AcpAgentConfig::new(self.program)
+                .args(self.args)
+                .envs(self.env),
+            cache_use_lease: self.cache_use_lease,
+        }
     }
 
     fn command(&self) -> Command {
@@ -93,78 +190,66 @@ impl CommandSpec {
     }
 }
 
-fn path_argument(path: &Path, description: &str) -> Result<String> {
-    path.to_str()
-        .map(str::to_owned)
-        .with_context(|| format!("agent {description} is not valid UTF-8: {path:?}"))
-}
-
 async fn resolve_agent_command(agent: &RegistryAgent, user_args: &[String]) -> Result<CommandSpec> {
-    if let Some(binary) = &agent.distribution.binary {
-        let platform = Platform::current()?;
-        if let Some(target) = binary.for_platform(platform) {
+    let distribution = resolve_distribution(agent)?.with_context(|| {
+        format!(
+            "agent \"{}\" does not have a runnable distribution",
+            agent.id
+        )
+    })?;
+    match distribution {
+        ResolvedDistribution::Binary { platform, target } => {
             let cached = cache_binary_target(agent, platform, target).await?;
-            return Ok(binary_command_spec(
-                cached.executable_path,
-                cached.extracted_dir,
-                target,
-                user_args,
-            ));
+            Ok(binary_command_spec(cached, target, user_args))
         }
-    }
-
-    if let Some(npx) = &agent.distribution.npx {
-        return Ok(npm_command_spec(
-            program_available("npm")?,
-            &npx.package,
-            npx.args.as_deref(),
-            npx.env.as_ref(),
+        ResolvedDistribution::Npm {
+            distribution,
+            runner,
+        } => Ok(npm_command_spec(
+            runner,
+            &distribution.package,
+            distribution.args.as_deref(),
+            distribution.env.as_ref(),
             user_args,
-        ));
-    }
-
-    if let Some(uvx) = &agent.distribution.uvx {
-        return Ok(package_command_spec(
+        )),
+        ResolvedDistribution::Uvx { distribution } => Ok(package_command_spec(
             "uvx",
             &[],
-            &uvx.package,
-            uvx.args.as_deref(),
-            uvx.env.as_ref(),
+            &distribution.package,
+            distribution.args.as_deref(),
+            distribution.env.as_ref(),
             user_args,
-        ));
+        )),
     }
-
-    bail!(
-        "agent \"{}\" does not have a runnable distribution",
-        agent.id
-    )
 }
 
 fn npm_command_spec(
-    npm_available: bool,
+    runner: PackageRunner,
     package: &str,
     default_args: Option<&[String]>,
     env: Option<&Environment>,
     user_args: &[String],
 ) -> CommandSpec {
-    if npm_available {
-        package_command_spec(
+    match runner {
+        PackageRunner::Npm => package_command_spec(
             "npm",
             &["exec", "--"],
             package,
             default_args,
             env,
             user_args,
-        )
-    } else {
-        package_command_spec(
+        ),
+        PackageRunner::Deno => package_command_spec(
             "deno",
             &["x", "--allow-all", "--minimum-dependency-age", "0"],
             package,
             default_args,
             env,
             user_args,
-        )
+        ),
+        // uvx belongs to uvx distributions; the shared runner never routes an
+        // npm distribution here.
+        PackageRunner::Uvx => unreachable!("npm distributions never use the uvx runner"),
     }
 }
 
@@ -188,12 +273,12 @@ fn package_command_spec(
         args,
         env: env.cloned().unwrap_or_default(),
         current_dir: None,
+        cache_use_lease: None,
     }
 }
 
 fn binary_command_spec(
-    executable_path: PathBuf,
-    extracted_dir: PathBuf,
+    cached: CachedBinary,
     target: &BinaryTarget,
     user_args: &[String],
 ) -> CommandSpec {
@@ -201,40 +286,33 @@ fn binary_command_spec(
     args.extend_from_slice(user_args);
 
     CommandSpec {
-        program: executable_path,
+        program: cached.executable_path,
         args,
         env: target.env.clone().unwrap_or_default(),
-        current_dir: Some(extracted_dir),
+        current_dir: Some(cached.extracted_dir),
+        cache_use_lease: cached.cache_use_lease,
     }
 }
 
 async fn run_command(spec: CommandSpec, agent_id: &str) -> Result<ExitStatus> {
     let program = spec.program.display().to_string();
-    spec.command()
-        .status()
+    let mut command = spec.command();
+    process::status(&mut command)
         .await
         .with_context(|| format!("failed to run {program} for {agent_id}"))
 }
 
-/// Runs a command with inherited stdio from a specific working directory.
-pub(crate) async fn run_in_directory(
-    current_dir: &Path,
-    program: &Path,
-    args: Vec<String>,
-) -> std::io::Result<ExitStatus> {
-    let spec = CommandSpec {
-        program: program.to_owned(),
-        args,
-        env: Environment::new(),
-        current_dir: Some(current_dir.to_owned()),
-    };
-    spec.command().status().await
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::registry::{AgentDistribution, NpxDistribution, UvxDistribution};
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        CommandSpec, PackageRunner, ResolvedDistribution, npm_command_spec, npm_package_runner,
+        resolve_agent_config_from_registry_agent, resolve_distribution,
+    };
+    use crate::registry::{
+        AgentDistribution, Environment, NpxDistribution, RegistryAgent, UvxDistribution,
+    };
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -289,7 +367,7 @@ mod tests {
         let agent = sample_npx_agent();
         let npx = agent.distribution.npx.as_ref().unwrap();
         let spec = npm_command_spec(
-            true,
+            PackageRunner::Npm,
             &npx.package,
             npx.args.as_deref(),
             npx.env.as_ref(),
@@ -313,7 +391,7 @@ mod tests {
         let agent = sample_npx_agent();
         let npx = agent.distribution.npx.as_ref().unwrap();
         let spec = npm_command_spec(
-            false,
+            PackageRunner::Deno,
             &npx.package,
             npx.args.as_deref(),
             npx.env.as_ref(),
@@ -337,17 +415,110 @@ mod tests {
     }
 
     #[test]
-    fn converts_resolved_command_to_acp_process_config() {
+    fn package_runner_is_shared_between_install_and_run() {
+        // `resolve_distribution` drives the installer's cache preparation, and
+        // the runner builds its command from the same decision. Binary agents
+        // have no package runner; uvx agents always run through uvx.
+        let binary_agent = RegistryAgent {
+            distribution: AgentDistribution {
+                binary: Some(crate::registry::BinaryDistribution::default()),
+                npx: None,
+                uvx: None,
+            },
+            ..sample_npx_agent()
+        };
+        assert_eq!(
+            resolve_distribution(&binary_agent).unwrap(),
+            None,
+            "binary distributions are prepared through the binary cache"
+        );
+        assert_eq!(
+            resolve_distribution(&sample_uvx_agent()).unwrap(),
+            Some(ResolvedDistribution::Uvx {
+                distribution: sample_uvx_agent().distribution.uvx.as_ref().unwrap(),
+            })
+        );
+        assert_eq!(PackageRunner::Uvx.program(), "uvx");
+        assert_eq!(PackageRunner::Npm.to_string(), "npm");
+        assert_eq!(PackageRunner::Deno.to_string(), "deno");
+    }
+
+    #[tokio::test]
+    // The guard intentionally spans the await below: it serializes tests that
+    // mutate the process-wide `PATH`, which the test runtime would otherwise
+    // run in parallel. No other task can hold it concurrently, so no deadlock.
+    #[allow(clippy::await_holding_lock)]
+    async fn shared_runner_decision_follows_npm_availability() {
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        use crate::installer::test_support::ENV_LOCK;
+
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = tempdir().unwrap();
+        let npm_dir = temp_dir.path().join("with-npm");
+        std::fs::create_dir_all(&npm_dir).unwrap();
+        let fake_npm = npm_dir.join("npm");
+        std::fs::write(&fake_npm, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let empty_dir = temp_dir.path().join("without-npm");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+
+        let previous_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("PATH", &npm_dir);
+        }
+        let with_npm = npm_package_runner().unwrap();
+        unsafe {
+            std::env::set_var("PATH", &empty_dir);
+        }
+        let without_npm = npm_package_runner().unwrap();
+        match previous_path {
+            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(with_npm, PackageRunner::Npm);
+        assert_eq!(without_npm, PackageRunner::Deno);
+
+        // The same decision drives the command the runner executes: with npm
+        // available run uses `npm exec`, without npm it uses `deno x`, so an
+        // install that prepared the corresponding cache is consumed by run.
+        let npx = sample_npx_agent();
+        let npx = npx.distribution.npx.unwrap();
+        let spec = npm_command_spec(
+            with_npm,
+            &npx.package,
+            npx.args.as_deref(),
+            npx.env.as_ref(),
+            &[],
+        );
+        assert_eq!(spec.program, Path::new("npm"));
+        let spec = npm_command_spec(
+            without_npm,
+            &npx.package,
+            npx.args.as_deref(),
+            npx.env.as_ref(),
+            &[],
+        );
+        assert_eq!(spec.program, Path::new("deno"));
+    }
+
+    #[test]
+    fn resolves_direct_process_config() {
         let spec = CommandSpec {
             program: PathBuf::from("agent-program"),
             args: strings(&["--stdio", "--model", "gpt-5"]),
             env: Environment::from([("AGENT_MODE".to_string(), "serve".to_string())]),
             current_dir: None,
+            cache_use_lease: None,
         };
 
-        let config = spec.into_acp_config().unwrap();
+        let config = spec.into_resolved_config().config;
 
-        assert_eq!(config.command(), std::path::Path::new("agent-program"));
+        assert_eq!(config.command(), Path::new("agent-program"));
         assert_eq!(config.arguments(), ["--stdio", "--model", "gpt-5"]);
         assert_eq!(
             config.environment().get("AGENT_MODE"),
@@ -356,29 +527,20 @@ mod tests {
     }
 
     #[test]
-    fn wraps_binary_process_config_to_preserve_working_directory() {
+    fn command_preserves_optional_working_directory() {
         let spec = CommandSpec {
-            program: PathBuf::from("/cache/demo/bin/agent"),
+            program: PathBuf::from("agent-program"),
             args: strings(&["--stdio"]),
             env: Environment::from([("AGENT_MODE".to_string(), "serve".to_string())]),
             current_dir: Some(PathBuf::from("/cache/demo")),
+            cache_use_lease: None,
         };
 
-        let config = spec.into_acp_config().unwrap();
+        let command = spec.command();
 
-        assert_eq!(config.command(), std::env::current_exe().unwrap());
         assert_eq!(
-            config.arguments(),
-            [
-                "__run-in-dir",
-                "/cache/demo",
-                "/cache/demo/bin/agent",
-                "--stdio",
-            ]
-        );
-        assert_eq!(
-            config.environment().get("AGENT_MODE"),
-            Some(&"serve".to_string())
+            command.as_std().get_current_dir(),
+            Some(Path::new("/cache/demo"))
         );
     }
 
@@ -391,13 +553,13 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(config.command(), Path::new("uvx"));
+        assert_eq!(config.config.command(), Path::new("uvx"));
         assert_eq!(
-            config.arguments(),
+            config.config.arguments(),
             ["acme-demo", "--stdio", "--model", "gpt-5"]
         );
         assert_eq!(
-            config.environment().get("DEMO_MODE"),
+            config.config.environment().get("DEMO_MODE"),
             Some(&"local".to_string())
         );
     }

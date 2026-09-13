@@ -10,23 +10,27 @@ a library for embedding:
 - [`commands`] embeds the CLI parser and dispatch logic.
 - [`installer`] owns agent distribution lifecycle and local toolchain setup.
 - [`serve`] serves a registry agent over ACP HTTP transports.
-- [`server`] manages named background servers and their control plane.
+- [`server`] manages live named instances through the foreground daemon's Unix-socket control plane.
 - [`registry`] loads and queries the public ACP registry.
 - [`runner`] launches registry agents as local processes.
 "#]
 #![warn(missing_docs)]
 
+#[cfg(not(unix))]
+compile_error!("acp-agent supports Unix platforms only");
+
 /// CLI parsing and command-dispatch helpers used by the `acp-agent` executable.
 pub mod commands;
 /// Agent distribution and local toolchain installers.
 pub mod installer;
+mod process;
 /// Types and helpers for loading ACP agent metadata from the public registry.
 pub mod registry;
 /// Local ACP agent command resolution and execution.
 pub mod runner;
 /// ACP HTTP/SSE and WebSocket serving for registry agents.
 pub mod serve;
-/// Named background ACP servers and their local control plane.
+/// Live named ACP instances managed by the foreground daemon over a user-scoped Unix socket.
 pub mod server;
-/// Embedded yolo-mode catalog and per-agent flag resolution for `--yolo`.
+/// Embedded yolo-mode catalog and per-agent argument resolution for `--yolo`.
 pub mod yolo;

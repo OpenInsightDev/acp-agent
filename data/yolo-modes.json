@@ -1,51 +1,32 @@
 {
-  "version": 1,
+  "version": 2,
   "agents": {
     "claude-acp": {
-      "mode": "bypassPermissions",
-      "flag": "--dangerously-skip-permissions"
+      "args": ["--dangerously-skip-permissions"]
     },
     "codex-acp": {
-      "mode": "agent-full-access",
-      "flag": "--dangerously-skip-sandbox-and-permissions"
+      "args": ["--dangerously-skip-sandbox-and-permissions"]
     },
     "cursor": {
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "gemini": {
-      "mode": "yolo",
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "qwen-code": {
-      "mode": "yolo",
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "devin": {
-      "mode": "bypass",
-      "flag": "--permission-mode bypass"
-    },
-    "goose": {
-      "mode": "auto"
-    },
-    "amp-acp": {
-      "option": {
-        "configId": "permissions",
-        "value": "bypass"
-      }
-    },
-    "kimi": {
-      "option": {
-        "configId": "mode"
-      }
+      "args": ["--permission-mode", "bypass"]
     },
     "dirac": {
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "github-copilot-cli": {
-      "flag": "--yolo"
+      "args": ["--yolo"]
     },
     "grok-build": {
-      "flag": "--always-approve"
+      "args": ["--always-approve"]
     }
   }
 }

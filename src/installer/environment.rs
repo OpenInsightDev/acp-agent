@@ -6,6 +6,8 @@ use std::process::ExitStatus;
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::process::Command;
 
+use crate::process;
+
 const JS_TOOLS: [&str; 2] = ["npm", "deno"];
 const PYTHON_TOOLS: [&str; 1] = ["uv"];
 
@@ -114,57 +116,29 @@ impl InstallTarget {
 
     /// Structured installer command for this target.
     fn installer_command(self) -> InstallerCommand {
-        if cfg!(windows) {
-            match self {
-                Self::Deno => InstallerCommand {
-                    program: "powershell",
-                    args: &["-c", r#"irm https://deno.land/install.ps1 | iex"#],
-                },
-                Self::Uv => InstallerCommand {
-                    program: "powershell",
-                    args: &[
-                        "-ExecutionPolicy",
-                        "ByPass",
-                        "-c",
-                        r#"irm https://astral.sh/uv/install.ps1 | iex"#,
-                    ],
-                },
-            }
-        } else {
-            match self {
-                Self::Deno => InstallerCommand {
-                    program: "sh",
-                    args: &["-c", "curl -fsSL https://deno.land/install.sh | sh"],
-                },
-                Self::Uv => InstallerCommand {
-                    program: "sh",
-                    args: &["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
-                },
-            }
+        match self {
+            Self::Deno => InstallerCommand {
+                program: "sh",
+                args: &["-c", "curl -fsSL https://deno.land/install.sh | sh"],
+            },
+            Self::Uv => InstallerCommand {
+                program: "sh",
+                args: &["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
+            },
         }
     }
 
     fn known_bin_directories(self, home: &Path) -> Vec<PathBuf> {
         match self {
             Self::Deno => vec![home.join(".deno").join("bin")],
-            Self::Uv => {
-                let mut directories = vec![home.join(".local").join("bin")];
-                if cfg!(windows) {
-                    directories.push(home.join(".cargo").join("bin"));
-                }
-                directories
-            }
+            Self::Uv => vec![home.join(".local").join("bin")],
         }
-    }
-
-    fn requires_curl(self) -> bool {
-        !cfg!(windows)
     }
 }
 
 /// Verified result of installing one local toolchain.
 #[derive(Debug, Clone)]
-pub struct InstallationResult {
+pub struct InstalledTool {
     /// Installed toolchain.
     pub target: InstallTarget,
     /// Verified executable path.
@@ -199,17 +173,17 @@ fn detect_tools(programs: &[&'static str]) -> Result<Vec<ToolAvailability>> {
 /// Targets run sequentially in plan order so the installers never modify user
 /// directories or shell profiles concurrently, and the first failure aborts
 /// the remaining targets with an explicit error.
-pub async fn install_plan(plan: &InstallationPlan) -> Result<Vec<InstallationResult>> {
+pub async fn install_plan(plan: &InstallationPlan) -> Result<Vec<InstalledTool>> {
     install_plan_with(plan, install_and_verify).await
 }
 
 async fn install_plan_with<F, Fut>(
     plan: &InstallationPlan,
     install: F,
-) -> Result<Vec<InstallationResult>>
+) -> Result<Vec<InstalledTool>>
 where
     F: Fn(InstallTarget) -> Fut,
-    Fut: Future<Output = Result<InstallationResult>>,
+    Fut: Future<Output = Result<InstalledTool>>,
 {
     let mut results = Vec::with_capacity(plan.targets.len());
     for target in &plan.targets {
@@ -218,7 +192,7 @@ where
     Ok(results)
 }
 
-async fn install_and_verify(target: InstallTarget) -> Result<InstallationResult> {
+async fn install_and_verify(target: InstallTarget) -> Result<InstalledTool> {
     run_installer(target).await?;
     verify_installation(target).await
 }
@@ -226,9 +200,9 @@ async fn install_and_verify(target: InstallTarget) -> Result<InstallationResult>
 async fn run_installer(target: InstallTarget) -> Result<()> {
     ensure_installer_prerequisites(target)?;
     let command = target.installer_command();
-    let output = Command::new(command.program)
-        .args(command.args)
-        .output()
+    let mut process = Command::new(command.program);
+    process.args(command.args);
+    let output = process::output(&mut process)
         .await
         .with_context(|| format!("failed to run installer for {}", target.label()))?;
 
@@ -245,7 +219,7 @@ async fn run_installer(target: InstallTarget) -> Result<()> {
 }
 
 fn ensure_installer_prerequisites(target: InstallTarget) -> Result<()> {
-    if target.requires_curl() && resolve_program("curl")?.is_none() {
+    if resolve_program("curl")?.is_none() {
         return Err(anyhow!(
             "Cannot install {} because curl is not available in the current environment",
             target.label()
@@ -255,26 +229,27 @@ fn ensure_installer_prerequisites(target: InstallTarget) -> Result<()> {
     Ok(())
 }
 
-async fn verify_installation(target: InstallTarget) -> Result<InstallationResult> {
+async fn verify_installation(target: InstallTarget) -> Result<InstalledTool> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("unable to determine the home directory"))?;
     let on_path = resolve_program(target.program())?;
     let on_path_available = on_path.is_some();
     let path = match on_path {
         Some(path) => path,
-        None => {
-            resolve_program_with_directories(target.program(), &target.known_bin_directories(&home))?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "verification failed for {}: {} was not found after installation",
-                        target.label(),
-                        target.program()
-                    )
-                })?
-        }
+        None => resolve_program_with_directories(
+            target.program(),
+            &target.known_bin_directories(&home),
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "verification failed for {}: {} was not found after installation",
+                target.label(),
+                target.program()
+            )
+        })?,
     };
 
     verify_program_version(&path, target.label()).await?;
-    Ok(InstallationResult {
+    Ok(InstalledTool {
         target,
         path,
         on_path: on_path_available,
@@ -282,9 +257,9 @@ async fn verify_installation(target: InstallTarget) -> Result<InstallationResult
 }
 
 async fn verify_program_version(path: &Path, subject: &str) -> Result<()> {
-    let output = Command::new(path)
-        .arg("--version")
-        .output()
+    let mut process = Command::new(path);
+    process.arg("--version");
+    let output = process::output(&mut process)
         .await
         .with_context(|| format!("failed to run installer for {subject}"))?;
 
@@ -321,8 +296,7 @@ pub(crate) fn program_available(program: &str) -> Result<bool> {
 /// Resolves `program` against the preferred directories followed by `PATH`.
 ///
 /// Resolution delegates to `which`, so a candidate must be an executable
-/// regular file on Unix and Windows resolution follows the active `PATHEXT`
-/// instead of a hard-coded extension list.
+/// regular file on Unix.
 fn resolve_program_with_directories(
     program: &str,
     preferred_directories: &[PathBuf],
@@ -348,12 +322,9 @@ fn display_status(status: ExitStatus) -> String {
         return code.to_string();
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return format!("signal {signal}");
-        }
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(signal) = status.signal() {
+        return format!("signal {signal}");
     }
 
     "unknown".to_string()
@@ -361,12 +332,15 @@ fn display_status(status: ExitStatus) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
 
-    /// Serializes tests that temporarily mutate the process-wide `PATH` (and on
-    /// Windows `PATHEXT`) environment variable, which would otherwise race
-    /// when the test binary runs them in parallel.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::{
+        EnvironmentReport, InstallTarget, InstallationPlan, InstalledTool, JS_TOOLS, PYTHON_TOOLS,
+        ToolAvailability, install_plan_with, plan_installation, resolve_program,
+        verify_installation,
+    };
+    use crate::installer::test_support::ENV_LOCK;
+    use anyhow::anyhow;
 
     fn report(js_available: &[&str], python_available: &[&str]) -> EnvironmentReport {
         EnvironmentReport {
@@ -446,7 +420,7 @@ mod tests {
             let executed = Arc::clone(&executed);
             async move {
                 executed.lock().unwrap().push(target);
-                Ok(InstallationResult {
+                Ok(InstalledTool {
                     target,
                     path: PathBuf::from(format!("/tmp/{}", target.label())),
                     on_path: false,
@@ -479,7 +453,7 @@ mod tests {
                 if target == InstallTarget::Deno {
                     Err(anyhow!("deno installer failed"))
                 } else {
-                    Ok(InstallationResult {
+                    Ok(InstalledTool {
                         target,
                         path: PathBuf::from("/tmp/uv"),
                         on_path: false,
@@ -498,7 +472,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     // The guard intentionally spans the await below: it serializes tests that
     // mutate the process-wide `PATH`, which the test runtime would otherwise
@@ -508,7 +481,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::tempdir;
 
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = tempdir().unwrap();
         let bin = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -526,10 +501,7 @@ mod tests {
                 format!(
                     "{}:{}",
                     bin.display(),
-                    previous_path
-                        .clone()
-                        .unwrap_or_default()
-                        .to_string_lossy()
+                    previous_path.clone().unwrap_or_default().to_string_lossy()
                 ),
             );
         }
@@ -544,13 +516,14 @@ mod tests {
         assert!(result.on_path);
     }
 
-    #[cfg(unix)]
     #[test]
     fn unix_resolution_rejects_non_executable_regular_files() {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::tempdir;
 
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = tempdir().unwrap();
         let bin = temp_dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -577,13 +550,14 @@ mod tests {
         assert_eq!(with_exec_bit.unwrap().unwrap(), tool);
     }
 
-    #[cfg(unix)]
     #[test]
     fn duplicate_path_entries_resolve_to_the_first_executable_match() {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::tempdir;
 
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = tempdir().unwrap();
         let first = temp_dir.path().join("first");
         let second = temp_dir.path().join("second");
@@ -607,34 +581,5 @@ mod tests {
         }
 
         assert_eq!(resolved, first.join("tool"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_resolution_finds_executable_extension() {
-        use tempfile::tempdir;
-
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp_dir = tempdir().unwrap();
-        let bin = temp_dir.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("tool.exe"), b"tool").unwrap();
-
-        // The real `PATHEXT` is left untouched so `which` initializes its
-        // per-process extension cache from the actual value; `.EXE` is always
-        // present on Windows. A hard-coded extension list would also pass this
-        // test, so it guards the delegation itself rather than PATHEXT parsing,
-        // which `which` owns.
-        let previous_path = std::env::var_os("PATH");
-        unsafe {
-            std::env::set_var("PATH", &bin);
-        }
-        let resolved = resolve_program("tool");
-        match previous_path {
-            Some(previous) => unsafe { std::env::set_var("PATH", previous) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-
-        assert_eq!(resolved.unwrap().unwrap(), bin.join("tool.exe"));
     }
 }

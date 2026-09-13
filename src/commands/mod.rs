@@ -1,11 +1,10 @@
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-mod agents;
+mod agent_output;
 mod environment;
 mod server;
 
@@ -32,24 +31,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Internal process wrapper used to preserve binary distribution working directories.
-    #[command(name = "__run-in-dir", hide = true, trailing_var_arg = true)]
-    RunInDir {
-        current_dir: PathBuf,
-        program: PathBuf,
-        #[arg(allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Internal foreground process for a named ACP server.
-    #[command(name = "__server-run", hide = true)]
-    ServerRun {
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        host: String,
-        #[arg(long)]
-        port: u16,
-    },
+    /// Run the foreground daemon that owns named ACP instances.
+    Daemon,
     /// List every published agent.
     List {
         /// List agents cached locally instead of the published registry.
@@ -65,19 +48,19 @@ enum Commands {
     Install {
         /// IDs of the agents to install.
         #[arg(value_name = "AGENT_ID", required = true)]
-        agent_id: Vec<String>,
+        agent_ids: Vec<String>,
     },
     /// Remove one or more installed agents from the local cache and/or package managers.
     Uninstall {
         /// IDs of the agents to uninstall.
         #[arg(value_name = "AGENT_ID", required = true)]
-        agent_id: Vec<String>,
+        agent_ids: Vec<String>,
     },
     /// Update one or more installed agents to the registry's latest distribution.
     Update {
         /// IDs of the agents to update.
         #[arg(value_name = "AGENT_ID", required = true)]
-        agent_id: Vec<String>,
+        agent_ids: Vec<String>,
     },
     /// Install Deno or uv when no compatible local toolchain exists.
     InstallEnv {
@@ -88,7 +71,7 @@ enum Commands {
     /// Run an agent locally over stdio.
     Run {
         agent_id: String,
-        /// Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).
+        /// Activate the agent's yolo/auto-approve mode (injects mapped startup arguments).
         #[arg(long)]
         yolo: bool,
         /// Arguments passed to the agent process. Hyphen-prefixed arguments
@@ -104,13 +87,18 @@ enum Commands {
         /// TCP port for the HTTP listener. Use 0 for an ephemeral port.
         #[arg(long, default_value_t = 0)]
         port: u16,
-        /// Optional URL prefix applied to all served endpoints (ACP, health,
+        /// Optional mount prefix applied to all served endpoints (ACP, health,
         /// readyz), e.g. `/myapp` makes the ACP endpoint `/myapp/acp`.
-        #[arg(long)]
-        subpath: Option<String>,
-        /// Use the agent id as the subpath (equivalent to `--subpath /<agent-id>`).
-        #[arg(long, conflicts_with = "subpath")]
-        agent_sub_path: bool,
+        #[arg(long = "mount-path", alias = "subpath")]
+        mount_path: Option<String>,
+        /// Use the agent id as the mount prefix (equivalent to
+        /// `--mount-path /<agent-id>`).
+        #[arg(
+            long = "agent-mount-path",
+            alias = "agent-sub-path",
+            conflicts_with = "mount_path"
+        )]
+        agent_mount_path: bool,
         /// ACP HTTP and WebSocket endpoint path.
         #[arg(long, default_value = "/acp")]
         path: String,
@@ -130,14 +118,17 @@ enum Commands {
         /// Disable the GET /readyz agent readiness endpoint.
         #[arg(long)]
         no_readyz: bool,
-        /// Activate the agent's yolo/auto-approve mode (injects the mapped startup flag).
+        /// Maximum number of concurrent agent processes for this route.
+        #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_PROCESSES)]
+        max_processes: usize,
+        /// Activate the agent's yolo/auto-approve mode (injects mapped startup arguments).
         #[arg(long)]
         yolo: bool,
         /// Arguments passed to the agent process.
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Manage named ACP servers and their agent routes.
+    /// Manage live named ACP instances through the daemon.
     Server {
         #[command(subcommand)]
         command: ServerCommands,
@@ -153,32 +144,32 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum ServerCommands {
-    /// Start a named ACP server in the background.
+    /// Create or reuse a named ACP instance in the foreground daemon.
     Start {
-        /// Local server name used by later commands.
+        /// Named instance used by later commands.
         #[arg(long, default_value = "default")]
         name: String,
-        /// Hostname or IP address for the named server listener.
+        /// Hostname or IP address for the instance's public listener.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-        /// TCP port for the named server listener. Use 0 for an ephemeral port.
+        /// TCP port for the instance's public listener. Use 0 for an ephemeral port.
         #[arg(long, default_value_t = 8010)]
         port: u16,
     },
-    /// Stop a named ACP server.
+    /// Stop and remove a named ACP instance from the daemon.
     Stop {
-        /// Local server name.
+        /// Named instance.
         #[arg(long, default_value = "default")]
         name: String,
     },
-    /// Register an agent route with a named server.
+    /// Register an agent route with a named instance.
     Register {
         agent_id: String,
-        /// Target server name.
+        /// Target instance name.
         #[arg(long, default_value = "default")]
         name: String,
         /// Public route prefix. Defaults to `/<agent-id>`.
-        #[arg(long, alias = "subpath")]
+        #[arg(long)]
         route: Option<String>,
         /// ACP HTTP and WebSocket endpoint path below the public route.
         #[arg(long, default_value = "/acp")]
@@ -199,6 +190,9 @@ enum ServerCommands {
         /// Disable the agent's GET /readyz endpoint.
         #[arg(long)]
         no_readyz: bool,
+        /// Maximum number of concurrent agent processes for this route.
+        #[arg(long, default_value_t = crate::serve::DEFAULT_MAX_PROCESSES)]
+        max_processes: usize,
         /// Activate the agent's yolo/auto-approve mode.
         #[arg(long)]
         yolo: bool,
@@ -206,46 +200,34 @@ enum ServerCommands {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    /// Remove an agent route from a named server.
+    /// Remove an agent route from a named instance.
     Unregister {
         agent_id: String,
-        /// Target server name.
+        /// Target instance name.
         #[arg(long, default_value = "default")]
         name: String,
     },
-    /// List named servers and their process states.
+    /// List live named instances owned by the daemon.
     List {
-        /// Emit server records as structured JSON.
+        /// Emit instance records as structured JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Show the state of a named server.
+    /// Show a live named instance's state and listener.
     Status {
-        /// Local server name.
+        /// Named instance.
         #[arg(long, default_value = "default")]
         name: String,
-        /// Emit the server record as structured JSON.
+        /// Emit the instance record as structured JSON.
         #[arg(long)]
         json: bool,
     },
-    /// List the agent routes registered with a named server.
+    /// List the routes and daemon-sourced readiness for a named instance.
     Registrations {
-        /// Local server name.
+        /// Named instance.
         #[arg(long, default_value = "default")]
         name: String,
         /// Emit registration records as structured JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Tail a named server's log.
-    Logs {
-        /// Local server name.
-        #[arg(long, default_value = "default")]
-        name: String,
-        /// Number of log lines to tail.
-        #[arg(long, default_value_t = 50)]
-        lines: usize,
-        /// Emit the log lines as structured JSON.
         #[arg(long)]
         json: bool,
     },
@@ -292,24 +274,8 @@ where
 /// Dispatches a parsed CLI command.
 pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<CliExit> {
     match cli.command {
-        Commands::RunInDir {
-            current_dir,
-            program,
-            args,
-        } => {
-            let status = crate::runner::run_in_directory(&current_dir, &program, args)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to run {} in {}",
-                        program.display(),
-                        current_dir.display()
-                    )
-                })?;
-            Ok(exit_from_status(status))
-        }
-        Commands::ServerRun { name, host, port } => {
-            crate::server::run(name, host, port).await?;
+        Commands::Daemon => {
+            crate::server::run().await?;
             Ok(CliExit::Success)
         }
         Commands::List { installed, json } => {
@@ -319,16 +285,16 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 AgentOutputFormat::Tsv
             };
             if installed {
-                let installed = crate::installer::agents::installed_agents()
+                let installed = crate::installer::lifecycle::installed_agents()
                     .await
                     .context("failed to list installed agents")?;
-                agents::write_installed_agents(writer, installed, format)
+                agent_output::write_installed_agents(writer, installed, format)
                     .context("failed to list installed agents")?;
             } else {
                 let registry = crate::registry::fetch_registry()
                     .await
                     .context("failed to list registry agents")?;
-                agents::write_registry_agents(
+                agent_output::write_registry_agents(
                     writer,
                     registry.list_agents().iter().collect(),
                     format,
@@ -337,43 +303,29 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             }
             Ok(CliExit::Success)
         }
-        Commands::Install { agent_id } => {
-            let outcomes = crate::installer::agents::install_agents(&agent_id).await;
-            for (_, outcome) in &outcomes {
-                if let Ok(outcome) = outcome {
-                    for warning in agents::install_warnings(outcome) {
-                        eprintln!("{warning}");
-                    }
-                }
-            }
+        Commands::Install { agent_ids } => {
+            let outcomes = crate::installer::lifecycle::install_agents(&agent_ids).await;
             report_batch_outcome(writer, &outcomes, "install", |outcome| {
-                agents::InstallMessage(outcome).to_string()
+                agent_output::InstallMessage(outcome).to_string()
             })
         }
-        Commands::Uninstall { agent_id } => {
-            let outcomes = crate::installer::agents::uninstall_agents(&agent_id).await;
+        Commands::Uninstall { agent_ids } => {
+            let outcomes = crate::installer::lifecycle::uninstall_agents(&agent_ids).await;
             for (_, outcome) in &outcomes {
                 if let Ok(outcome) = outcome {
-                    for warning in agents::uninstall_warnings(outcome) {
+                    for warning in agent_output::uninstall_warnings(outcome) {
                         eprintln!("{warning}");
                     }
                 }
             }
             report_batch_outcome(writer, &outcomes, "uninstall", |outcome| {
-                agents::UninstallMessage(outcome).to_string()
+                agent_output::UninstallMessage(outcome).to_string()
             })
         }
-        Commands::Update { agent_id } => {
-            let outcomes = crate::installer::agents::update_agents(&agent_id).await;
-            for (_, outcome) in &outcomes {
-                if let Ok(outcome) = outcome {
-                    for warning in agents::install_warnings(outcome) {
-                        eprintln!("{warning}");
-                    }
-                }
-            }
+        Commands::Update { agent_ids } => {
+            let outcomes = crate::installer::lifecycle::update_agents(&agent_ids).await;
             report_batch_outcome(writer, &outcomes, "update", |outcome| {
-                agents::InstallMessage(outcome).to_string()
+                agent_output::InstallMessage(outcome).to_string()
             })
         }
         Commands::InstallEnv { yes } => {
@@ -412,29 +364,32 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             agent_id,
             host,
             port,
-            subpath,
-            agent_sub_path,
+            mount_path,
+            agent_mount_path,
             path,
             cors_origins,
             allow_any_origin,
             no_health,
             no_readyz,
+            max_processes,
             yolo,
             args,
         } => {
             let args = crate::yolo::resolve_args(&agent_id, yolo, args).await?;
-            let subpath = resolve_subpath(&agent_id, subpath, agent_sub_path);
+            let mount_path = resolve_mount_path(&agent_id, mount_path, agent_mount_path);
             crate::serve::serve_agent(
                 &agent_id,
                 crate::serve::ServeOptions {
                     host,
                     port,
-                    subpath,
-                    router: crate::serve::AgentRouterOptions {
+                    mount_path,
+                    route: crate::serve::RouteConfig {
                         path,
-                        cors: crate::serve::cors_options(cors_origins, allow_any_origin)?,
+                        cors_origins,
+                        allow_any_origin,
                         health_endpoint: !no_health,
                         readyz_endpoint: !no_readyz,
+                        max_processes,
                     },
                 },
                 &args,
@@ -468,6 +423,7 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 allow_any_origin,
                 no_health,
                 no_readyz,
+                max_processes,
                 yolo,
                 args,
             } => {
@@ -476,11 +432,14 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                     crate::server::RegisterOptions {
                         name,
                         route,
-                        path,
-                        cors_origins,
-                        allow_any_origin,
-                        health_endpoint: !no_health,
-                        readyz_endpoint: !no_readyz,
+                        config: crate::serve::RouteConfig {
+                            path,
+                            cors_origins,
+                            allow_any_origin,
+                            health_endpoint: !no_health,
+                            readyz_endpoint: !no_readyz,
+                            max_processes,
+                        },
                         yolo,
                         args,
                     },
@@ -527,14 +486,6 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
                 })?;
                 Ok(CliExit::Success)
             }
-            ServerCommands::Logs { name, lines, json } => {
-                let record = crate::server::logs(&name, lines)
-                    .await
-                    .with_context(|| format!("failed to read logs for server \"{name}\""))?;
-                server::write_logs(writer, &record, json)
-                    .with_context(|| format!("failed to read logs for server \"{name}\""))?;
-                Ok(CliExit::Success)
-            }
         },
         Commands::Search { query, json } => {
             let format = if json {
@@ -545,22 +496,22 @@ pub async fn execute_cli<W: Write>(cli: Cli, writer: &mut W) -> anyhow::Result<C
             let registry = crate::registry::fetch_registry()
                 .await
                 .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
-            agents::write_registry_agents(writer, registry.search_agents(&query), format)
+            agent_output::write_registry_agents(writer, registry.search_agents(&query), format)
                 .with_context(|| format!("failed to search registry agents for \"{query}\""))?;
             Ok(CliExit::Success)
         }
     }
 }
 
-fn resolve_subpath(
+fn resolve_mount_path(
     agent_id: &str,
-    subpath: Option<String>,
-    agent_sub_path: bool,
+    mount_path: Option<String>,
+    agent_mount_path: bool,
 ) -> Option<String> {
-    if agent_sub_path {
+    if agent_mount_path {
         Some(format!("/{agent_id}"))
     } else {
-        subpath
+        mount_path
     }
 }
 
@@ -573,21 +524,16 @@ fn exit_from_status(status: ExitStatus) -> CliExit {
         .map_or_else(|| CliExit::Code(signal_exit_code(status)), CliExit::Code)
 }
 
-#[cfg(unix)]
 fn signal_exit_code(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
 
     status.signal().map_or(1, |signal| 128 + signal)
 }
 
-#[cfg(not(unix))]
-fn signal_exit_code(_: ExitStatus) -> i32 {
-    1
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Cli, CliExit, Commands, ServerCommands, report_batch_outcome, resolve_mount_path};
+    use clap::Parser;
 
     #[test]
     fn batch_outcome_is_all_or_nothing_success() {
@@ -715,31 +661,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_internal_working_directory_wrapper_arguments() {
-        let cli = Cli::try_parse_from([
-            "acp-agent",
-            "__run-in-dir",
-            "/cache/demo",
-            "/cache/demo/bin/agent",
-            "--stdio",
-            "--model",
-            "gpt-5",
-        ])
-        .unwrap();
-
-        assert!(matches!(
-            cli.command,
-            Commands::RunInDir {
-                current_dir,
-                program,
-                args,
-            } if current_dir == std::path::Path::new("/cache/demo")
-                && program == std::path::Path::new("/cache/demo/bin/agent")
-                && args == ["--stdio", "--model", "gpt-5"]
-        ));
-    }
-
-    #[test]
     fn parses_server_commands_and_defaults() {
         let start = Cli::try_parse_from(["acp-agent", "server", "start"]).unwrap();
         assert!(matches!(
@@ -771,6 +692,8 @@ mod tests {
             "/assistant",
             "--path",
             "/rpc",
+            "--max-processes",
+            "7",
             "--yolo",
             "--",
             "--model",
@@ -785,6 +708,7 @@ mod tests {
                     name,
                     route,
                     path,
+                    max_processes,
                     yolo,
                     args,
                     ..
@@ -793,6 +717,7 @@ mod tests {
                 && name == "work"
                 && route.as_deref() == Some("/assistant")
                 && path == "/rpc"
+                && max_processes == 7
                 && yolo
                 && args == ["--model", "gpt-5"]
         ));
@@ -851,23 +776,14 @@ mod tests {
             } if name == "work"
         ));
 
-        let logs = Cli::try_parse_from([
-            "acp-agent",
-            "server",
-            "logs",
-            "--name",
-            "work",
-            "--lines",
-            "100",
-            "--json",
-        ])
-        .unwrap();
-        assert!(matches!(
-            logs.command,
-            Commands::Server {
-                command: ServerCommands::Logs { name, lines, json: true }
-            } if name == "work" && lines == 100
-        ));
+        let daemon = Cli::try_parse_from(["acp-agent", "daemon"]).unwrap();
+        assert!(matches!(daemon.command, Commands::Daemon));
+    }
+
+    #[test]
+    fn rejects_unsupported_commands() {
+        assert!(Cli::try_parse_from(["acp-agent", "unsupported"]).is_err());
+        assert!(Cli::try_parse_from(["acp-agent", "server", "unsupported"]).is_err());
     }
 
     #[test]
@@ -888,6 +804,8 @@ mod tests {
             "https://example.com",
             "--no-health",
             "--no-readyz",
+            "--max-processes",
+            "3",
             "--",
             "--model",
             "gpt-5",
@@ -899,22 +817,24 @@ mod tests {
                 agent_id,
                 host,
                 port,
-                subpath,
+                mount_path,
                 path,
                 cors_origins,
                 no_health,
                 no_readyz,
+                max_processes,
                 args,
                 ..
             }
                 if agent_id == "demo"
                     && host == "0.0.0.0"
                     && port == 8010
-                    && subpath.as_deref() == Some("/myapp")
+                    && mount_path.as_deref() == Some("/myapp")
                     && path == "/rpc"
                     && cors_origins == ["https://example.com"]
                     && no_health
                     && no_readyz
+                    && max_processes == 3
                     && args == ["--model", "gpt-5"]
         ));
     }
@@ -927,22 +847,24 @@ mod tests {
             Commands::Serve {
                 host,
                 port,
-                subpath,
+                mount_path,
                 path,
                 cors_origins,
                 allow_any_origin,
                 no_health,
                 no_readyz,
+                max_processes,
                 yolo,
                 ..
             } if host == "127.0.0.1"
                 && port == 0
-                && subpath.is_none()
+                && mount_path.is_none()
                 && path == "/acp"
                 && cors_origins.is_empty()
                 && !allow_any_origin
                 && !no_health
                 && !no_readyz
+                && max_processes == crate::serve::DEFAULT_MAX_PROCESSES
                 && !yolo
         ));
     }
@@ -970,12 +892,12 @@ mod tests {
             cli.command,
             Commands::Serve {
                 agent_id,
-                subpath,
-                agent_sub_path,
+                mount_path,
+                agent_mount_path,
                 ..
             } if agent_id == "codex-acp"
-                && subpath.is_none()
-                && agent_sub_path
+                && mount_path.is_none()
+                && agent_mount_path
         ));
     }
 
@@ -996,13 +918,13 @@ mod tests {
     #[test]
     fn resolves_agent_sub_path_to_agent_id_prefix() {
         assert_eq!(
-            resolve_subpath("codex-acp", None, true),
+            resolve_mount_path("codex-acp", None, true),
             Some("/codex-acp".to_string())
         );
         assert_eq!(
-            resolve_subpath("codex-acp", Some("/myapp".to_string()), false),
+            resolve_mount_path("codex-acp", Some("/myapp".to_string()), false),
             Some("/myapp".to_string())
         );
-        assert_eq!(resolve_subpath("codex-acp", None, false), None);
+        assert_eq!(resolve_mount_path("codex-acp", None, false), None);
     }
 }

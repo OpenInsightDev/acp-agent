@@ -40,12 +40,6 @@ pub enum Platform {
     /// Linux on x86_64.
     #[serde(rename = "linux-x86_64")]
     LinuxX86_64,
-    /// Windows on arm64.
-    #[serde(rename = "windows-aarch64")]
-    WindowsAarch64,
-    /// Windows on x86_64.
-    #[serde(rename = "windows-x86_64")]
-    WindowsX86_64,
 }
 
 /// A single downloadable binary distribution for a particular platform.
@@ -98,20 +92,6 @@ pub struct BinaryDistribution {
     )]
     /// Binary target published for Linux on x86_64.
     pub linux_x86_64: Option<BinaryTarget>,
-    #[serde(
-        rename = "windows-aarch64",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    /// Binary target published for Windows on arm64.
-    pub windows_aarch64: Option<BinaryTarget>,
-    #[serde(
-        rename = "windows-x86_64",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    /// Binary target published for Windows on x86_64.
-    pub windows_x86_64: Option<BinaryTarget>,
 }
 
 /// Metadata for package-based distributions (npm/uvx).
@@ -171,8 +151,6 @@ impl BinaryDistribution {
             Platform::DarwinX86_64 => self.darwin_x86_64.as_ref(),
             Platform::LinuxAarch64 => self.linux_aarch64.as_ref(),
             Platform::LinuxX86_64 => self.linux_x86_64.as_ref(),
-            Platform::WindowsAarch64 => self.windows_aarch64.as_ref(),
-            Platform::WindowsX86_64 => self.windows_x86_64.as_ref(),
         }
     }
 }
@@ -301,8 +279,6 @@ impl Platform {
             ("macos", "x86_64") => Ok(Self::DarwinX86_64),
             ("linux", "aarch64") => Ok(Self::LinuxAarch64),
             ("linux", "x86_64") => Ok(Self::LinuxX86_64),
-            ("windows", "aarch64") => Ok(Self::WindowsAarch64),
-            ("windows", "x86_64") => Ok(Self::WindowsX86_64),
             (os, arch) => Err(anyhow!("unsupported platform: {os}-{arch}")),
         }
     }
@@ -330,8 +306,9 @@ fn registry_decode_error(reason: impl std::fmt::Display) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::{BinaryDistribution, BinaryTarget, Platform, Registry};
 
     #[test]
     fn decodes_registry_with_binary_distribution() {

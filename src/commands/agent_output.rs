@@ -4,8 +4,9 @@ use std::io::Write;
 use anyhow::{Context, Result};
 
 use super::AgentOutputFormat;
-use crate::installer::agents::{InstallMethod, InstallOutcome, InstalledAgent, UninstallOutcome};
+use crate::installer::lifecycle::{InstallOutcome, InstalledAgent, UninstallOutcome};
 use crate::registry::RegistryAgent;
+use crate::runner::PackageRunner;
 
 pub(super) fn write_installed_agents<W: Write>(
     writer: &mut W,
@@ -88,13 +89,15 @@ impl fmt::Display for InstallMessage<'_> {
             ),
             InstallOutcome::PackageManager {
                 agent_id,
-                method,
+                runner,
                 package,
-            } => write!(
-                formatter,
-                "Installed {agent_id} via {}: {package}",
-                install_method(*method)
-            ),
+            } => match runner {
+                PackageRunner::Npm => write!(formatter, "Installed {agent_id} via npm: {package}"),
+                PackageRunner::Deno => {
+                    write!(formatter, "Prepared {agent_id} via deno cache: {package}")
+                }
+                PackageRunner::Uvx => write!(formatter, "Installed {agent_id} via uv: {package}"),
+            },
         }
     }
 }
@@ -109,35 +112,19 @@ impl fmt::Display for UninstallMessage<'_> {
             }
             UninstallOutcome::PackageManager {
                 agent_id,
-                method,
+                runner,
                 package,
             } => write!(
                 formatter,
                 "Uninstalled {agent_id} via {}: {package}",
-                install_method(*method)
+                runner.install_name()
+            ),
+            UninstallOutcome::RunnerManaged { agent_id, runner } => write!(
+                formatter,
+                "Nothing to uninstall for {agent_id}: its package is cached by {runner}, which manages its own cache"
             ),
         }
     }
-}
-
-fn install_method(method: InstallMethod) -> &'static str {
-    match method {
-        InstallMethod::Npm => "npm",
-        InstallMethod::Deno => "deno",
-        InstallMethod::Uvx => "uv",
-    }
-}
-
-pub(super) fn install_warnings(outcome: &InstallOutcome) -> impl Iterator<Item = String> {
-    let warning = match outcome {
-        InstallOutcome::Binary {
-            agent_id,
-            stale_cache_entries_removed: true,
-            ..
-        } => Some(format!("removed stale cached binaries for \"{agent_id}\"")),
-        _ => None,
-    };
-    warning.into_iter()
 }
 
 pub(super) fn uninstall_warnings(outcome: &UninstallOutcome) -> impl Iterator<Item = String> {
@@ -156,8 +143,11 @@ pub(super) fn uninstall_warnings(outcome: &UninstallOutcome) -> impl Iterator<It
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::installer::agents::InstalledAgent;
+    use super::{
+        AgentOutputFormat, InstallMessage, UninstallMessage, uninstall_warnings,
+        write_installed_agents, write_registry_agents,
+    };
+    use crate::installer::lifecycle::{InstallOutcome, InstalledAgent, UninstallOutcome};
     use crate::registry::Registry;
     use serde_json::json;
 
@@ -226,15 +216,10 @@ mod tests {
             agent_id: "demo".into(),
             executable_path: "/cache/demo/bin".into(),
             cache_dir: "/cache/demo".into(),
-            stale_cache_entries_removed: true,
         };
         assert_eq!(
             InstallMessage(&update).to_string(),
             "Installed demo binary at /cache/demo/bin (cache: /cache/demo)"
-        );
-        assert_eq!(
-            install_warnings(&update).collect::<Vec<_>>(),
-            vec!["removed stale cached binaries for \"demo\""]
         );
 
         let uninstall = UninstallOutcome::Cache {
@@ -250,6 +235,52 @@ mod tests {
                 .next()
                 .unwrap()
                 .contains("without checking package-manager distributions (request timed out)")
+        );
+    }
+
+    #[test]
+    fn renders_package_preparation_and_runner_managed_messages() {
+        use crate::runner::PackageRunner;
+
+        let npm = InstallOutcome::PackageManager {
+            agent_id: "demo".into(),
+            runner: PackageRunner::Npm,
+            package: "@acme/demo".into(),
+        };
+        assert_eq!(
+            InstallMessage(&npm).to_string(),
+            "Installed demo via npm: @acme/demo"
+        );
+
+        // The Deno fallback never creates a launcher: install only warms the
+        // npm cache that `deno x` reads, and the message says so.
+        let deno = InstallOutcome::PackageManager {
+            agent_id: "demo".into(),
+            runner: PackageRunner::Deno,
+            package: "@acme/demo".into(),
+        };
+        assert_eq!(
+            InstallMessage(&deno).to_string(),
+            "Prepared demo via deno cache: @acme/demo"
+        );
+
+        let uvx = InstallOutcome::PackageManager {
+            agent_id: "demo".into(),
+            runner: PackageRunner::Uvx,
+            package: "acme-demo".into(),
+        };
+        assert_eq!(
+            InstallMessage(&uvx).to_string(),
+            "Installed demo via uv: acme-demo"
+        );
+
+        let managed = UninstallOutcome::RunnerManaged {
+            agent_id: "demo".into(),
+            runner: PackageRunner::Deno,
+        };
+        assert_eq!(
+            UninstallMessage(&managed).to_string(),
+            "Nothing to uninstall for demo: its package is cached by deno, which manages its own cache"
         );
     }
 }

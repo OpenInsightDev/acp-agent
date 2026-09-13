@@ -6,36 +6,37 @@
 
 use std::ffi::OsString;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures::{FutureExt, StreamExt, stream};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::fs;
 use tokio::process::Command;
 
 use crate::installer::binary::{cache_binary_target, refresh_binary_target_in};
-use crate::installer::cache::{
-    cache_root_dir, list_cached_agents, remove_cached_agent, remove_cached_platform_except,
-};
+use crate::installer::cache::{cache_root_dir, list_cached_agents, remove_cached_agent};
 use crate::installer::environment::program_available;
-use crate::registry::{
-    BinaryTarget, NpxDistribution, Platform, Registry, RegistryAgent, UvxDistribution,
-    fetch_registry,
-};
+use crate::process;
+use crate::registry::{Platform, Registry, RegistryAgent, fetch_registry};
+use crate::runner::{PackageRunner, ResolvedDistribution, resolve_distribution};
 
 const OPERATION_CONCURRENCY: usize = 4;
 
-/// Package manager that installed or removed an agent wrapper.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallMethod {
-    /// npm installed an npm distribution.
-    Npm,
-    /// Deno installed an npm distribution.
-    Deno,
-    /// uv installed a uvx distribution.
-    Uvx,
+enum RegistrySnapshot {
+    Available(Arc<Registry>),
+    Unavailable(String),
+}
+
+impl RegistrySnapshot {
+    fn from_result(registry: Result<Registry>) -> Self {
+        match registry {
+            Ok(registry) => Self::Available(Arc::new(registry)),
+            Err(error) => Self::Unavailable(format!("{error:#}")),
+        }
+    }
 }
 
 /// Result of installing or updating an agent.
@@ -49,15 +50,13 @@ pub enum InstallOutcome {
         executable_path: PathBuf,
         /// Cache directory that owns the payload.
         cache_dir: PathBuf,
-        /// Whether an update removed older cache entries for this platform.
-        stale_cache_entries_removed: bool,
     },
     /// A package manager installed a wrapper for the agent.
     PackageManager {
         /// Registry ID of the agent.
         agent_id: String,
-        /// Package-manager strategy used.
-        method: InstallMethod,
+        /// Package runner used to prepare the distribution.
+        runner: PackageRunner,
         /// Registry package requirement passed to the installer.
         package: String,
     },
@@ -74,14 +73,23 @@ pub enum UninstallOutcome {
         /// cached binaries were removed.
         registry_error: Option<String>,
     },
-    /// A package manager removed a wrapper for the agent.
+    /// A package runner removed a wrapper for the agent.
     PackageManager {
         /// Registry ID of the agent.
         agent_id: String,
-        /// Package-manager strategy used.
-        method: InstallMethod,
+        /// Package runner used to remove the distribution.
+        runner: PackageRunner,
         /// Package name passed to the uninstaller.
         package: String,
+    },
+    /// The agent's package distribution is resolved through its runner's own
+    /// cache, which the runner manages; there is no launcher or local payload
+    /// for `acp-agent` to remove.
+    RunnerManaged {
+        /// Registry ID of the agent.
+        agent_id: String,
+        /// Runner that owns the package cache.
+        runner: PackageRunner,
     },
 }
 
@@ -122,19 +130,38 @@ pub async fn installed_agents() -> Result<Vec<InstalledAgent>> {
 /// Installs an agent using its highest-priority supported distribution.
 pub async fn install_agent(agent_id: &str) -> Result<InstallOutcome> {
     let registry = fetch_registry().await?;
-    let agent = registry.get_agent(agent_id)?;
-    install_from_registry(agent).await
+    install_from(agent_id, &registry).await
 }
 
 /// Installs distinct agent IDs concurrently, preserving first-request order.
 pub async fn install_agents(agent_ids: &[String]) -> Vec<(String, Result<InstallOutcome>)> {
-    run_concurrently(agent_ids, |id| async move { install_agent(&id).await }).await
+    if agent_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let registry = match fetch_registry().await {
+        Ok(registry) => Arc::new(registry),
+        Err(error) => {
+            let error = format!("{error:#}");
+            return run_concurrently(agent_ids, move |_id| {
+                let error = error.clone();
+                async move { Err(anyhow!(error)) }
+            })
+            .await;
+        }
+    };
+    run_concurrently(agent_ids, move |id| {
+        let registry = Arc::clone(&registry);
+        async move { install_from(&id, &registry).await }
+    })
+    .await
 }
 
 /// Updates an agent from the latest registry distribution.
 ///
-/// Binary updates prepare a complete replacement before deleting stale cache
-/// entries, so a failed refresh leaves the existing binary usable.
+/// Binary updates prepare a complete immutable digest-keyed entry. Older
+/// entries remain available until explicit uninstall or garbage collection so
+/// a running server can never lose the executable it resolved before update.
 pub async fn update_agent(agent_id: &str) -> Result<InstallOutcome> {
     let registry = fetch_registry().await?;
     let root_dir = cache_root_dir()?;
@@ -143,42 +170,109 @@ pub async fn update_agent(agent_id: &str) -> Result<InstallOutcome> {
 
 /// Updates distinct agent IDs concurrently, preserving first-request order.
 pub async fn update_agents(agent_ids: &[String]) -> Vec<(String, Result<InstallOutcome>)> {
-    run_concurrently(agent_ids, |id| async move { update_agent(&id).await }).await
+    if agent_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let registry = match fetch_registry().await {
+        Ok(registry) => Arc::new(registry),
+        Err(error) => {
+            let error = format!("{error:#}");
+            return run_concurrently(agent_ids, move |_id| {
+                let error = error.clone();
+                async move { Err(anyhow!(error)) }
+            })
+            .await;
+        }
+    };
+    let root_dir = match cache_root_dir() {
+        Ok(root_dir) => Arc::new(root_dir),
+        Err(error) => {
+            let error = format!("{error:#}");
+            return run_concurrently(agent_ids, move |_id| {
+                let error = error.clone();
+                async move { Err(anyhow!(error)) }
+            })
+            .await;
+        }
+    };
+    run_concurrently(agent_ids, move |id| {
+        let registry = Arc::clone(&registry);
+        let root_dir = Arc::clone(&root_dir);
+        async move { update_from(&id, &registry, &root_dir).await }
+    })
+    .await
 }
 
 /// Removes cached binaries or a package-manager wrapper for an agent.
 pub async fn uninstall_agent(agent_id: &str) -> Result<UninstallOutcome> {
-    let registry = fetch_registry().await;
+    let registry = RegistrySnapshot::from_result(fetch_registry().await);
     let root_dir = cache_root_dir()?;
-    uninstall_from(agent_id, registry, &root_dir).await
+    uninstall_from(agent_id, &registry, &root_dir).await
 }
 
 /// Uninstalls distinct agent IDs concurrently, preserving first-request order.
 pub async fn uninstall_agents(agent_ids: &[String]) -> Vec<(String, Result<UninstallOutcome>)> {
-    run_concurrently(agent_ids, |id| async move { uninstall_agent(&id).await }).await
+    if agent_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let registry = Arc::new(RegistrySnapshot::from_result(fetch_registry().await));
+    let root_dir = match cache_root_dir() {
+        Ok(root_dir) => Arc::new(root_dir),
+        Err(error) => {
+            let error = format!("{error:#}");
+            return run_concurrently(agent_ids, move |_id| {
+                let error = error.clone();
+                async move { Err(anyhow!(error)) }
+            })
+            .await;
+        }
+    };
+    run_concurrently(agent_ids, move |id| {
+        let registry = Arc::clone(&registry);
+        let root_dir = Arc::clone(&root_dir);
+        async move { uninstall_from(&id, &registry, &root_dir).await }
+    })
+    .await
 }
 
 /// Installs a registry agent according to binary, npm, then uvx priority.
+///
+/// Binary distributions are downloaded into the platform cache. Package
+/// distributions share one runner decision with `run`/`serve` (see
+/// `runner::resolve_distribution`) and are prepared through that runner's own
+/// cache — a global npm install, a uv tool install, or a Deno npm-cache
+/// warm-up — so the prepared artifacts are exactly what execution consumes,
+/// instead of a separate lifecycle that later runs ignore.
 pub async fn install_from_registry(agent: &RegistryAgent) -> Result<InstallOutcome> {
-    if let Some(binary) = &agent.distribution.binary {
-        let platform = Platform::current()?;
-        if let Some(target) = binary.for_platform(platform) {
-            return install_binary(agent, target).await;
+    install_from_agent(agent).await
+}
+
+async fn install_from(agent_id: &str, registry: &Registry) -> Result<InstallOutcome> {
+    let agent = registry.get_agent(agent_id)?;
+    install_from_agent(agent).await
+}
+
+async fn install_from_agent(agent: &RegistryAgent) -> Result<InstallOutcome> {
+    let distribution = resolve_distribution(agent)?.with_context(|| {
+        format!(
+            "agent \"{}\" does not have an installable distribution",
+            agent.id
+        )
+    })?;
+    match distribution {
+        ResolvedDistribution::Binary { platform, target } => {
+            install_binary(agent, platform, target).await
+        }
+        ResolvedDistribution::Npm {
+            distribution,
+            runner,
+        } => install_package(agent, runner, &distribution.package).await,
+        ResolvedDistribution::Uvx { distribution } => {
+            install_package(agent, PackageRunner::Uvx, &distribution.package).await
         }
     }
-
-    if let Some(npx) = &agent.distribution.npx {
-        return install_npx(agent, npx).await;
-    }
-
-    if let Some(uvx) = &agent.distribution.uvx {
-        return install_uvx(agent, uvx).await;
-    }
-
-    Err(anyhow!(
-        "agent \"{}\" does not have an installable distribution",
-        agent.id
-    ))
 }
 
 async fn update_from(
@@ -188,42 +282,48 @@ async fn update_from(
 ) -> Result<InstallOutcome> {
     let agent = registry.get_agent(agent_id)?;
 
-    if let Some(binary) = &agent.distribution.binary {
-        let platform = Platform::current()?;
-        if let Some(target) = binary.for_platform(platform) {
+    let distribution = resolve_distribution(agent)?.with_context(|| {
+        format!(
+            "agent \"{}\" does not have an installable distribution",
+            agent.id
+        )
+    })?;
+    match distribution {
+        ResolvedDistribution::Binary { platform, target } => {
             let cached = refresh_binary_target_in(root_dir, agent, platform, target).await?;
-            let stale_cache_entries_removed =
-                remove_cached_platform_except(root_dir, agent_id, platform, &cached.cache_dir)
-                    .await?;
-            return Ok(InstallOutcome::Binary {
+            Ok(InstallOutcome::Binary {
                 agent_id: agent.id.clone(),
                 executable_path: cached.executable_path,
                 cache_dir: cached.cache_dir,
-                stale_cache_entries_removed,
-            });
+            })
+        }
+        ResolvedDistribution::Npm {
+            distribution,
+            runner,
+        } => install_package(agent, runner, &distribution.package).await,
+        ResolvedDistribution::Uvx { distribution } => {
+            install_package(agent, PackageRunner::Uvx, &distribution.package).await
         }
     }
-
-    install_from_registry(agent).await
 }
 
 async fn uninstall_from(
     agent_id: &str,
-    registry: Result<Registry>,
+    registry: &RegistrySnapshot,
     root_dir: &Path,
 ) -> Result<UninstallOutcome> {
     let cache_removed = remove_cached_agent(root_dir, agent_id).await?;
 
     let agent = match registry {
-        Ok(registry) => registry.find_agent(agent_id).cloned(),
-        Err(error) if cache_removed => {
+        RegistrySnapshot::Available(registry) => registry.find_agent(agent_id),
+        RegistrySnapshot::Unavailable(error) if cache_removed => {
             return Ok(UninstallOutcome::Cache {
                 agent_id: agent_id.to_string(),
-                registry_error: Some(format!("{error:#}")),
+                registry_error: Some(error.clone()),
             });
         }
-        Err(error) => {
-            return Err(error).with_context(|| {
+        RegistrySnapshot::Unavailable(error) => {
+            return Err(anyhow!(error.clone())).with_context(|| {
                 format!("could not determine how agent \"{agent_id}\" was installed")
             });
         }
@@ -240,86 +340,92 @@ async fn uninstall_from(
         bail!("agent \"{agent_id}\" is not installed");
     };
 
-    if let Some(npx) = &agent.distribution.npx {
-        return uninstall_npx_package(agent_id, &npx.package).await;
+    let distribution = resolve_distribution(agent)?
+        .with_context(|| format!("agent \"{agent_id}\" is not installed"))?;
+    match distribution {
+        ResolvedDistribution::Binary { .. } => bail!("agent \"{agent_id}\" is not installed"),
+        ResolvedDistribution::Npm {
+            distribution,
+            runner,
+        } => uninstall_npm_package(agent_id, runner, &distribution.package).await,
+        ResolvedDistribution::Uvx { distribution } => {
+            uninstall_uvx_package(agent_id, &distribution.package).await
+        }
     }
-    if let Some(uvx) = &agent.distribution.uvx {
-        return uninstall_uvx_package(agent_id, &uvx.package).await;
-    }
-    bail!("agent \"{agent_id}\" is not installed")
 }
 
-async fn install_binary(agent: &RegistryAgent, target: &BinaryTarget) -> Result<InstallOutcome> {
-    let platform = Platform::current()?;
+async fn install_binary(
+    agent: &RegistryAgent,
+    platform: Platform,
+    target: &crate::registry::BinaryTarget,
+) -> Result<InstallOutcome> {
     let cached_binary = cache_binary_target(agent, platform, target).await?;
     Ok(InstallOutcome::Binary {
         agent_id: agent.id.clone(),
         executable_path: cached_binary.executable_path,
         cache_dir: cached_binary.cache_dir,
-        stale_cache_entries_removed: false,
     })
 }
 
-async fn install_npx(
+/// Prepares a package distribution through the shared runner's own cache.
+///
+/// The runner is decided by [`crate::runner::resolve_distribution`], the same
+/// function `run`/`serve` use to build the execution command, so preparation
+/// and execution can never drift apart:
+///
+/// - `npm exec` finds globally installed npm launchers, so npm installs the
+///   package globally;
+/// - `deno x` reads Deno's npm cache, so Deno warms exactly that cache;
+/// - `uvx` prefers tools installed with `uv tool install`, so uv installs the
+///   tool.
+async fn install_package(
     agent: &RegistryAgent,
-    distribution: &NpxDistribution,
+    runner: PackageRunner,
+    package: &str,
 ) -> Result<InstallOutcome> {
-    let method = if program_available("npm")? {
-        run_command(
-            "npm",
-            ["install", "--global", distribution.package.as_str()],
-            &format!("npm package {}", distribution.package),
-        )
-        .await?;
-        InstallMethod::Npm
-    } else {
-        run_command(
-            "deno",
-            deno_install_args(&distribution.package),
-            &format!("npm package {} via Deno", distribution.package),
-        )
-        .await?;
-        InstallMethod::Deno
-    };
-    Ok(InstallOutcome::PackageManager {
-        agent_id: agent.id.clone(),
-        method,
-        package: distribution.package.clone(),
-    })
-}
-
-async fn install_uvx(
-    agent: &RegistryAgent,
-    distribution: &UvxDistribution,
-) -> Result<InstallOutcome> {
-    run_command(
-        "uv",
-        ["tool", "install", distribution.package.as_str()],
-        &format!("uv package {}", distribution.package),
-    )
-    .await?;
-    Ok(InstallOutcome::PackageManager {
-        agent_id: agent.id.clone(),
-        method: InstallMethod::Uvx,
-        package: distribution.package.clone(),
-    })
-}
-
-async fn uninstall_npx_package(agent_id: &str, package: &str) -> Result<UninstallOutcome> {
-    let package = bare_package_name(package);
-    let npm_installed = if program_available("npm")? {
-        npm_package_installed(package).await?
-    } else {
-        false
-    };
-    let deno_installations = find_deno_installations(&deno_install_root()?, package).await?;
-
-    if npm_installed && !deno_installations.is_empty() {
-        bail!(
-            "npm package {package} is installed through both npm and Deno; remove one installation explicitly and retry"
-        );
+    match runner {
+        PackageRunner::Npm => {
+            run_command(
+                "npm",
+                ["install", "--global", package],
+                &format!("npm package {package}"),
+            )
+            .await?;
+        }
+        PackageRunner::Deno => {
+            run_command(
+                "deno",
+                deno_cache_args(package),
+                &format!("npm package {package} via Deno"),
+            )
+            .await?;
+        }
+        PackageRunner::Uvx => {
+            run_command(
+                "uv",
+                ["tool", "install", package],
+                &format!("uv package {package}"),
+            )
+            .await?;
+        }
     }
-    if npm_installed {
+    Ok(InstallOutcome::PackageManager {
+        agent_id: agent.id.clone(),
+        runner,
+        package: package.to_string(),
+    })
+}
+
+async fn uninstall_npm_package(
+    agent_id: &str,
+    runner: PackageRunner,
+    package: &str,
+) -> Result<UninstallOutcome> {
+    let package = bare_package_name(package);
+    if runner == PackageRunner::Npm
+        && program_available("npm")?
+        && npm_package_installed(package).await?
+    {
         run_command(
             "npm",
             ["uninstall", "--global", package],
@@ -328,24 +434,15 @@ async fn uninstall_npx_package(agent_id: &str, package: &str) -> Result<Uninstal
         .await?;
         return Ok(UninstallOutcome::PackageManager {
             agent_id: agent_id.to_string(),
-            method: InstallMethod::Npm,
+            runner,
             package: package.to_string(),
         });
     }
-    if !deno_installations.is_empty() {
-        if !program_available("deno")? {
-            bail!("npm package {package} is installed through Deno, but deno is not available");
-        }
-        let mut args = vec!["uninstall".to_string(), "--global".to_string()];
-        args.extend(deno_installations);
-        run_command("deno", args, &format!("npm package {package}")).await?;
-        return Ok(UninstallOutcome::PackageManager {
-            agent_id: agent_id.to_string(),
-            method: InstallMethod::Deno,
-            package: package.to_string(),
-        });
-    }
-    bail!("npm package {package} is not installed through npm or Deno")
+    // Deno owns its npm cache and does not create a global launcher.
+    Ok(UninstallOutcome::RunnerManaged {
+        agent_id: agent_id.to_string(),
+        runner,
+    })
 }
 
 async fn uninstall_uvx_package(agent_id: &str, package: &str) -> Result<UninstallOutcome> {
@@ -358,7 +455,7 @@ async fn uninstall_uvx_package(agent_id: &str, package: &str) -> Result<Uninstal
     .await?;
     Ok(UninstallOutcome::PackageManager {
         agent_id: agent_id.to_string(),
-        method: InstallMethod::Uvx,
+        runner: PackageRunner::Uvx,
         package: tool_name.to_string(),
     })
 }
@@ -369,9 +466,9 @@ where
     S: Into<OsString>,
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<OsString>>();
-    let output = Command::new(program)
-        .args(&args)
-        .output()
+    let mut command = Command::new(program);
+    command.args(&args);
+    let output = process::output(&mut command)
         .await
         .with_context(|| format!("failed to run {program}"))?;
     if output.status.success() {
@@ -398,53 +495,58 @@ where
         .filter(|id| seen.insert((*id).clone()))
         .cloned()
         .collect::<Vec<_>>();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(OPERATION_CONCURRENCY));
     let operation = Arc::new(operation);
-    let mut tasks = tokio::task::JoinSet::new();
 
-    for id in &ids {
-        let id = id.clone();
-        let operation = Arc::clone(&operation);
-        let semaphore = Arc::clone(&semaphore);
-        tasks.spawn(async move {
-            let _permit = semaphore
-                .acquire()
-                .await
-                .expect("semaphore is never closed");
-            let task_id = id.clone();
-            match tokio::spawn(async move { (task_id.clone(), operation(task_id).await) }).await {
-                Ok(result) => result,
-                Err(error) => (
-                    id.clone(),
-                    Err(anyhow!("operation for agent \"{id}\" panicked: {error}")),
-                ),
+    let results = stream::iter(ids.iter().cloned())
+        .map(|id| {
+            let operation = Arc::clone(&operation);
+            async move {
+                let result = AssertUnwindSafe(operation(id.clone())).catch_unwind().await;
+                match result {
+                    Ok(result) => (id, result),
+                    Err(panic) => {
+                        let message = match panic.downcast_ref::<String>() {
+                            Some(message) => message.clone(),
+                            None => panic
+                                .downcast_ref::<&str>()
+                                .copied()
+                                .unwrap_or("unknown panic")
+                                .to_owned(),
+                        };
+                        (
+                            id.clone(),
+                            Err(anyhow!("operation for agent \"{id}\" panicked: {message}")),
+                        )
+                    }
+                }
             }
-        });
-    }
+        })
+        .buffer_unordered(OPERATION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
 
-    let mut results = std::collections::HashMap::with_capacity(ids.len());
-    while let Some(task) = tasks.join_next().await {
-        let (id, result) = task.expect("outer concurrent task does not panic");
-        results.insert(id, result);
-    }
+    let mut results_by_id = results
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
     ids.into_iter()
         .map(|id| {
-            let result = results
+            let result = results_by_id
                 .remove(&id)
-                .expect("every spawned task returns a result");
+                .expect("every concurrent operation returns a result");
             (id, result)
         })
         .collect()
 }
 
-fn deno_install_args(package: &str) -> [&str; 6] {
+/// Warms Deno's npm cache for an npm package: `deno x` (the shared runner for
+/// npm distributions when npm is unavailable) reads exactly this cache, so
+/// preparation and execution stay on one lifecycle.
+fn deno_cache_args(package: &str) -> [String; 4] {
     [
-        "install",
-        "--global",
-        "--allow-all",
-        "--minimum-dependency-age",
-        "0",
-        package,
+        "cache".to_string(),
+        "--minimum-dependency-age".to_string(),
+        "0".to_string(),
+        format!("npm:{package}"),
     ]
 }
 
@@ -478,9 +580,9 @@ fn uv_tool_name(package: &str) -> Result<&str> {
 }
 
 async fn npm_package_installed(package: &str) -> Result<bool> {
-    let output = Command::new("npm")
-        .args(["list", "--global", "--depth=0", "--json"])
-        .output()
+    let mut command = Command::new("npm");
+    command.args(["list", "--global", "--depth=0", "--json"]);
+    let output = process::output(&mut command)
         .await
         .context("failed to inspect globally installed npm packages")?;
     let value: Value = serde_json::from_slice(&output.stdout).with_context(|| {
@@ -500,48 +602,6 @@ fn npm_list_contains(value: &Value, package: &str) -> bool {
         .is_some_and(|dependencies| dependencies.contains_key(package))
 }
 
-fn deno_install_root() -> Result<PathBuf> {
-    if let Some(root) = std::env::var_os("DENO_INSTALL_ROOT").filter(|root| !root.is_empty()) {
-        return Ok(root.into());
-    }
-    dirs::home_dir()
-        .map(|home| home.join(".deno"))
-        .context("could not determine the Deno installation root")
-}
-
-async fn find_deno_installations(root_dir: &Path, package: &str) -> Result<Vec<String>> {
-    let bin_dir = root_dir.join("bin");
-    let mut entries = match fs::read_dir(&bin_dir).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", bin_dir.display()));
-        }
-    };
-    let mut installations = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        let Some(name) = file_name.strip_prefix('.').filter(|name| !name.is_empty()) else {
-            continue;
-        };
-        let Ok(bytes) = fs::read(entry.path().join("package.json")).await else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        if npm_list_contains(&value, package) {
-            installations.push(name.to_string());
-        }
-    }
-    installations.sort();
-    installations.dedup();
-    Ok(installations)
-}
-
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
@@ -549,9 +609,15 @@ mod tests {
     use tempfile::tempdir;
     use tokio::fs;
 
-    use super::*;
+    use super::{
+        RegistrySnapshot, UninstallOutcome, bare_package_name, deno_cache_args,
+        install_from_registry, npm_list_contains, run_concurrently, uninstall_from, update_from,
+        uv_tool_name,
+    };
     use crate::installer::cache::{BinaryCacheMetadata, binary_cache_paths};
-    use crate::registry::{AgentDistribution, BinaryDistribution};
+    use crate::registry::{
+        AgentDistribution, BinaryDistribution, BinaryTarget, Platform, Registry, RegistryAgent,
+    };
 
     fn sample_agent() -> RegistryAgent {
         RegistryAgent {
@@ -634,7 +700,8 @@ mod tests {
         };
         let temp_dir = tempdir().unwrap();
 
-        let error = uninstall_from("demo", Ok(registry), temp_dir.path())
+        let registry = RegistrySnapshot::from_result(Ok(registry));
+        let error = uninstall_from("demo", &registry, temp_dir.path())
             .await
             .unwrap_err();
 
@@ -655,14 +722,21 @@ mod tests {
         assert_eq!(uv_tool_name("demo[cli]>=1.2").unwrap(), "demo");
         assert!(uv_tool_name("==1.2").is_err());
         assert_eq!(
-            deno_install_args("@agentclientprotocol/codex-acp@1.1.7"),
+            deno_cache_args("@agentclientprotocol/codex-acp@1.1.7"),
             [
-                "install",
-                "--global",
-                "--allow-all",
-                "--minimum-dependency-age",
-                "0",
-                "@agentclientprotocol/codex-acp@1.1.7",
+                "cache".to_string(),
+                "--minimum-dependency-age".to_string(),
+                "0".to_string(),
+                "npm:@agentclientprotocol/codex-acp@1.1.7".to_string(),
+            ]
+        );
+        assert_eq!(
+            deno_cache_args("acp-demo"),
+            [
+                "cache".to_string(),
+                "--minimum-dependency-age".to_string(),
+                "0".to_string(),
+                "npm:acp-demo".to_string(),
             ]
         );
     }
@@ -672,25 +746,6 @@ mod tests {
         let list = json!({"dependencies": {"@acme/demo": {"version": "1.0.0"}, "demo-extra": {}}});
         assert!(npm_list_contains(&list, "@acme/demo"));
         assert!(!npm_list_contains(&list, "demo"));
-    }
-
-    #[tokio::test]
-    async fn detects_deno_installation_by_package_metadata() {
-        let temp_dir = tempdir().unwrap();
-        let installation = temp_dir.path().join("bin/.demo-command");
-        fs::create_dir_all(&installation).await.unwrap();
-        fs::write(
-            installation.join("package.json"),
-            br#"{"dependencies":{"@acme/demo":"1.2.3"}}"#,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            find_deno_installations(temp_dir.path(), "@acme/demo")
-                .await
-                .unwrap(),
-            vec!["demo-command"]
-        );
     }
 
     #[tokio::test]
@@ -711,9 +766,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            uninstall_from("demo", Err(anyhow!("offline")), &root)
-                .await
-                .unwrap(),
+            uninstall_from(
+                "demo",
+                &RegistrySnapshot::from_result(Err(anyhow!("offline"))),
+                &root,
+            )
+            .await
+            .unwrap(),
             UninstallOutcome::Cache {
                 agent_id: "demo".to_string(),
                 registry_error: Some("offline".to_string())
@@ -749,8 +808,6 @@ mod tests {
             Platform::DarwinX86_64 => binary.darwin_x86_64 = Some(target),
             Platform::LinuxAarch64 => binary.linux_aarch64 = Some(target),
             Platform::LinuxX86_64 => binary.linux_x86_64 = Some(target),
-            Platform::WindowsAarch64 => binary.windows_aarch64 = Some(target),
-            Platform::WindowsX86_64 => binary.windows_x86_64 = Some(target),
         }
         let mut agent = sample_agent();
         agent.distribution.binary = Some(binary);

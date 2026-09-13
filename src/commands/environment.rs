@@ -4,7 +4,7 @@ use anyhow::Result;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 use crate::installer::environment::{
-    EnvironmentReport, InstallationPlan, InstallationResult, ToolAvailability,
+    EnvironmentReport, InstallationPlan, InstalledTool, ToolAvailability,
 };
 
 pub(super) fn write_detection_report<W: Write>(
@@ -66,7 +66,7 @@ pub(super) fn write_installation_start<W: Write>(writer: &mut W) -> Result<()> {
 
 pub(super) fn write_installation_complete<W: Write>(
     writer: &mut W,
-    results: &[InstallationResult],
+    results: &[InstalledTool],
 ) -> Result<()> {
     writeln!(writer)?;
     for result in results {
@@ -126,17 +126,19 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use super::*;
-    use tokio::io::AsyncRead;
+    use super::prompt_for_installation;
+    use tokio::io::{AsyncBufRead, AsyncRead};
 
     #[tokio::test]
     async fn prompts_default_to_yes_on_empty_input() {
         let mut input = io::Cursor::new("\n");
         let mut output = Vec::new();
 
-        assert!(prompt_for_installation(&mut input, &mut output)
-            .await
-            .unwrap());
+        assert!(
+            prompt_for_installation(&mut input, &mut output)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Proceed with installation? [Y/n]: "
@@ -148,9 +150,11 @@ mod tests {
         let mut input = io::Cursor::new("maybe\nn\n");
         let mut output = Vec::new();
 
-        assert!(!prompt_for_installation(&mut input, &mut output)
-            .await
-            .unwrap());
+        assert!(
+            !prompt_for_installation(&mut input, &mut output)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Proceed with installation? [Y/n]: Please answer with y or n.\nProceed with installation? [Y/n]: "
