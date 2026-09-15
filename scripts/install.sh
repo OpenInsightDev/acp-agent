@@ -1,12 +1,21 @@
 #!/bin/sh
 #
-# Install acp-agent from its GitHub release assets.
+# Install acp-agent.
 #
-# Downloads the archive for this OS/arch and installs the binary into
-# $INSTALL_DIR. No GitHub API call is made: assets are fetched via the
-# deterministic releases/latest/download/ (or releases/download/<tag>/)
-# URLs, and the download is verified against the SHA256SUMS published
-# with the release.
+# Binaries are published as npm platform packages (cargo-npm) and served
+# from the jsDelivr CDN, so the bare binary is fetched from
+#   https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-<platform>@<version>/acp-agent
+# If the CDN is unreachable, the script falls back to the GitHub release
+# archive (verified against the SHA256SUMS published with the release).
+#
+# No GitHub API call is made. The version to install is resolved from
+# ACP_AGENT_VERSION, or - for the default "latest" install - by following
+# the deterministic releases/latest/download/ redirect once (a single HEAD
+# request) to learn the current release tag. The CDN is only ever queried
+# with that exact version: `@latest` is not used because it silently serves
+# the newest *published npm* version, which can lag behind the GitHub
+# release if the npm publish step fails or is slow. Downloaded CDN binaries
+# are additionally checked to report the expected version.
 #
 # Optional env overrides:
 #   ACP_AGENT_REPO          GitHub repo (default: OpenInsightDev/acp-agent)
@@ -44,10 +53,35 @@ esac
 
 # Asset naming convention used by .github/workflows/release.yml.
 ASSET="${BIN_NAME}-${OS}-${ARCH}.tar.gz"
+
+# npm platform package name for this OS/arch (cargo-npm naming), e.g.
+# @open-insight/acp-agent-linux-x64. The bare binary lives at the package root.
+case "$OS-$ARCH" in
+  linux-x86_64) NPM_PLATFORM="linux-x64" ;;
+  linux-aarch64) NPM_PLATFORM="linux-arm64" ;;
+  darwin-x86_64) NPM_PLATFORM="darwin-x64" ;;
+  darwin-aarch64) NPM_PLATFORM="darwin-arm64" ;;
+  *) NPM_PLATFORM="" ;;
+esac
+
+# Resolve the exact version to install. Prefer ACP_AGENT_VERSION; otherwise
+# follow the releases/latest/download/ redirect (one HEAD request, no API).
+# Prints the version, or nothing if it cannot be determined (e.g. GitHub
+# unreachable); callers fall back to the plain latest URLs in that case.
+resolve_latest_version() {
+  # GitHub redirects latest -> releases/download/vX.y.z/... -> signed asset
+  # URL, so follow only the first hop and read its Location header.
+  curl -sSI --retry 2 --proto '=https' --tlsv1.2 \
+    -H "User-Agent: ${BIN_NAME}-install" \
+    "https://github.com/$REPO/releases/latest/download/$ASSET" 2>/dev/null |
+    tr -d '\r' | sed -n 's/^[Ll]ocation: //p' | head -n 1 |
+    sed -n 's#.*/releases/download/v\([^/]*\)/.*#\1#p'
+}
+
 if [ -n "${ACP_AGENT_VERSION:-}" ]; then
-  BASE_URL="https://github.com/$REPO/releases/download/v${ACP_AGENT_VERSION#v}"
+  VERSION="${ACP_AGENT_VERSION#v}"
 else
-  BASE_URL="https://github.com/$REPO/releases/latest/download"
+  VERSION="$(resolve_latest_version)"
 fi
 
 download() {
@@ -55,9 +89,41 @@ download() {
     -H "User-Agent: ${BIN_NAME}-install" -o "$2" "$1"
 }
 
+# True if the binary runs and reports the expected version, e.g.
+# `acp-agent 0.0.4` -> "0.0.4". Also guards against truncated or
+# wrong-architecture downloads.
+binary_version_matches() {
+  [ "$("$1" --version 2>/dev/null | sed 's/.* //')" = "$2" ]
+}
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
+# 1. Prefer the jsDelivr CDN: the npm platform package carries the bare
+# binary, so no archive extraction is needed. Only exact versions are used
+# and the downloaded binary must report that version - anything else falls
+# back to GitHub.
+if [ -n "$NPM_PLATFORM" ] && [ -n "$VERSION" ]; then
+  BIN_PATH="$TMP_DIR/$BIN_NAME"
+  NPM_BIN_URL="https://cdn.jsdelivr.net/npm/@open-insight/acp-agent-${NPM_PLATFORM}@${VERSION}/acp-agent"
+  if download "$NPM_BIN_URL" "$BIN_PATH"; then
+    chmod +x "$BIN_PATH" # curl -o does not set the executable bit
+    if binary_version_matches "$BIN_PATH" "$VERSION"; then
+      mkdir -p "$INSTALL_DIR"
+      install -m 0755 "$BIN_PATH" "$INSTALL_DIR/$BIN_NAME"
+      echo "installed $BIN_NAME $VERSION to $INSTALL_DIR/$BIN_NAME"
+      exit 0
+    fi
+  fi
+  echo "warning: jsDelivr download failed or version mismatch ($NPM_BIN_URL); falling back to GitHub releases" >&2
+fi
+
+# 2. Fallback: GitHub release archive, verified against SHA256SUMS.
+if [ -n "$VERSION" ]; then
+  BASE_URL="https://github.com/$REPO/releases/download/v$VERSION"
+else
+  BASE_URL="https://github.com/$REPO/releases/latest/download"
+fi
 ARCHIVE="$TMP_DIR/$ASSET"
 download "$BASE_URL/$ASSET" "$ARCHIVE" || {
   echo "failed to download $BASE_URL/$ASSET" >&2
