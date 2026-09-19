@@ -75,9 +75,9 @@ dependencies = [
 
 [[package]]
 name = "agent-client-protocol-http"
-version = "2.0.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b4d8db045bc66b84526dfe4ef2ffb87d651b81c4ff945f91c63a2bc677a582c"
+checksum = "5f0d39290be11146183166d4d077013b94a204516c9ecbbb058a234c28c5babc"
 dependencies = [
  "agent-client-protocol",
  "async-stream",
