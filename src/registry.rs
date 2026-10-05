@@ -15,6 +15,12 @@ use serde_json::Value;
 pub const REGISTRY_URL: &str =
     "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 
+/// Environment variable overriding the registry payload URL.
+///
+/// It exists so tests can serve a mock catalog; the published CDN URL stays the
+/// default and no runtime configuration is required to use the CLI.
+pub const REGISTRY_URL_ENV: &str = "ACP_AGENT_REGISTRY_URL";
+
 /// CLI arguments forwarded to an agent's executable or package entry point.
 pub type CommandArgs = Vec<String>;
 
@@ -284,9 +290,21 @@ impl Platform {
     }
 }
 
-/// Downloads the registry JSON and resolves it into a `Registry`.
+/// URL the registry payload is fetched from.
+///
+/// [`REGISTRY_URL_ENV`] overrides the published URL; an empty or blank override
+/// is ignored so a stray environment variable cannot break the CLI.
+pub fn registry_url() -> String {
+    match std::env::var(REGISTRY_URL_ENV) {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => REGISTRY_URL.to_string(),
+    }
+}
+
+/// Downloads the registry JSON and resolves it into a [`Registry`].
 pub async fn fetch_registry() -> Result<Registry> {
-    let response = reqwest::get(REGISTRY_URL)
+    let url = registry_url();
+    let response = reqwest::get(&url)
         .await
         .map_err(|error| anyhow!("failed to fetch registry payload: {error}"))?;
     let response = response
@@ -301,7 +319,10 @@ pub async fn fetch_registry() -> Result<Registry> {
 
 /// Normalizes decode failure errors so the caller knows which URL failed.
 fn registry_decode_error(reason: impl std::fmt::Display) -> anyhow::Error {
-    anyhow!("failed to decode registry payload from {REGISTRY_URL}: {reason}")
+    anyhow!(
+        "failed to decode registry payload from {}: {reason}",
+        registry_url()
+    )
 }
 
 #[cfg(test)]
