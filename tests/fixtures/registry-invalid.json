@@ -1,0 +1,14 @@
+{
+  "version": "mock-invalid-1",
+  "agents": [
+    {
+      "id": "mock-broken",
+      "name": "Broken Mock Agent",
+      "version": "0.1.0",
+      "description": "mock agent without any distribution source",
+      "authors": ["ACP"],
+      "license": "MIT",
+      "distribution": {}
+    }
+  ]
+}
