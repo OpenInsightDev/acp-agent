@@ -1,0 +1,83 @@
+{
+  "version": "mock-1",
+  "agents": [
+    {
+      "id": "mock-npx",
+      "name": "alpha agent",
+      "version": "1.0.0",
+      "description": "npm-packaged mock agent",
+      "authors": ["ACP"],
+      "license": "MIT",
+      "distribution": {
+        "npx": {
+          "package": "@mock/alpha",
+          "args": ["--stdio"]
+        }
+      }
+    },
+    {
+      "id": "mock-binary",
+      "name": "Beta Agent",
+      "version": "2.3.4",
+      "description": "binary-packaged mock agent for every supported platform",
+      "repository": "https://example.invalid/mock-binary",
+      "website": "https://example.invalid/mock-binary/docs",
+      "authors": ["ACP"],
+      "license": "Apache-2.0",
+      "icon": "https://example.invalid/mock-binary/icon.png",
+      "distribution": {
+        "binary": {
+          "darwin-aarch64": {
+            "archive": "{fixture_server}/binary/darwin-aarch64.tar.gz",
+            "cmd": "bin/mock-binary",
+            "sha256": "{archive_sha256}",
+            "args": ["--acp"],
+            "env": { "MOCK_MODE": "binary" }
+          },
+          "darwin-x86_64": {
+            "archive": "{fixture_server}/binary/darwin-x86_64.tar.gz",
+            "cmd": "bin/mock-binary",
+            "sha256": "{archive_sha256}"
+          },
+          "linux-aarch64": {
+            "archive": "{fixture_server}/binary/linux-aarch64.tar.gz",
+            "cmd": "bin/mock-binary",
+            "sha256": "{archive_sha256}"
+          },
+          "linux-x86_64": {
+            "archive": "{fixture_server}/binary/linux-x86_64.tar.gz",
+            "cmd": "bin/mock-binary",
+            "sha256": "{archive_sha256}"
+          }
+        }
+      }
+    },
+    {
+      "id": "mock-uvx",
+      "name": "Beta Agent",
+      "version": "0.9.0",
+      "description": "python-packaged mock agent",
+      "authors": ["ACP", "Second Author"],
+      "license": "MIT",
+      "distribution": {
+        "uvx": {
+          "package": "mock-beta",
+          "env": { "MOCK_MODE": "uvx" }
+        }
+      }
+    },
+    {
+      "id": "mock-bare",
+      "name": "Gamma Agent",
+      "version": "0.0.1",
+      "description": "mock agent with only the required fields",
+      "authors": [],
+      "license": "MIT",
+      "distribution": {
+        "npx": {
+          "package": "@mock/gamma"
+        }
+      }
+    }
+  ]
+}
