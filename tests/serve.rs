@@ -87,6 +87,7 @@ mod startup {
         let harness = Harness::new();
         let catalog = catalog_with(&harness, &AcpAgent::Echo.script()).await;
         let serve = serve(&harness, &catalog, &[]).await;
+        serve.wait_for_stderr("Agent readiness probe at").await;
 
         assert!(
             serve.stdout_text().is_empty(),
@@ -361,7 +362,9 @@ mod health {
 mod readiness {
     use std::time::Duration;
 
-    use crate::harness::{AcpAgent, Harness, http_get, http_post_json, wait_for_http_status};
+    use crate::harness::{
+        AcpAgent, Harness, SERVE_START_TIMEOUT, http_get, http_post_json, wait_for_http_status,
+    };
     use crate::{INITIALIZE, catalog_with, serve};
 
     #[tokio::test]
@@ -369,8 +372,7 @@ mod readiness {
         let harness = Harness::new();
         let catalog = catalog_with(&harness, &AcpAgent::Echo.script()).await;
         let serve = serve(&harness, &catalog, &[]).await;
-        let response = http_get(&serve.url("/readyz")).await;
-        response.has_status(200);
+        let response = wait_for_http_status(&serve.url("/readyz"), 200, SERVE_START_TIMEOUT).await;
         assert_eq!(response.body, "ready\n");
     }
 

@@ -8,8 +8,12 @@ use tokio::time::sleep;
 
 use super::{Command, Harness};
 
-/// How long a `serve` process may take to print its address and answer.
-pub const SERVE_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a `serve` process may take to print its address, answer, and stop.
+///
+/// Generous on purpose: the whole suite runs its targets in parallel, so a
+/// loaded machine can stretch a launch or the shutdown drain well past what an
+/// idle run takes.
+pub const SERVE_START_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A foreground `acp-agent serve` owned by one test.
@@ -69,6 +73,26 @@ impl Serve {
 
     pub fn stderr_text(&self) -> String {
         std::fs::read_to_string(&self.stderr_log).unwrap_or_default()
+    }
+
+    /// Waits until standard error contains `needle`.
+    ///
+    /// The address line and the readiness line are separate writes, so a case
+    /// that inspects the whole stream waits for the later one instead of racing
+    /// the process.
+    pub async fn wait_for_stderr(&self, needle: &str) {
+        let deadline = Instant::now() + SERVE_START_TIMEOUT;
+        loop {
+            if self.stderr_text().contains(needle) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "serve did not report {needle:?} within {SERVE_START_TIMEOUT:?}\nstderr:\n{}",
+                self.stderr_text().trim_end_matches('\n')
+            );
+            sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// Reads the address line the process printed, failing if it never appeared.
