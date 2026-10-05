@@ -28,26 +28,26 @@
       "distribution": {
         "binary": {
           "darwin-aarch64": {
-            "archive": "https://example.invalid/mock-binary-darwin-aarch64.tar.gz",
+            "archive": "{fixture_server}/binary/darwin-aarch64.tar.gz",
             "cmd": "bin/mock-binary",
-            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "sha256": "{archive_sha256}",
             "args": ["--acp"],
             "env": { "MOCK_MODE": "binary" }
           },
           "darwin-x86_64": {
-            "archive": "https://example.invalid/mock-binary-darwin-x86_64.tar.gz",
+            "archive": "{fixture_server}/binary/darwin-x86_64.tar.gz",
             "cmd": "bin/mock-binary",
-            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "sha256": "{archive_sha256}"
           },
           "linux-aarch64": {
-            "archive": "https://example.invalid/mock-binary-linux-aarch64.tar.gz",
+            "archive": "{fixture_server}/binary/linux-aarch64.tar.gz",
             "cmd": "bin/mock-binary",
-            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "sha256": "{archive_sha256}"
           },
           "linux-x86_64": {
-            "archive": "https://example.invalid/mock-binary-linux-x86_64.tar.gz",
+            "archive": "{fixture_server}/binary/linux-x86_64.tar.gz",
             "cmd": "bin/mock-binary",
-            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "sha256": "{archive_sha256}"
           }
         }
       }

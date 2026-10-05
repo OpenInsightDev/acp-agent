@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use crate::installer::binary::{cache_binary_target, refresh_binary_target_in};
+use crate::installer::cache::remove_replaced_platform_entries;
 use crate::installer::cache::{cache_root_dir, list_cached_agents, remove_cached_agent};
 use crate::installer::environment::program_available;
 use crate::process;
@@ -159,9 +160,10 @@ pub async fn install_agents(agent_ids: &[String]) -> Vec<(String, Result<Install
 
 /// Updates an agent from the latest registry distribution.
 ///
-/// Binary updates prepare a complete immutable digest-keyed entry. Older
-/// entries remain available until explicit uninstall or garbage collection so
-/// a running server can never lose the executable it resolved before update.
+/// A binary update publishes a complete immutable digest-keyed entry, then
+/// removes the entries it replaced for the same agent and platform. An entry a
+/// running server is still executing is left for a later update or uninstall,
+/// so an update can never pull an executable out from under a live connection.
 pub async fn update_agent(agent_id: &str) -> Result<InstallOutcome> {
     let registry = fetch_registry().await?;
     let root_dir = cache_root_dir()?;
@@ -291,6 +293,10 @@ async fn update_from(
     match distribution {
         ResolvedDistribution::Binary { platform, target } => {
             let cached = refresh_binary_target_in(root_dir, agent, platform, target).await?;
+            // The replacement is published and verified; drop what it replaced so
+            // a machine does not accumulate one entry per published digest.
+            remove_replaced_platform_entries(root_dir, &agent.id, platform, &cached.cache_dir)
+                .await?;
             Ok(InstallOutcome::Binary {
                 agent_id: agent.id.clone(),
                 executable_path: cached.executable_path,

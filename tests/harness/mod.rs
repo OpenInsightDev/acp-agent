@@ -12,14 +12,23 @@ mod cli;
 mod daemon;
 mod http;
 mod registry;
+mod serve;
 mod server;
+mod ws;
 
-pub use agent::{AcpAgent, CachedBinaryFixture, binary_archive, seed_cached_binary, sha256_hex};
+pub use agent::{
+    AcpAgent, CachedBinaryFixture, FakeInvocation, binary_archive,
+    binary_archive_with_empty_directories, binary_archive_with_escaping_entry,
+    catalog_archive_path, fake_invocations, fake_program, seed_cached_binary, sha256_hex,
+    write_catalog_archives,
+};
 pub use cli::{CliOutput, Command};
 pub use daemon::Daemon;
 pub use http::{HttpResponse, free_port, http_get, http_post_json, wait_for_http_status};
 pub use registry::MockCatalog;
+pub use serve::{SERVE_START_TIMEOUT, Serve};
 pub use server::FixtureServer;
+pub use ws::WsClient;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -38,11 +47,11 @@ pub const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
 /// One test's isolated filesystem and environment; two harnesses share no
 /// directory, socket, or cache entry.
 ///
-/// The socket gets its own `/tmp` directory because a Unix socket path is capped
-/// at 104 bytes and a CI or sandbox `TMPDIR` is often nested deeper than that.
+/// The root sits directly in `/tmp` because a Unix socket path is capped at 104
+/// bytes: the harness socket and the daemon's default socket path, which is
+/// derived from `HOME`, both have to stay under that cap.
 pub struct Harness {
     root: TempDir,
-    socket_dir: TempDir,
     home: PathBuf,
     temp: PathBuf,
     bin: PathBuf,
@@ -51,30 +60,43 @@ pub struct Harness {
     path: OsString,
 }
 
+/// Cache directory a child process resolves from `HOME`.
+fn cache_layout(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Caches").join("acp-agent")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".cache").join("acp-agent")
+    }
+}
+
+/// Socket path the daemon resolves from `HOME` when its override is unset.
+fn default_daemon_socket(home: &Path) -> PathBuf {
+    cache_layout(home).join("daemon").join("daemon.sock")
+}
+
 impl Harness {
     pub fn new() -> Self {
         let root = tempfile::Builder::new()
             .prefix("acp-e2e-")
-            .tempdir()
-            .expect("failed to create the harness root directory");
+            .tempdir_in("/tmp")
+            .expect("failed to create the harness root directory in /tmp");
         let home = root.path().join("home");
         let temp = root.path().join("tmp");
         let bin = root.path().join("bin");
         let fixtures = root.path().join("fixtures");
-        for directory in [&home, &temp, &bin, &fixtures] {
+        let run = root.path().join("run");
+        for directory in [&home, &temp, &bin, &fixtures, &run] {
             fs::create_dir_all(directory).unwrap_or_else(|error| {
                 panic!("failed to create {}: {error}", directory.display())
             });
         }
-
-        let socket_dir = tempfile::Builder::new()
-            .prefix("acp-e2e-")
-            .tempdir_in("/tmp")
-            .expect("failed to create the daemon socket directory in /tmp");
         // The daemon refuses a socket whose parent is not private.
-        fs::set_permissions(socket_dir.path(), fs::Permissions::from_mode(0o700))
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700))
             .expect("failed to secure the daemon socket directory");
-        let socket = socket_dir.path().join("daemon.sock");
+        let socket = run.join("daemon.sock");
 
         let path = match env::var_os("PATH") {
             Some(inherited) if !inherited.is_empty() => {
@@ -88,7 +110,6 @@ impl Harness {
 
         Self {
             root,
-            socket_dir,
             home,
             temp,
             bin,
@@ -110,20 +131,21 @@ impl Harness {
     /// answer for the test process instead. `XDG_CACHE_HOME` is deliberately
     /// unset, so `HOME` decides, and `installed_inventory` pins the result.
     pub fn cache_root(&self) -> PathBuf {
-        #[cfg(target_os = "macos")]
-        {
-            self.home.join("Library/Caches").join("acp-agent")
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.home.join(".cache").join("acp-agent")
-        }
+        cache_layout(&self.home)
+    }
+
+    /// Socket the daemon resolves from `HOME` when `ACP_AGENT_DAEMON_SOCKET` is
+    /// unset.
+    pub fn default_socket_path(&self) -> PathBuf {
+        default_daemon_socket(&self.home)
     }
 
     pub fn temp_dir(&self) -> &Path {
         &self.temp
     }
 
+    /// Directory the harness prepends to `PATH`; [`Self::write_script`] writes
+    /// fixture binaries here.
     pub fn bin_dir(&self) -> &Path {
         &self.bin
     }
@@ -152,6 +174,12 @@ impl Harness {
     }
 
     pub fn write_fixture_file(&self, relative: &str, contents: &str) -> PathBuf {
+        self.write_fixture_bytes(relative, contents.as_bytes())
+    }
+
+    /// Writes raw bytes (an archive, say) below the fixture directory a
+    /// [`FixtureServer`] serves.
+    pub fn write_fixture_bytes(&self, relative: &str, contents: &[u8]) -> PathBuf {
         let path = self.fixtures.join(relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -196,6 +224,16 @@ pub fn repo_fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+/// The platform cache keys the registry knows, in the catalog's order.
+pub fn platform_keys() -> [&'static str; 4] {
+    [
+        "darwin-aarch64",
+        "darwin-x86_64",
+        "linux-aarch64",
+        "linux-x86_64",
+    ]
+}
+
 pub fn host_platform_key() -> &'static str {
     match (env::consts::OS, env::consts::ARCH) {
         ("macos", "aarch64") => "darwin-aarch64",
@@ -204,4 +242,13 @@ pub fn host_platform_key() -> &'static str {
         ("linux", "x86_64") => "linux-x86_64",
         (os, arch) => panic!("the harness does not support the {os}-{arch} platform"),
     }
+}
+
+/// A supported platform cache key that is not the host's, for exercising code
+/// paths that must not assume the host platform.
+pub fn other_platform_key() -> &'static str {
+    platform_keys()
+        .into_iter()
+        .find(|key| *key != host_platform_key())
+        .expect("a platform other than the host's exists")
 }

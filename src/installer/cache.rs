@@ -178,6 +178,7 @@ pub(crate) async fn acquire_binary_cache_use_write_lock(
 }
 
 /// Attempts to acquire a cache key without waiting for another process.
+///
 /// Startup cleanup uses this to skip active installs rather than delaying
 /// every CLI invocation behind a long download or extraction.
 pub(crate) async fn try_acquire_binary_cache_lock(
@@ -187,6 +188,21 @@ pub(crate) async fn try_acquire_binary_cache_lock(
         binary_cache_lock_path(paths),
         CacheLockMode::TryWrite,
         "cache lock",
+    )
+    .await
+}
+
+/// Attempts to acquire the exclusive payload-use lock without waiting.
+///
+/// Removal that must not block — the cleanup a completed update performs — uses
+/// this to leave an entry a running process is still executing in place.
+pub(crate) async fn try_acquire_binary_cache_use_write_lock(
+    paths: &BinaryCachePaths,
+) -> Result<Option<BinaryCacheLock>> {
+    acquire_cache_lock(
+        binary_cache_use_lock_path(paths),
+        CacheLockMode::TryWrite,
+        "cache use lock",
     )
     .await
 }
@@ -413,15 +429,28 @@ async fn read_cached_agent(cache_dir: &Path) -> Option<CachedAgent> {
 /// Removes every cached binary distribution for an agent.
 ///
 /// Returns `true` when at least one cache entry was removed.
-pub(crate) async fn remove_cached_agent(root_dir: &Path, agent_id: &str) -> Result<bool> {
-    remove_cached_entries(root_dir, agent_id, None, None).await
+/// How removal treats an entry another process is using.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BusyEntry {
+    /// Wait for the other process to finish, then remove the entry.
+    Wait,
+    /// Leave the entry in place; a later removal picks it up.
+    Skip,
 }
 
-/// Removes all matching entries except the cache directory that was just
-/// installed. Metadata identity is authoritative because sanitized path
-/// components are not collision-free.
-#[cfg(test)]
-pub(crate) async fn remove_cached_platform_except(
+/// Removes every cached binary for one agent.
+pub(crate) async fn remove_cached_agent(root_dir: &Path, agent_id: &str) -> Result<bool> {
+    remove_cached_entries(root_dir, agent_id, None, None, BusyEntry::Wait).await
+}
+
+/// Removes the entries a completed update replaced, keeping the fresh one.
+///
+/// Metadata identity is authoritative because sanitized path components are not
+/// collision-free. An entry a running server is still executing is skipped
+/// rather than waited on: the update is complete either way, and stalling the
+/// command behind a server's connection lifetime would be worse than leaving
+/// the entry for the next update or uninstall.
+pub(crate) async fn remove_replaced_platform_entries(
     root_dir: &Path,
     agent_id: &str,
     platform: Platform,
@@ -432,6 +461,7 @@ pub(crate) async fn remove_cached_platform_except(
         agent_id,
         Some(platform_cache_key(platform)),
         Some(keep),
+        BusyEntry::Skip,
     )
     .await
 }
@@ -441,6 +471,7 @@ async fn remove_cached_entries(
     agent_id: &str,
     platform: Option<&str>,
     keep: Option<&Path>,
+    busy: BusyEntry,
 ) -> Result<bool> {
     let mut entries = list_cached_agents(root_dir).await;
     // Inventory intentionally ignores corrupt metadata, but uninstall must
@@ -500,9 +531,10 @@ async fn remove_cached_entries(
             continue;
         }
 
-        // Hold the same per-key lock used by installers while deleting the
-        // final directory. This prevents uninstall/update cleanup from
-        // deleting a cache another process has just validated or published.
+        // Hold the same per-key locks an installer takes while deleting the
+        // final directory. This prevents uninstall/update cleanup from deleting
+        // a cache another process has just validated or published, and in
+        // `BusyEntry::Skip` mode it leaves entries that are in use untouched.
         let paths = BinaryCachePaths {
             root_dir: root_dir.to_path_buf(),
             parent_dir: entry
@@ -514,8 +546,21 @@ async fn remove_cached_entries(
             metadata_path: entry.cache_dir.join(METADATA_FILE_NAME),
             cache_dir: entry.cache_dir.clone(),
         };
-        let _lock = acquire_binary_cache_lock(&paths).await?;
-        let _use_lock = acquire_binary_cache_use_write_lock(&paths).await?;
+        let lock = match busy {
+            BusyEntry::Wait => acquire_binary_cache_lock(&paths).await.map(Some),
+            BusyEntry::Skip => try_acquire_binary_cache_lock(&paths).await,
+        }?;
+        let Some(lock) = lock else {
+            continue;
+        };
+        let use_lock = match busy {
+            BusyEntry::Wait => acquire_binary_cache_use_write_lock(&paths).await.map(Some),
+            BusyEntry::Skip => try_acquire_binary_cache_use_write_lock(&paths).await,
+        }?;
+        let Some(use_lock) = use_lock else {
+            continue;
+        };
+        let _locks = (lock, use_lock);
         match fs::remove_dir_all(&entry.cache_dir).await {
             Ok(()) => {
                 removed = true;
@@ -557,7 +602,7 @@ mod tests {
     use super::{
         BinaryCacheMetadata, BinaryCachePaths, METADATA_FILE_NAME, acquire_binary_cache_lock,
         acquire_binary_cache_use_read_lock, binary_cache_paths, binary_cache_paths_with_digest,
-        list_cached_agents, remove_cached_agent, remove_cached_platform_except,
+        list_cached_agents, remove_cached_agent, remove_replaced_platform_entries,
         safe_path_component,
     };
     use crate::registry::Platform;
@@ -791,7 +836,7 @@ mod tests {
         write_cache_entry(&darwin, "demo", "1.0.0", Platform::DarwinAarch64).await;
 
         assert!(
-            remove_cached_platform_except(
+            remove_replaced_platform_entries(
                 &cache_root,
                 "demo",
                 Platform::LinuxX86_64,
@@ -831,7 +876,7 @@ mod tests {
         write_cache_entry(&current, "demo", "2.0.0", Platform::LinuxX86_64).await;
 
         assert!(
-            remove_cached_platform_except(
+            remove_replaced_platform_entries(
                 &cache_root,
                 "demo",
                 Platform::LinuxX86_64,
@@ -841,6 +886,45 @@ mod tests {
             .unwrap()
         );
         assert!(!old.cache_dir.exists());
+        assert!(current.cache_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn replacement_cleanup_skips_an_entry_in_active_use() {
+        let temp_dir = tempdir().unwrap();
+        let cache_root = temp_dir.path().join("cache").join("acp-agent");
+        let replaced = binary_cache_paths(&cache_root, "demo", "1.0.0", Platform::LinuxX86_64);
+        let current = binary_cache_paths(&cache_root, "demo", "2.0.0", Platform::LinuxX86_64);
+        write_cache_entry(&replaced, "demo", "1.0.0", Platform::LinuxX86_64).await;
+        write_cache_entry(&current, "demo", "2.0.0", Platform::LinuxX86_64).await;
+
+        // A running server holds the payload lease of the entry it resolved.
+        let lease = acquire_binary_cache_use_read_lock(&replaced).await.unwrap();
+        assert!(
+            !remove_replaced_platform_entries(
+                &cache_root,
+                "demo",
+                Platform::LinuxX86_64,
+                &current.cache_dir,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(replaced.cache_dir.exists());
+        assert!(current.cache_dir.exists());
+
+        drop(lease);
+        assert!(
+            remove_replaced_platform_entries(
+                &cache_root,
+                "demo",
+                Platform::LinuxX86_64,
+                &current.cache_dir,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(!replaced.cache_dir.exists());
         assert!(current.cache_dir.exists());
     }
 

@@ -1,12 +1,12 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 
-use super::{Harness, host_platform_key};
+use super::{Harness, platform_keys};
 
 /// A fixture ACP agent: a shell script speaking minimal JSON-RPC over stdio.
 #[derive(Debug, Clone)]
@@ -56,6 +56,65 @@ done
     }
 }
 
+/// One recorded invocation of a [`fake_program`].
+#[derive(Debug, PartialEq, Eq)]
+pub struct FakeInvocation {
+    /// Arguments the caller passed, in order.
+    pub args: Vec<String>,
+    /// Value of the mock catalog's `MOCK_MODE` variable the process inherited, or
+    /// `None` when no such variable reached it.
+    pub mock_mode: Option<String>,
+}
+
+/// Writes a fake package manager (`npm`, `deno`, `uv`, or `uvx`) into the harness
+/// `bin/` directory, where it shadows the real tool on `PATH`.
+///
+/// Each invocation appends a record to `log`: the argument count, one line per
+/// argument, then the inherited `MOCK_MODE` value; the program then exits
+/// successfully. When `FAKE_LIST_OUTPUT` is set and the first argument is
+/// `list`, it prints that value to standard output, standing in for npm's
+/// `npm list --json` global inventory. Read the records back with
+/// [`fake_invocations`].
+pub fn fake_program(harness: &Harness, name: &str, log: &Path) -> PathBuf {
+    let body = format!(
+        "#!/bin/sh\n{{\n  printf '%s\\n' \"$#\"\n  for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\n  printf '%s\\n' \"${{MOCK_MODE-}}\"\n}} >> {log}\nif [ \"$1\" = \"list\" ] && [ -n \"${{FAKE_LIST_OUTPUT-}}\" ]; then\n  printf '%s\\n' \"$FAKE_LIST_OUTPUT\"\nfi\nexit 0\n",
+        log = shell_quote(&log.display().to_string()),
+    );
+    harness.write_script(name, &body)
+}
+
+/// Reads the records a [`fake_program`] appended to `log`.
+///
+/// A program that was never invoked (so left no log file) records nothing.
+pub fn fake_invocations(log: &Path) -> Vec<FakeInvocation> {
+    let contents = match fs::read_to_string(log) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => panic!("failed to read {}: {error}", log.display()),
+    };
+    let mut lines = contents.lines();
+    let mut invocations = Vec::new();
+    while let Some(count) = lines.next() {
+        let count: usize = count
+            .parse()
+            .unwrap_or_else(|error| panic!("malformed fake program log ({count:?}): {error}"));
+        let args = (0..count)
+            .map(|_| {
+                lines
+                    .next()
+                    .expect("fake program log has one line per argument")
+                    .to_string()
+            })
+            .collect();
+        let mock_mode = lines.next().expect("fake program log records MOCK_MODE");
+        invocations.push(FakeInvocation {
+            args,
+            mock_mode: (!mock_mode.is_empty()).then(|| mock_mode.to_string()),
+        });
+    }
+    invocations
+}
+
 #[derive(Debug, Clone)]
 pub struct CachedBinaryFixture {
     pub agent_id: String,
@@ -68,10 +127,14 @@ pub struct CachedBinaryFixture {
 /// digests: it serves inventory flows (`list --installed`, uninstall), while
 /// `run` and `serve` reuse needs archive- and payload-bound metadata that only
 /// the real installer produces.
+///
+/// `platform` is the cache key (`darwin-aarch64`, `linux-x86_64`, ...) the entry
+/// is published under, so a test can seed a platform other than the host's.
 pub fn seed_cached_binary(
     harness: &Harness,
     agent_id: &str,
     agent_version: &str,
+    platform: &str,
     script: &str,
 ) -> CachedBinaryFixture {
     const CMD: &str = "bin/agent";
@@ -79,7 +142,7 @@ pub fn seed_cached_binary(
         .cache_root()
         .join("agents")
         .join(agent_id)
-        .join(host_platform_key())
+        .join(platform)
         .join(safe_path_component(agent_version));
     let executable_path = cache_dir.join("extracted").join(CMD);
     let executable_dir = executable_path.parent().expect("command path has a parent");
@@ -93,7 +156,7 @@ pub fn seed_cached_binary(
     let metadata = serde_json::json!({
         "agent_id": agent_id,
         "agent_version": agent_version,
-        "platform": host_platform_key(),
+        "platform": platform,
         "archive": format!("https://example.invalid/{agent_id}.tar.gz"),
         "cmd": CMD,
     });
@@ -120,6 +183,79 @@ pub fn binary_archive(entry_path: &str, executable: &str, extra_files: &[(&str, 
     for (path, contents) in extra_files {
         append(&mut builder, path, contents, 0o644);
     }
+    finish(builder)
+}
+
+/// Builds a `.tar.gz` whose last entry names `escape_path` verbatim, so a test
+/// can hand an extractor a `../`-escaping entry that `tar::Header::set_path`
+/// refuses to produce.
+pub fn binary_archive_with_escaping_entry(
+    entry_path: &str,
+    executable: &str,
+    escape_path: &str,
+) -> Vec<u8> {
+    let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+    append(&mut builder, entry_path, executable, 0o755);
+
+    let mut header = tar::Header::new_gnu();
+    header.set_size(0);
+    header.set_mode(0o644);
+    let name = header.as_mut_bytes();
+    let escape = escape_path.as_bytes();
+    assert!(
+        escape.len() <= name.len(),
+        "tar names fit in the header's name field"
+    );
+    name[..escape.len()].copy_from_slice(escape);
+    header.set_cksum();
+    builder
+        .append(&header, std::io::empty())
+        .expect("failed to add the escaping entry to the fixture archive");
+
+    finish(builder)
+}
+
+/// Builds a `.tar.gz` carrying the distribution plus `directories` directory
+/// entries, enough entries to exceed the archive entry-count limit without also
+/// exceeding the separate non-directory file limit.
+///
+/// Every entry names the same path, so extraction reaches the limit without the
+/// cost of creating a directory per entry.
+pub fn binary_archive_with_empty_directories(
+    entry_path: &str,
+    executable: &str,
+    directories: usize,
+) -> Vec<u8> {
+    let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+    append(&mut builder, entry_path, executable, 0o755);
+    for _ in 0..directories {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, "lib/", std::io::empty())
+            .expect("failed to add a directory entry to the fixture archive");
+    }
+    finish(builder)
+}
+
+/// Path, relative to the harness fixture directory, the mock catalog names as a
+/// platform's binary archive.
+pub fn catalog_archive_path(platform: &str) -> String {
+    format!("binary/{platform}.tar.gz")
+}
+
+/// Writes `bytes` as the binary archive for every platform the mock catalog
+/// declares, so the catalog's archive URLs and its `{archive_sha256}`
+/// placeholder all agree with the served bytes.
+pub fn write_catalog_archives(harness: &Harness, bytes: &[u8]) {
+    for platform in platform_keys() {
+        harness.write_fixture_bytes(&catalog_archive_path(platform), bytes);
+    }
+}
+
+fn finish(builder: tar::Builder<GzEncoder<Vec<u8>>>) -> Vec<u8> {
     builder
         .into_inner()
         .expect("failed to finish the fixture archive")

@@ -1,63 +1,120 @@
 # Registry
 
 The published ACP registry payload is `acp-agent`'s source of agent metadata.
-`list` and `search` read it and print agents; `install`, `run`, `serve`, and `server register` resolve agent ids from it.
-`list --installed` reads the local cache instead and belongs to the install spec.
+`list` and `search` read it and print agents; both are specified below.
+Commands that act on one agent by id — `install`, `run`, `serve`, and `server register` — resolve that id from the same payload and are specified separately.
 
-Tests never read the published payload, because its contents change between runs.
-They serve the checked-in mock catalog at `tests/fixtures/registry.json` from the shared harness.
-The catalog is reached through `ACP_AGENT_REGISTRY_URL`, which overrides the published URL; an empty override is ignored, so the default stays the CDN URL.
+The payload URL MUST be `https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`.
+`ACP_AGENT_REGISTRY_URL` overrides it; an empty or blank value is ignored.
 
-## Mock catalog
+## Agent record
 
-A few agents cover the metadata and distribution shapes the CLI reads.
-Archive URLs are inert for `list` and `search`, which never download.
+Both commands print the same record, one per agent.
 
-| id | name | covers |
+The default TSV form MUST be three tab-separated columns in this order, one record per line, with no header line and no quoting, escaping, or padding.
+Every line MUST end with a newline, including the last; an empty catalog prints nothing. (`list::tsv`)
+
+| Column | Value |
+| --- | --- |
+| 1 | `name` |
+| 2 | `id` |
+| 3 | `description` |
+
+`--json` MUST print one array holding the records, pretty-printed with two-space indentation and followed by a newline. (`list::json`)
+
+| Field | Presence | Value |
 | --- | --- | --- |
-| `mock-npx` | `alpha agent` | npm distribution with `args`; lowercase name |
-| `mock-binary` | `Beta Agent` | binary distribution with per-platform targets, `args`, `env`, and `sha256` |
-| `mock-uvx` | `Beta Agent` | uvx distribution with `env`; name tied with `mock-binary` |
-| `mock-bare` | `Gamma Agent` | only required fields, so `repository`, `website`, and `icon` are absent |
+| `id` | always | Registry id. |
+| `name` | always | Display name. |
+| `version` | always | Version the catalog publishes for the agent. |
+| `description` | always | Short summary. |
+| `authors` | always | Array of author names, possibly empty. |
+| `license` | always | License declaration. |
+| `distribution` | always | Distribution object, copied from the catalog. |
+| `repository` | when declared | Source repository URL. |
+| `website` | when declared | Documentation site URL. |
+| `icon` | when declared | Icon URL. |
 
-Expected `list` order: `mock-npx`, `mock-binary`, `mock-uvx`, `mock-bare`.
+An optional field an agent does not declare MUST be omitted from its record, never rendered as `null`. (`list::json`)
 
 ## list
 
-`list` prints every agent in the catalog, one per line, as tab-separated `name`, `id`, `description`.
-`--json` prints the same records as a JSON array.
-Records sort by name compared in lowercase, then by id.
-Optional fields that are absent are omitted from the JSON records.
+`acp-agent list [--json]` MUST print every agent in the catalog and MUST exit `0`.
+
+Records MUST sort by `name` compared in lowercase, then by `id`. (`list::tsv`)
+A name that is already lowercase therefore sorts before an uppercase name with the same letters, and two agents sharing a name fall back to their ids.
+
+```text
+$ acp-agent list
+alpha agent	mock-npx	npm-packaged mock agent
+Beta Agent	mock-binary	binary-packaged mock agent for every supported platform
+Beta Agent	mock-uvx	python-packaged mock agent
+Gamma Agent	mock-bare	mock agent with only the required fields
+```
 
 ### Tests
 
-- `list::prints_every_agent_as_tsv`: each line has the three columns and the line count matches the catalog size.
-- `list::json_records_match_tsv_records`: the two formats carry the same name, id, and description per agent.
-- `list::orders_by_name_in_lowercase_then_id`: output follows the expected order above, so a lowercase name sorts before an uppercase one and tied names fall back to id.
-- `list::omits_absent_optional_fields`: the `mock-bare` JSON record has no `repository`, `website`, or `icon` key.
+- `list::tsv`: one TSV line per catalog agent, with the three columns and the trailing newline.
+- `list::json`: the array form, its stream framing, and each record's field presence.
 
 ## search
 
-`search <query>` prints the agents whose id, name, or description contains the query, matched case-insensitively.
-An empty query prints every agent.
-Results use the `list` order and formats.
-A query that matches nothing prints nothing and still succeeds.
+`acp-agent search <query> [--json]` MUST print the agents whose `id`, `name`, or `description` contains `query`, in the record form and the `list` order.
+
+The query MUST be trimmed and then compared as ASCII lowercase against those three fields, so surrounding whitespace is ignored and non-ASCII case pairs do not match. (`search::matches`)
+The query MUST NOT be split into words and MUST NOT be interpreted as a pattern: any substring matches.
+
+A query that is empty after trimming MUST print every agent. (`search::empty_query`)
+A query that matches nothing MUST print nothing and MUST exit `0`. (`search::no_match`)
+
+```json
+$ acp-agent search mock-bare --json
+[
+  {
+    "id": "mock-bare",
+    "name": "Gamma Agent",
+    "version": "0.0.1",
+    "description": "mock agent with only the required fields",
+    "authors": [],
+    "license": "MIT",
+    "distribution": {
+      "npx": {
+        "package": "@mock/gamma"
+      }
+    }
+  }
+]
+```
 
 ### Tests
 
-- `search::matches_id`: a query equal to an id prints exactly that agent.
-- `search::matches_name_and_description`: a query appearing only in a name or a description still prints that agent.
-- `search::ignores_case`: an upper-case query matches lower-case catalog text.
-- `search::empty_query_prints_every_agent`: an empty query prints the same records as `list`.
-- `search::unknown_query_prints_nothing`: a query with no match prints no line and exits zero.
-- `search::json_uses_the_same_records_as_tsv`: `--json` carries the same records as the TSV form.
+- `search::matches`: queries hitting an id, a name, or a description print the agents the rules above select, including upper-case and space-padded queries.
+- `search::empty_query`: an empty query prints exactly what `list` prints.
+- `search::no_match`: an unmatched query prints no line and exits `0`.
 
 ## Loading
 
-A catalog that cannot be fetched, decoded, or validated fails the command with a non-zero exit and a message naming the failure.
-An agent without any distribution source is invalid.
+A catalog that cannot be fetched, decoded, or validated MUST fail the command with exit code `1`, MUST name the failure on standard error, and MUST leave standard output empty. (`loading::invalid`)
+An agent without any distribution source makes a catalog invalid.
+
+```text
+$ acp-agent list
+Error: failed to list registry agents
+
+Caused by:
+    failed to decode registry payload from http://127.0.0.1:8099/registry-invalid.json: agents[0].distribution must contain at least one of binary, npx, or uvx
+```
 
 ### Tests
 
-- `loading::rejects_agent_without_a_distribution_source`: serving `tests/fixtures/registry-invalid.json` makes the command fail with the distribution error.
-- `loading::reports_an_unreachable_catalog`: pointing the command at a closed port makes it fail with the fetch error.
+- `loading::invalid`: a catalog whose agent declares no distribution exits `1`, names the distribution error on standard error, and prints nothing on standard output.
+- `loading::unreachable`: a catalog URL that nothing serves exits `1`, names the fetch error on standard error, and prints nothing on standard output.
+
+## Out of scope
+
+`install`, `run`, `serve`, and `server register` resolve agent ids from the same payload; their behavior belongs to their own docs.
+`list --installed` reads the local binary cache instead; see [InstallBinary.md](InstallBinary.md).
+
+## Open questions
+
+Whether `ACP_AGENT_REGISTRY_URL` is a supported public interface or internal test support, and where it is documented.
