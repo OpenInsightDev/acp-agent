@@ -11,6 +11,17 @@ documentation = "https://docs.rs/acp-agent"
 keywords = ["acp", "agent", "cli", "registry"]
 categories = ["command-line-utilities"]
 
+# npm 发布配置（cargo-npm）：平台包内嵌二进制，经 jsDelivr CDN 提供 curl 下载。
+[package.metadata.npm]
+name = "@open-insight/acp-agent"
+prefix = "@open-insight/acp-agent-"
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+
 [profile.release]
 strip = true
 
