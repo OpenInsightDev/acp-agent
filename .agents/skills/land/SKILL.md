@@ -64,7 +64,7 @@ cargo test --locked --all-targets
 ## CI
 
 - `gh pr checks --watch`. Required checks from `.github/workflows/ci.yml`: `check`, `test (ubuntu-latest)`, `test (macos-15)`.
-- Jobs skipped by that workflow's `src`/`tests`/`data`/`Cargo.toml`/`Cargo.lock` paths filter count as satisfied. Pending, failing, and missing checks do not.
+- Pending, failing, and missing checks do not count as satisfied.
 - On failure: `gh run view <run-id> --log-failed`, fix, commit, push, watch again.
 - `main` has no branch protection, so GitHub does not block a merge with red checks; enforcing this is the skill's job.
 

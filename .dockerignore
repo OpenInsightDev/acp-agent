@@ -1,8 +1,5 @@
+# Only the staged binary reaches the builder.
 *
-!Cargo.toml
-!Cargo.lock
 !Dockerfile
-!src/
-!src/**
-!data/
-!data/yolo-modes.json
+!linux
+!linux/**

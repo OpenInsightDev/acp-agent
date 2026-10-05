@@ -1,19 +1,15 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.98-bookworm AS builder
-
-WORKDIR /app
-
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY data ./data
-
-RUN cargo build --release --locked \
-    && install -Dm755 target/release/acp-agent /out/acp-agent
+# The context carries the release binary under `linux/<arch>/`, where <arch> is
+# the amd64 or arm64 that BuildKit resolves TARGETARCH to. Nothing is compiled
+# here, so no architecture needs emulation.
 
 FROM scratch AS bin
 
-COPY --from=builder /out/acp-agent /acp-agent
+ARG TARGETARCH
+COPY linux/$TARGETARCH/acp-agent /acp-agent
+# `docker create` takes its command from the image, and a scratch one brings none.
+CMD ["/acp-agent"]
 
 FROM debian:bookworm AS latest
 

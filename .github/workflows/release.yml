@@ -5,8 +5,7 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -14,50 +13,91 @@ concurrency:
 env:
   BIN_NAME: acp-agent
 
+# A `v*` tag is the single release entry point: every artifact is built from the
+# commit it points at.
 jobs:
-  build:
+  # A bullseye container holds the glibc floor at 2.31, so one binary covers
+  # Debian 11, Ubuntu 20.04 and newer. Each architecture builds natively.
+  binaries:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset_suffix: linux-x86_64
-          - os: ubuntu-24.04-arm
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             asset_suffix: linux-aarch64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            asset_suffix: darwin-x86_64
-          - os: macos-15
-            target: aarch64-apple-darwin
-            asset_suffix: darwin-aarch64
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
+    container: rust:1.98-bullseye
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --target "${{ matrix.target }}"
+          persist-credentials: false
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            target
+            /usr/local/cargo/registry
+          key: cargo-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Package
         env:
-          TARGET: ${{ matrix.target }}
           ASSET_SUFFIX: ${{ matrix.asset_suffix }}
-        run: |
-          mkdir -p dist/data
-          cp "target/${TARGET}/release/${BIN_NAME}" dist/
-          cp data/yolo-modes.json dist/data/yolo-modes.json
-          # Asset names carry no version so installers can use the
-          # releases/latest/download/ redirect; old versions stay reachable
-          # via releases/download/<tag>/.
-          tar -czf "dist/${BIN_NAME}-${ASSET_SUFFIX}.tar.gz" -C dist "${BIN_NAME}" data/yolo-modes.json
-          rm dist/${BIN_NAME}
+          TARGET: ${{ matrix.target }}
+        run: sh scripts/package-release.sh "target/${TARGET}/release/${BIN_NAME}" "${ASSET_SUFFIX}"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset_suffix }}
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  macos-binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset_suffix: darwin-x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset_suffix: darwin-aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package
+        env:
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          TARGET: ${{ matrix.target }}
+        run: sh scripts/package-release.sh "target/${TARGET}/release/${BIN_NAME}" "${ASSET_SUFFIX}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
           path: dist/*.tar.gz
           if-no-files-found: error
 
@@ -68,8 +108,13 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
       - uses: dtolnay/rust-toolchain@stable
+
       - uses: Swatinem/rust-cache@v2
+
       - id: crates_io_auth
         uses: rust-lang/crates-io-auth-action@v1
 
@@ -82,22 +127,190 @@ jobs:
               || { cat /tmp/publish.err; exit 1; }
           fi
 
+  # Nothing is compiled or emulated here: the image carries the binary built
+  # above, on a runner of its own architecture. Each platform is pushed as a
+  # digest, and only the merged manifest list is tagged.
+  images:
+    needs: binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: dist
+
+      - name: Stage the binary
+        run: |
+          mkdir -p "linux/${{ matrix.arch }}"
+          tar -xzf dist/${BIN_NAME}-*.tar.gz -C "linux/${{ matrix.arch }}" "${BIN_NAME}"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR rejects the owner's casing, and a digest push is not a tag that
+      # metadata-action could sanitise.
+      - name: Resolve the image reference
+        id: image
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # Only the labels are taken: the tags belong to the manifest list.
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.ref }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+
+      - name: Build the runtime image
+        id: latest
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: latest
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ steps.image.outputs.ref }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Build the carrier image
+        id: bin
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          target: bin
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ steps.image.outputs.ref }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Collect digests
+        run: |
+          mkdir digests
+          echo "${{ steps.latest.outputs.digest }}" > "digests/latest-${{ matrix.arch }}"
+          echo "${{ steps.bin.outputs.digest }}" > "digests/bin-${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  manifests:
+    needs: images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digests-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve the image reference
+        id: image
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.ref }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - id: meta-bin
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.ref }}
+          tags: |
+            type=raw,value=bin
+
+      - name: Tag the runtime manifest list
+        working-directory: digests
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          TAGS: ${{ steps.meta.outputs.json }}
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$TAGS") \
+            $(printf -- "$IMAGE@%s " $(cat latest-*))
+
+      - name: Tag the carrier manifest list
+        working-directory: digests
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+          TAGS: ${{ steps.meta-bin.outputs.json }}
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$TAGS") \
+            $(printf -- "$IMAGE@%s " $(cat bin-*))
+
   release:
-    needs: [build, publish]
+    needs: [binaries, macos-binaries, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Scoped past the digest artifacts the image jobs also upload.
       - uses: actions/download-artifact@v8
         with:
+          pattern: ${{ env.BIN_NAME }}-*
           path: dist
           merge-multiple: true
+
       - run: cp scripts/install.sh data/yolo-modes.json dist/
 
       - name: Checksums
         working-directory: dist
         run: sha256sum *.tar.gz yolo-modes.json > SHA256SUMS
+
+      # Signing the one checksum file is what a downloader verifies. Keyless, so
+      # there is no key to keep or rotate.
+      - uses: sigstore/cosign-installer@v4
+
+      - name: Sign the checksums
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle SHA256SUMS.bundle SHA256SUMS
 
       - uses: softprops/action-gh-release@v3
         with:
@@ -106,52 +319,8 @@ jobs:
             dist/install.sh
             dist/yolo-modes.json
             dist/SHA256SUMS
+            dist/SHA256SUMS.bundle
           fail_on_unmatched_files: true
           generate_release_notes: true
           overwrite_files: true
 
-  docker:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-      # Publish bin image (scratch stage, binary only)
-      - id: meta-bin
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=bin
-      - name: Publish bin image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          target: bin
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta-bin.outputs.tags }}

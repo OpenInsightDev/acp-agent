@@ -235,9 +235,22 @@ The image contains the `acp-agent` CLI and its supported JavaScript/Python toolc
 No agent is preloaded into the image; the first `run` or `serve` command downloads or prepares the selected agent as needed.
 The final image is a small Debian runtime image that uses `acp-agent` as the entrypoint and runs as root by default.
 
-```sh
-docker build -t acp-agent:latest .
+Images are published to `ghcr.io/openinsightdev/acp-agent`: the runtime image as `latest` and `<version>`, and a binary-only carrier image as `bin`.
 
+```sh
+docker pull ghcr.io/openinsightdev/acp-agent:latest
+```
+
+The image carries a prebuilt release binary instead of compiling inside the build, so building it locally stages that binary under the host's architecture first:
+
+```sh
+cargo build --release
+arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+mkdir -p "linux/$arch" && cp target/release/acp-agent "linux/$arch/"
+docker build -t acp-agent:latest .
+```
+
+```sh
 docker run --rm \
   -p 127.0.0.1:8010:8010 \
   -v acp-agent-cache:/cache \
