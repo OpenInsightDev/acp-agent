@@ -1,6 +1,10 @@
 /target
 /references
 
+# Release build output.
+/dist/
+/linux/
+
 .env
 
 .DS_Store

@@ -1,47 +1,29 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  changes:
-    runs-on: ubuntu-latest
-    outputs:
-      src: ${{ steps.filter.outputs.src }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: dorny/paths-filter@v4
-        id: filter
-        with:
-          filters: |
-            src:
-              - 'src/**'
-              - 'tests/**'
-              - 'data/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-
   check:
-    needs: changes
-    if: needs.changes.outputs.src == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -50,15 +32,20 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
-    needs: changes
-    if: needs.changes.outputs.src == 'true' || github.event_name == 'workflow_dispatch'
+    # The CLI ships macOS and Linux binaries, and the harness covers cache and
+    # process behaviour that differs per OS.
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-targets
+
