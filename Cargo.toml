@@ -50,7 +50,7 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3.27.0"
 which = "8.0.5"
 # Registry ZIP assets use standard deflate; keep the codec/encryption surface minimal.
-zip = { version = "8.4.0", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9.1.3", default-features = false, features = ["deflate-flate2"] }
 
 
 
